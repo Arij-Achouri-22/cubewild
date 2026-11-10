@@ -1,0 +1,1021 @@
+//! Items, the slot inventory, crafting recipes, block drops and mining times.
+
+use crate::world::*;
+
+/// Block items share their id with the block. Other items start at 64.
+pub type Item = u8;
+pub const STICK: Item = 64;
+pub const MEAT: Item = 65;
+pub const HIDE: Item = 66;
+pub const WOOD_PICK: Item = 67;
+pub const STONE_PICK: Item = 68;
+pub const STONE_AXE: Item = 69;
+pub const SPEAR: Item = 70;
+pub const COAL: Item = 71;
+pub const IRON_INGOT: Item = 72;
+pub const CRYSTAL: Item = 73;
+pub const COOKED_MEAT: Item = 74;
+pub const IRON_PICK: Item = 75;
+pub const IRON_AXE: Item = 76;
+pub const IRON_SWORD: Item = 77;
+pub const CRYSTAL_PICK: Item = 78;
+pub const FLINT: Item = 79;
+pub const GOLD_INGOT: Item = 80;
+pub const FIBER: Item = 81;
+pub const BERRIES: Item = 82;
+pub const STEW: Item = 83;
+pub const LEATHER_CHEST: Item = 84;
+pub const IRON_CHEST: Item = 85;
+pub const FLINT_KNIFE: Item = 86;
+pub const GOLD_PICK: Item = 87;
+pub const WOOD_AXE: Item = 88;
+pub const GOLD_AXE: Item = 89;
+pub const CRYSTAL_AXE: Item = 90;
+pub const WOOD_SHOVEL: Item = 91;
+pub const STONE_SHOVEL: Item = 92;
+pub const IRON_SHOVEL: Item = 93;
+pub const GOLD_SHOVEL: Item = 94;
+pub const CRYSTAL_SHOVEL: Item = 95;
+pub const WOOD_HOE: Item = 96;
+pub const STONE_HOE: Item = 97;
+pub const IRON_HOE: Item = 98;
+pub const WOOD_SWORD: Item = 99;
+pub const STONE_SWORD: Item = 100;
+pub const GOLD_SWORD: Item = 101;
+pub const CRYSTAL_SWORD: Item = 102;
+pub const SHEARS: Item = 103;
+pub const BUCKET: Item = 104;
+pub const WATER_BUCKET: Item = 105;
+pub const FISHING_ROD: Item = 106;
+pub const RAW_FISH: Item = 107;
+pub const COOKED_FISH: Item = 108;
+pub const BOW: Item = 109;
+pub const ARROW: Item = 110;
+pub const COMPASS: Item = 111;
+pub const CLOCK: Item = 112;
+pub const SEEDS: Item = 113;
+pub const WHEAT: Item = 114;
+pub const BREAD: Item = 115;
+pub const LEATHER_HELMET: Item = 116;
+pub const LEATHER_LEGS: Item = 117;
+pub const LEATHER_BOOTS: Item = 118;
+pub const IRON_HELMET: Item = 119;
+pub const IRON_LEGS: Item = 120;
+pub const IRON_BOOTS: Item = 121;
+pub const GOLD_HELMET: Item = 122;
+pub const GOLD_CHEST: Item = 123;
+pub const GOLD_LEGS: Item = 124;
+pub const GOLD_BOOTS: Item = 125;
+pub const CRYSTAL_HELMET: Item = 126;
+pub const CRYSTAL_CHEST: Item = 127;
+pub const CRYSTAL_LEGS: Item = 128;
+pub const CRYSTAL_BOOTS: Item = 129;
+const ITEM_END: Item = 130;
+/// first texture layer holding item icons
+const ICON_BASE: u32 = crate::textures::ICON_BASE as u32;
+pub const ICON_HEART: u32 = ICON_BASE + 100;
+pub const ICON_FOOD: u32 = ICON_BASE + 101;
+pub const ICON_AIR: u32 = ICON_BASE + 102;
+
+pub fn is_block(i: Item) -> bool {
+    i != AIR && i < 64
+}
+
+pub fn valid(i: Item) -> bool {
+    (i >= GRASS && i <= LAST_BLOCK && i != WATER && i != BEDROCK && !(WHEAT_0..=WHEAT_3).contains(&i))
+        || (64..ITEM_END).contains(&i)
+}
+
+pub fn name(i: Item) -> &'static str {
+    match i {
+        GRASS => "Grass",
+        DIRT => "Dirt",
+        STONE => "Stone",
+        SAND => "Sand",
+        LOG => "Log",
+        LEAVES => "Leaves",
+        PLANKS => "Planks",
+        COBBLE => "Cobblestone",
+        BRICK => "Bricks",
+        SNOW => "Snow",
+        GLASS => "Glass",
+        STONE_BRICK => "Stone Bricks",
+        LEATHER => "Leather Block",
+        COAL_ORE => "Coal Ore",
+        IRON_ORE => "Iron Ore",
+        CRYSTAL_ORE => "Crystal Ore",
+        SANDSTONE => "Sandstone",
+        CACTUS => "Cactus",
+        WORKBENCH => "Workbench",
+        FURNACE => "Furnace",
+        TORCH => "Torch",
+        LAMP => "Crystal Lamp",
+        BED => "Bed",
+        BIRCH_LOG => "Birch Log",
+        BIRCH_LEAVES => "Birch Leaves",
+        PINE_LEAVES => "Pine Needles",
+        GRAVEL => "Gravel",
+        CLAY => "Clay",
+        GOLD_ORE => "Gold Ore",
+        TALL_GRASS => "Grass Tuft",
+        FLOWER_RED => "Red Flower",
+        FLOWER_YELLOW => "Yellow Flower",
+        MUSHROOM => "Mushroom",
+        BERRY_BUSH => "Berry Bush",
+        DEAD_BUSH => "Dry Bush",
+        BIRCH_PLANKS => "Birch Planks",
+        GOLD_BLOCK => "Gold Block",
+        IRON_BLOCK => "Iron Block",
+        MOSSY_COBBLE => "Mossy Cobblestone",
+        CLOTH => "Cloth",
+        THATCH => "Thatch",
+        FARMLAND => "Farmland",
+        STICK => "Stick",
+        MEAT => "Raw Meat",
+        HIDE => "Hide",
+        WOOD_PICK => "Wooden Pickaxe",
+        STONE_PICK => "Stone Pickaxe",
+        STONE_AXE => "Stone Axe",
+        SPEAR => "Spear",
+        COAL => "Coal",
+        IRON_INGOT => "Iron Ingot",
+        CRYSTAL => "Crystal",
+        COOKED_MEAT => "Cooked Meat",
+        IRON_PICK => "Iron Pickaxe",
+        IRON_AXE => "Iron Axe",
+        IRON_SWORD => "Iron Sword",
+        CRYSTAL_PICK => "Crystal Pickaxe",
+        FLINT => "Flint",
+        GOLD_INGOT => "Gold Ingot",
+        FIBER => "Plant Fibre",
+        BERRIES => "Berries",
+        STEW => "Forest Stew",
+        LEATHER_CHEST => "Leather Tunic",
+        IRON_CHEST => "Iron Chestplate",
+        FLINT_KNIFE => "Flint Knife",
+        GOLD_PICK => "Golden Pickaxe",
+        WOOD_AXE => "Wooden Axe",
+        GOLD_AXE => "Golden Axe",
+        CRYSTAL_AXE => "Crystal Axe",
+        WOOD_SHOVEL => "Wooden Shovel",
+        STONE_SHOVEL => "Stone Shovel",
+        IRON_SHOVEL => "Iron Shovel",
+        GOLD_SHOVEL => "Golden Shovel",
+        CRYSTAL_SHOVEL => "Crystal Shovel",
+        WOOD_HOE => "Wooden Hoe",
+        STONE_HOE => "Stone Hoe",
+        IRON_HOE => "Iron Hoe",
+        WOOD_SWORD => "Wooden Sword",
+        STONE_SWORD => "Stone Sword",
+        GOLD_SWORD => "Golden Sword",
+        CRYSTAL_SWORD => "Crystal Sword",
+        SHEARS => "Shears",
+        BUCKET => "Bucket",
+        WATER_BUCKET => "Water Bucket",
+        FISHING_ROD => "Fishing Rod",
+        RAW_FISH => "Raw Fish",
+        COOKED_FISH => "Cooked Fish",
+        BOW => "Bow",
+        ARROW => "Arrow",
+        COMPASS => "Compass",
+        CLOCK => "Clock",
+        SEEDS => "Seeds",
+        WHEAT => "Wheat",
+        BREAD => "Bread",
+        LEATHER_HELMET => "Leather Cap",
+        LEATHER_LEGS => "Leather Trousers",
+        LEATHER_BOOTS => "Leather Boots",
+        IRON_HELMET => "Iron Helmet",
+        IRON_LEGS => "Iron Leggings",
+        IRON_BOOTS => "Iron Boots",
+        GOLD_HELMET => "Golden Helmet",
+        GOLD_CHEST => "Golden Chestplate",
+        GOLD_LEGS => "Golden Leggings",
+        GOLD_BOOTS => "Golden Boots",
+        CRYSTAL_HELMET => "Crystal Helmet",
+        CRYSTAL_CHEST => "Crystal Chestplate",
+        CRYSTAL_LEGS => "Crystal Leggings",
+        CRYSTAL_BOOTS => "Crystal Boots",
+        _ => "?",
+    }
+}
+
+/// Texture-array layer used as the item's icon.
+pub fn icon(i: Item) -> u32 {
+    if is_block(i) {
+        tex_for(i, if i == FURNACE { 4 } else { 0 })
+    } else {
+        ICON_BASE + (i - 64) as u32
+    }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum Mat {
+    Wood,
+    Stone,
+    Iron,
+    Gold,
+    Crystal,
+    Leather,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum Kind {
+    Pick,
+    Axe,
+    Shovel,
+    Hoe,
+    Sword,
+    Helmet,
+    Chest,
+    Legs,
+    Boots,
+}
+
+/// Tools, weapons and armour that come in several materials.
+pub fn gear(i: Item) -> Option<(Kind, Mat)> {
+    Some(match i {
+        WOOD_PICK => (Kind::Pick, Mat::Wood),
+        WOOD_AXE => (Kind::Axe, Mat::Wood),
+        WOOD_SHOVEL => (Kind::Shovel, Mat::Wood),
+        WOOD_HOE => (Kind::Hoe, Mat::Wood),
+        WOOD_SWORD => (Kind::Sword, Mat::Wood),
+        STONE_PICK => (Kind::Pick, Mat::Stone),
+        STONE_AXE => (Kind::Axe, Mat::Stone),
+        STONE_SHOVEL => (Kind::Shovel, Mat::Stone),
+        STONE_HOE => (Kind::Hoe, Mat::Stone),
+        STONE_SWORD => (Kind::Sword, Mat::Stone),
+        IRON_PICK => (Kind::Pick, Mat::Iron),
+        IRON_AXE => (Kind::Axe, Mat::Iron),
+        IRON_SHOVEL => (Kind::Shovel, Mat::Iron),
+        IRON_HOE => (Kind::Hoe, Mat::Iron),
+        IRON_SWORD => (Kind::Sword, Mat::Iron),
+        GOLD_PICK => (Kind::Pick, Mat::Gold),
+        GOLD_AXE => (Kind::Axe, Mat::Gold),
+        GOLD_SHOVEL => (Kind::Shovel, Mat::Gold),
+        GOLD_SWORD => (Kind::Sword, Mat::Gold),
+        CRYSTAL_PICK => (Kind::Pick, Mat::Crystal),
+        CRYSTAL_AXE => (Kind::Axe, Mat::Crystal),
+        CRYSTAL_SHOVEL => (Kind::Shovel, Mat::Crystal),
+        CRYSTAL_SWORD => (Kind::Sword, Mat::Crystal),
+        LEATHER_HELMET => (Kind::Helmet, Mat::Leather),
+        LEATHER_CHEST => (Kind::Chest, Mat::Leather),
+        LEATHER_LEGS => (Kind::Legs, Mat::Leather),
+        LEATHER_BOOTS => (Kind::Boots, Mat::Leather),
+        IRON_HELMET => (Kind::Helmet, Mat::Iron),
+        IRON_CHEST => (Kind::Chest, Mat::Iron),
+        IRON_LEGS => (Kind::Legs, Mat::Iron),
+        IRON_BOOTS => (Kind::Boots, Mat::Iron),
+        GOLD_HELMET => (Kind::Helmet, Mat::Gold),
+        GOLD_CHEST => (Kind::Chest, Mat::Gold),
+        GOLD_LEGS => (Kind::Legs, Mat::Gold),
+        GOLD_BOOTS => (Kind::Boots, Mat::Gold),
+        CRYSTAL_HELMET => (Kind::Helmet, Mat::Crystal),
+        CRYSTAL_CHEST => (Kind::Chest, Mat::Crystal),
+        CRYSTAL_LEGS => (Kind::Legs, Mat::Crystal),
+        CRYSTAL_BOOTS => (Kind::Boots, Mat::Crystal),
+        _ => return None,
+    })
+}
+
+fn tool(i: Item, kind: Kind) -> Option<Mat> {
+    gear(i).filter(|g| g.0 == kind).map(|g| g.1)
+}
+
+/// Share of the bare-hand time a tool of this material needs.
+fn speed(m: Mat) -> f32 {
+    match m {
+        Mat::Wood | Mat::Leather => 0.31,
+        Mat::Stone => 0.135,
+        Mat::Iron => 0.085,
+        Mat::Gold => 0.06,
+        Mat::Crystal => 0.054,
+    }
+}
+
+/// Pickaxe strength: 0 none, 1 wood and gold, 2 stone, 3 iron, 4 crystal.
+fn pick_tier(i: Item) -> u8 {
+    match tool(i, Kind::Pick) {
+        Some(Mat::Wood | Mat::Gold) => 1,
+        Some(Mat::Stone) => 2,
+        Some(Mat::Iron) => 3,
+        Some(Mat::Crystal) => 4,
+        _ => 0,
+    }
+}
+
+/// How many uses an item survives (0 = never wears out).
+pub fn max_wear(i: Item) -> u16 {
+    match gear(i) {
+        Some((Kind::Pick | Kind::Axe | Kind::Shovel | Kind::Hoe | Kind::Sword, m)) => match m {
+            Mat::Wood | Mat::Leather => 60,
+            Mat::Stone => 130,
+            Mat::Iron => 250,
+            Mat::Gold => 40,
+            Mat::Crystal => 900,
+        },
+        Some(_) => 0,
+        None => match i {
+            SPEAR => 80,
+            FLINT_KNIFE => 50,
+            SHEARS => 200,
+            FISHING_ROD => 64,
+            BOW => 200,
+            _ => 0,
+        },
+    }
+}
+
+/// Hunger restored by eating an item (0 = not food).
+pub fn food(i: Item) -> f32 {
+    match i {
+        MEAT | RAW_FISH => 2.5,
+        BERRIES => 1.5,
+        BREAD => 5.0,
+        COOKED_FISH => 6.0,
+        COOKED_MEAT => 7.0,
+        STEW => 9.0,
+        _ => 0.0,
+    }
+}
+
+/// Armour slot (0 head .. 3 feet) and the share of damage the piece absorbs.
+pub fn armor(i: Item) -> Option<(usize, f32)> {
+    let (kind, mat) = gear(i)?;
+    let (slot, share) = match kind {
+        Kind::Helmet => (0, 0.15),
+        Kind::Chest => (1, 0.4),
+        Kind::Legs => (2, 0.3),
+        Kind::Boots => (3, 0.15),
+        _ => return None,
+    };
+    let set = match mat {
+        Mat::Leather => 0.25,
+        Mat::Gold => 0.38,
+        Mat::Iron => 0.5,
+        _ => 0.64,
+    };
+    Some((slot, share * set))
+}
+
+pub fn max_stack(i: Item) -> u32 {
+    if gear(i).is_some() || max_wear(i) > 0 || matches!(i, BED | BUCKET | WATER_BUCKET | COMPASS | CLOCK) {
+        1
+    } else {
+        99
+    }
+}
+
+/// Short type label shown in tooltips.
+pub fn kind(i: Item) -> &'static str {
+    match gear(i) {
+        Some((Kind::Sword, _)) => "Weapon",
+        Some((Kind::Helmet | Kind::Chest | Kind::Legs | Kind::Boots, _)) => "Armour",
+        Some(_) => "Tool",
+        None => match i {
+            SPEAR | FLINT_KNIFE | BOW | ARROW => "Weapon",
+            SHEARS | BUCKET | WATER_BUCKET | FISHING_ROD | COMPASS | CLOCK => "Tool",
+            WORKBENCH | FURNACE | BED | TORCH | LAMP => "Utility block",
+            i if food(i) > 0.0 => "Food",
+            i if is_plant(i) => "Plant",
+            i if is_block(i) => "Block",
+            _ => "Material",
+        },
+    }
+}
+
+/// One line of help for the tooltip.
+pub fn desc(i: Item) -> &'static str {
+    match gear(i) {
+        Some((Kind::Pick, _)) => return "Breaks stone and ore. Better ones mine rarer ores.",
+        Some((Kind::Axe, _)) => return "Chops logs and planks quickly. A fair weapon too.",
+        Some((Kind::Shovel, _)) => return "Digs dirt, sand, gravel, clay and snow quickly.",
+        Some((Kind::Hoe, _)) => return "Right click grass or dirt to till it for seeds.",
+        Some((Kind::Sword, _)) => return "Made for fighting.",
+        Some(_) => return "Wear it in its armour slot to take less damage.",
+        None => {}
+    }
+    match i {
+        GRASS | DIRT => "Soft ground. A shovel digs it fastest.",
+        STONE => "Smooth stone, smelted from cobblestone.",
+        SAND => "Smelt it into glass or pack it into sandstone.",
+        LOG | BIRCH_LOG => "Craft into planks, or burn into coal in a furnace.",
+        LEAVES | BIRCH_LEAVES | PINE_LEAVES => "Light foliage. Sometimes hides a stick.",
+        PLANKS | BIRCH_PLANKS => "The base of most early crafting.",
+        COBBLE => "Rough stone for tools, furnaces and walls.",
+        BRICK => "Fired clay. A sturdy building block.",
+        SNOW => "Packed snow from the mountain tops.",
+        GLASS => "Lets you see out while keeping wolves out.",
+        STONE_BRICK | SANDSTONE | MOSSY_COBBLE | THATCH | CLOTH | LEATHER => "A decorative building block.",
+        COAL_ORE => "Drops coal when mined.",
+        IRON_ORE => "Needs a stone pickaxe. Smelt it in a furnace.",
+        CRYSTAL_ORE => "Deep underground. Needs an iron pickaxe.",
+        GOLD_ORE => "Deep underground. Needs an iron pickaxe.",
+        CACTUS => "A prickly desert plant.",
+        WORKBENCH => "Stand near it to craft advanced recipes.",
+        FURNACE => "Stand near it to smelt ore and cook food.",
+        TORCH => "Lights the dark. Glows in your hand too.",
+        LAMP => "A bright, steady light.",
+        BED => "Right click to set your spawn and sleep through the night.",
+        GRAVEL => "Loose stones from the sea bed. May hide flint.",
+        CLAY => "Found under water. Fire it into bricks.",
+        TALL_GRASS => "Gives plant fibre and sometimes seeds when cut.",
+        FLOWER_RED | FLOWER_YELLOW => "Brightens up a home.",
+        MUSHROOM => "Grows in the woods. Good in a stew.",
+        BERRY_BUSH => "Break it to gather berries.",
+        DEAD_BUSH => "Dry twigs. Breaks into sticks.",
+        GOLD_BLOCK | IRON_BLOCK => "Solid metal. Shows off your wealth.",
+        FARMLAND => "Tilled soil. Plant seeds on it.",
+        STICK => "Handles for tools, torches and weapons.",
+        MEAT | RAW_FISH => "Restores a little hunger. Better cooked.",
+        COOKED_MEAT | COOKED_FISH => "A hearty meal.",
+        BERRIES => "A quick snack.",
+        BREAD => "Baked from three wheat. Filling.",
+        STEW => "The best meal there is.",
+        HIDE => "Animal skin for beds, leather and armour.",
+        SPEAR => "A long reach keeps wolves at a distance.",
+        FLINT_KNIFE => "Cheap and quick to make.",
+        COAL => "Fuel for the furnace and for torches.",
+        IRON_INGOT => "Forge it into tools, weapons and armour.",
+        GOLD_INGOT => "Soft and shiny. Golden tools are fast but brittle.",
+        CRYSTAL => "A rare gem for lamps and the best gear.",
+        FLINT => "A sharp stone for knives and arrowheads.",
+        FIBER => "For cloth, thatch, bowstrings and fishing line.",
+        SHEARS => "Snips leaves and grass in an instant, and keeps the grass.",
+        BUCKET => "Right click water to scoop it up.",
+        WATER_BUCKET => "Right click to pour the water out.",
+        FISHING_ROD => "Hold right click on water and wait for a bite.",
+        BOW => "Right click to shoot an arrow.",
+        ARROW => "Ammunition for the bow.",
+        COMPASS => "Carry it to see your heading and the way to your spawn.",
+        CLOCK => "Carry it to see the time of day.",
+        SEEDS => "Plant on farmland. Grows into wheat.",
+        WHEAT => "Three make a loaf of bread.",
+        _ => "",
+    }
+}
+
+/// Recipe book tabs.
+#[derive(Clone, Copy, PartialEq)]
+pub enum Cat {
+    All,
+    Tools,
+    Combat,
+    Armour,
+    Utility,
+    Building,
+    Materials,
+    Food,
+}
+
+/// (tab, label, icon item)
+pub const CATS: [(Cat, &str, Item); 8] = [
+    (Cat::All, "All recipes", WORKBENCH),
+    (Cat::Tools, "Tools", STONE_PICK),
+    (Cat::Combat, "Weapons", IRON_SWORD),
+    (Cat::Armour, "Armour", IRON_CHEST),
+    (Cat::Utility, "Utility", TORCH),
+    (Cat::Building, "Building blocks", BRICK),
+    (Cat::Materials, "Materials", IRON_INGOT),
+    (Cat::Food, "Food", COOKED_MEAT),
+];
+
+pub struct Recipe {
+    pub out: (Item, u32),
+    pub ins: &'static [(Item, u32)],
+    /// block that must stand within a few steps (AIR = craft anywhere)
+    pub station: Block,
+    pub cat: Cat,
+}
+
+const fn r(cat: Cat, out: (Item, u32), ins: &'static [(Item, u32)], station: Block) -> Recipe {
+    Recipe { out, ins, station, cat }
+}
+
+pub const RECIPES: &[Recipe] = &[
+    r(Cat::Materials, (PLANKS, 4), &[(LOG, 1)], AIR),
+    r(Cat::Materials, (BIRCH_PLANKS, 4), &[(BIRCH_LOG, 1)], AIR),
+    r(Cat::Materials, (STICK, 4), &[(PLANKS, 2)], AIR),
+    r(Cat::Materials, (STICK, 4), &[(BIRCH_PLANKS, 2)], AIR),
+    r(Cat::Materials, (COAL, 1), &[(LOG, 2)], FURNACE),
+    r(Cat::Materials, (COAL, 1), &[(BIRCH_LOG, 2)], FURNACE),
+    r(Cat::Materials, (IRON_INGOT, 2), &[(IRON_ORE, 2), (COAL, 1)], FURNACE),
+    r(Cat::Materials, (GOLD_INGOT, 2), &[(GOLD_ORE, 2), (COAL, 1)], FURNACE),
+    r(Cat::Materials, (FLINT, 1), &[(GRAVEL, 3)], AIR),
+    r(Cat::Utility, (WORKBENCH, 1), &[(PLANKS, 4)], AIR),
+    r(Cat::Utility, (TORCH, 4), &[(COAL, 1), (STICK, 1)], AIR),
+    r(Cat::Utility, (FURNACE, 1), &[(COBBLE, 8)], WORKBENCH),
+    r(Cat::Utility, (BED, 1), &[(PLANKS, 3), (HIDE, 3)], WORKBENCH),
+    r(Cat::Utility, (LAMP, 1), &[(CRYSTAL, 1), (GLASS, 1)], WORKBENCH),
+    r(Cat::Utility, (BUCKET, 1), &[(IRON_INGOT, 3)], WORKBENCH),
+    r(Cat::Utility, (COMPASS, 1), &[(IRON_INGOT, 4), (CRYSTAL, 1)], WORKBENCH),
+    r(Cat::Utility, (CLOCK, 1), &[(GOLD_INGOT, 4), (CRYSTAL, 1)], WORKBENCH),
+    r(Cat::Tools, (WOOD_PICK, 1), &[(PLANKS, 3), (STICK, 2)], AIR),
+    r(Cat::Tools, (STONE_PICK, 1), &[(COBBLE, 3), (STICK, 2)], AIR),
+    r(Cat::Tools, (IRON_PICK, 1), &[(IRON_INGOT, 3), (STICK, 2)], WORKBENCH),
+    r(Cat::Tools, (GOLD_PICK, 1), &[(GOLD_INGOT, 3), (STICK, 2)], WORKBENCH),
+    r(Cat::Tools, (CRYSTAL_PICK, 1), &[(CRYSTAL, 3), (STICK, 2)], WORKBENCH),
+    r(Cat::Tools, (WOOD_AXE, 1), &[(PLANKS, 3), (STICK, 2)], AIR),
+    r(Cat::Tools, (STONE_AXE, 1), &[(COBBLE, 3), (STICK, 2)], AIR),
+    r(Cat::Tools, (IRON_AXE, 1), &[(IRON_INGOT, 3), (STICK, 2)], WORKBENCH),
+    r(Cat::Tools, (GOLD_AXE, 1), &[(GOLD_INGOT, 3), (STICK, 2)], WORKBENCH),
+    r(Cat::Tools, (CRYSTAL_AXE, 1), &[(CRYSTAL, 3), (STICK, 2)], WORKBENCH),
+    r(Cat::Tools, (WOOD_SHOVEL, 1), &[(PLANKS, 1), (STICK, 2)], AIR),
+    r(Cat::Tools, (STONE_SHOVEL, 1), &[(COBBLE, 1), (STICK, 2)], AIR),
+    r(Cat::Tools, (IRON_SHOVEL, 1), &[(IRON_INGOT, 1), (STICK, 2)], WORKBENCH),
+    r(Cat::Tools, (GOLD_SHOVEL, 1), &[(GOLD_INGOT, 1), (STICK, 2)], WORKBENCH),
+    r(Cat::Tools, (CRYSTAL_SHOVEL, 1), &[(CRYSTAL, 1), (STICK, 2)], WORKBENCH),
+    r(Cat::Tools, (WOOD_HOE, 1), &[(PLANKS, 2), (STICK, 2)], AIR),
+    r(Cat::Tools, (STONE_HOE, 1), &[(COBBLE, 2), (STICK, 2)], AIR),
+    r(Cat::Tools, (IRON_HOE, 1), &[(IRON_INGOT, 2), (STICK, 2)], WORKBENCH),
+    r(Cat::Tools, (SHEARS, 1), &[(IRON_INGOT, 2)], WORKBENCH),
+    r(Cat::Tools, (FISHING_ROD, 1), &[(STICK, 3), (FIBER, 2)], AIR),
+    r(Cat::Combat, (FLINT_KNIFE, 1), &[(FLINT, 1), (STICK, 1)], AIR),
+    r(Cat::Combat, (SPEAR, 1), &[(COBBLE, 1), (STICK, 2)], AIR),
+    r(Cat::Combat, (WOOD_SWORD, 1), &[(PLANKS, 2), (STICK, 1)], AIR),
+    r(Cat::Combat, (STONE_SWORD, 1), &[(COBBLE, 2), (STICK, 1)], AIR),
+    r(Cat::Combat, (IRON_SWORD, 1), &[(IRON_INGOT, 2), (STICK, 1)], WORKBENCH),
+    r(Cat::Combat, (GOLD_SWORD, 1), &[(GOLD_INGOT, 2), (STICK, 1)], WORKBENCH),
+    r(Cat::Combat, (CRYSTAL_SWORD, 1), &[(CRYSTAL, 2), (STICK, 1)], WORKBENCH),
+    r(Cat::Combat, (BOW, 1), &[(STICK, 3), (FIBER, 3)], AIR),
+    r(Cat::Combat, (ARROW, 4), &[(FLINT, 1), (STICK, 1)], AIR),
+    r(Cat::Armour, (LEATHER_HELMET, 1), &[(HIDE, 5)], WORKBENCH),
+    r(Cat::Armour, (LEATHER_CHEST, 1), &[(HIDE, 8)], WORKBENCH),
+    r(Cat::Armour, (LEATHER_LEGS, 1), &[(HIDE, 7)], WORKBENCH),
+    r(Cat::Armour, (LEATHER_BOOTS, 1), &[(HIDE, 4)], WORKBENCH),
+    r(Cat::Armour, (IRON_HELMET, 1), &[(IRON_INGOT, 5)], WORKBENCH),
+    r(Cat::Armour, (IRON_CHEST, 1), &[(IRON_INGOT, 8)], WORKBENCH),
+    r(Cat::Armour, (IRON_LEGS, 1), &[(IRON_INGOT, 7)], WORKBENCH),
+    r(Cat::Armour, (IRON_BOOTS, 1), &[(IRON_INGOT, 4)], WORKBENCH),
+    r(Cat::Armour, (GOLD_HELMET, 1), &[(GOLD_INGOT, 5)], WORKBENCH),
+    r(Cat::Armour, (GOLD_CHEST, 1), &[(GOLD_INGOT, 8)], WORKBENCH),
+    r(Cat::Armour, (GOLD_LEGS, 1), &[(GOLD_INGOT, 7)], WORKBENCH),
+    r(Cat::Armour, (GOLD_BOOTS, 1), &[(GOLD_INGOT, 4)], WORKBENCH),
+    r(Cat::Armour, (CRYSTAL_HELMET, 1), &[(CRYSTAL, 5)], WORKBENCH),
+    r(Cat::Armour, (CRYSTAL_CHEST, 1), &[(CRYSTAL, 8)], WORKBENCH),
+    r(Cat::Armour, (CRYSTAL_LEGS, 1), &[(CRYSTAL, 7)], WORKBENCH),
+    r(Cat::Armour, (CRYSTAL_BOOTS, 1), &[(CRYSTAL, 4)], WORKBENCH),
+    r(Cat::Food, (COOKED_MEAT, 2), &[(MEAT, 2), (COAL, 1)], FURNACE),
+    r(Cat::Food, (COOKED_FISH, 2), &[(RAW_FISH, 2), (COAL, 1)], FURNACE),
+    r(Cat::Food, (BREAD, 1), &[(WHEAT, 3)], AIR),
+    r(Cat::Food, (STEW, 1), &[(MUSHROOM, 2), (BERRIES, 2)], AIR),
+    r(Cat::Building, (STONE, 4), &[(COBBLE, 4), (COAL, 1)], FURNACE),
+    r(Cat::Building, (STONE_BRICK, 4), &[(COBBLE, 4)], AIR),
+    r(Cat::Building, (MOSSY_COBBLE, 2), &[(COBBLE, 2), (FIBER, 2)], AIR),
+    r(Cat::Building, (SANDSTONE, 2), &[(SAND, 4)], AIR),
+    r(Cat::Building, (GLASS, 4), &[(SAND, 4), (COAL, 1)], FURNACE),
+    r(Cat::Building, (BRICK, 4), &[(CLAY, 2), (COAL, 1)], FURNACE),
+    r(Cat::Building, (THATCH, 2), &[(FIBER, 3)], AIR),
+    r(Cat::Building, (CLOTH, 1), &[(FIBER, 4)], AIR),
+    r(Cat::Building, (LEATHER, 1), &[(HIDE, 2)], AIR),
+    r(Cat::Building, (IRON_BLOCK, 1), &[(IRON_INGOT, 4)], WORKBENCH),
+    r(Cat::Building, (GOLD_BLOCK, 1), &[(GOLD_INGOT, 4)], WORKBENCH),
+];
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Stack {
+    pub item: Item,
+    pub n: u32,
+    /// uses spent, for tools
+    pub wear: u16,
+}
+
+impl Stack {
+    pub fn new(item: Item, n: u32) -> Stack {
+        Stack { item, n, wear: 0 }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.n == 0
+    }
+
+    /// Remaining durability, 0..1 (None for items that never wear).
+    pub fn condition(&self) -> Option<f32> {
+        let max = max_wear(self.item);
+        (max > 0 && !self.is_empty()).then(|| 1.0 - self.wear as f32 / max as f32)
+    }
+}
+
+/// slots 0..9 are the hotbar, 9..36 the backpack, 36..40 armour (head, chest, legs, feet)
+pub const HOTBAR: usize = 9;
+pub const BAG_END: usize = 36;
+pub const ARMOR: usize = 36;
+pub const SLOTS: usize = 40;
+
+pub struct Inventory {
+    pub slots: [Stack; SLOTS],
+    /// the stack picked up with the mouse in the inventory screen
+    pub held: Stack,
+}
+
+impl Inventory {
+    pub fn new() -> Inventory {
+        Inventory { slots: [Stack::default(); SLOTS], held: Stack::default() }
+    }
+
+    /// Item in a hotbar slot (AIR if empty).
+    pub fn hot(&self, slot: usize) -> Item {
+        self.slots[slot].item
+    }
+
+    /// Share of damage that gets through the armour worn.
+    pub fn armor_factor(&self) -> f32 {
+        1.0 - self.slots[ARMOR..].iter().filter_map(|s| armor(s.item)).map(|a| a.1).sum::<f32>()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.slots.iter().all(|s| s.is_empty())
+    }
+
+    /// Total carried in the hotbar and backpack.
+    pub fn count(&self, i: Item) -> u32 {
+        self.slots[..BAG_END].iter().filter(|s| s.item == i).map(|s| s.n).sum()
+    }
+
+    /// True if the item is anywhere on the player.
+    pub fn has(&self, i: Item) -> bool {
+        self.count(i) > 0
+    }
+
+    fn put(&mut self, slot: usize, i: Item, n: u32) -> u32 {
+        let s = &mut self.slots[slot];
+        if s.is_empty() || s.item == i {
+            let k = n.min(max_stack(i).saturating_sub(s.n));
+            if k > 0 {
+                *s = Stack { item: i, n: s.n + k, wear: s.wear };
+            }
+            n - k
+        } else {
+            n
+        }
+    }
+
+    /// Adds to the slots in `range`: tops up matching stacks, then fills empty slots.
+    fn add_to(&mut self, range: std::ops::Range<usize>, i: Item, mut n: u32) -> u32 {
+        for slot in range.clone() {
+            if n > 0 && self.slots[slot].item == i && !self.slots[slot].is_empty() {
+                n = self.put(slot, i, n);
+            }
+        }
+        for slot in range {
+            if n > 0 && self.slots[slot].is_empty() {
+                n = self.put(slot, i, n);
+            }
+        }
+        n
+    }
+
+    /// Moves a whole stack (keeping its wear) into `range`. Returns what did not fit.
+    fn stash(&mut self, range: std::ops::Range<usize>, st: Stack) -> Stack {
+        if st.is_empty() {
+            return st;
+        }
+        if max_stack(st.item) == 1 {
+            return match range.clone().find(|&i| self.slots[i].is_empty()) {
+                Some(free) => {
+                    self.slots[free] = st;
+                    Stack::default()
+                }
+                None => st,
+            };
+        }
+        let left = self.add_to(range, st.item, st.n);
+        if left > 0 { Stack::new(st.item, left) } else { Stack::default() }
+    }
+
+    /// Adds items. Returns how many did not fit.
+    pub fn add(&mut self, i: Item, n: u32) -> u32 {
+        if !valid(i) || n == 0 {
+            return 0;
+        }
+        self.add_to(0..BAG_END, i, n)
+    }
+
+    /// Removes `n` of an item, emptying the backpack before the hotbar.
+    pub fn take(&mut self, i: Item, mut n: u32) -> bool {
+        if self.count(i) < n {
+            return false;
+        }
+        for slot in (0..BAG_END).rev() {
+            let s = &mut self.slots[slot];
+            if s.item == i && n > 0 {
+                let k = n.min(s.n);
+                s.n -= k;
+                n -= k;
+                if s.n == 0 {
+                    *s = Stack::default();
+                }
+            }
+        }
+        true
+    }
+
+    /// Removes one item from a specific slot.
+    pub fn take_slot(&mut self, slot: usize) -> bool {
+        let s = &mut self.slots[slot];
+        if s.is_empty() {
+            return false;
+        }
+        s.n -= 1;
+        if s.n == 0 {
+            *s = Stack::default();
+        }
+        true
+    }
+
+    /// Spends one use of the tool in `slot`. Returns true if it just broke.
+    pub fn wear_tool(&mut self, slot: usize) -> bool {
+        let s = &mut self.slots[slot];
+        let max = max_wear(s.item);
+        if max == 0 || s.is_empty() {
+            return false;
+        }
+        s.wear += 1;
+        if s.wear >= max {
+            *s = Stack::default();
+            return true;
+        }
+        false
+    }
+
+    pub fn can_craft(&self, r: &Recipe) -> bool {
+        r.ins.iter().all(|&(i, n)| self.count(i) >= n)
+    }
+
+    /// Crafts once into the inventory. Returns false if ingredients are missing.
+    pub fn craft(&mut self, r: &Recipe) -> bool {
+        if !self.can_craft(r) {
+            return false;
+        }
+        for &(i, n) in r.ins {
+            self.take(i, n);
+        }
+        let left = self.add(r.out.0, r.out.1);
+        if left > 0 {
+            // no room: hand the rest to the mouse, or give up on it
+            if self.held.is_empty() {
+                self.held = Stack::new(r.out.0, left);
+            } else if self.held.item == r.out.0 {
+                self.held.n += left;
+            }
+        }
+        true
+    }
+
+    /// Crafts once onto the mouse, like taking the result out of a crafting grid.
+    pub fn craft_to_hand(&mut self, r: &Recipe) -> bool {
+        let fits = self.held.is_empty()
+            || (self.held.item == r.out.0 && self.held.n + r.out.1 <= max_stack(r.out.0));
+        if !fits {
+            return self.craft(r);
+        }
+        if !self.can_craft(r) {
+            return false;
+        }
+        for &(i, n) in r.ins {
+            self.take(i, n);
+        }
+        self.held = Stack::new(r.out.0, self.held.n + r.out.1);
+        true
+    }
+
+    fn accepts(slot: usize, i: Item) -> bool {
+        slot < ARMOR || armor(i).is_some_and(|a| a.0 == slot - ARMOR)
+    }
+
+    /// Left click: pick up, drop, merge or swap the held stack.
+    pub fn click(&mut self, slot: usize) {
+        let s = self.slots[slot];
+        if self.held.is_empty() {
+            self.held = s;
+            self.slots[slot] = Stack::default();
+        } else if !Self::accepts(slot, self.held.item) {
+        } else if !s.is_empty() && s.item == self.held.item && max_stack(s.item) > 1 {
+            let left = self.put(slot, self.held.item, self.held.n);
+            self.held = if left > 0 { Stack::new(self.held.item, left) } else { Stack::default() };
+        } else {
+            self.slots[slot] = self.held;
+            self.held = s;
+        }
+    }
+
+    /// Right click: take half a stack, or drop a single held item.
+    pub fn right_click(&mut self, slot: usize) {
+        let s = self.slots[slot];
+        if self.held.is_empty() {
+            if !s.is_empty() {
+                let k = (s.n + 1) / 2;
+                self.held = Stack { n: k, ..s };
+                self.slots[slot] = if s.n > k { Stack { n: s.n - k, ..s } } else { Stack::default() };
+            }
+        } else if max_stack(self.held.item) == 1 {
+            if s.is_empty() {
+                self.click(slot);
+            }
+        } else if Self::accepts(slot, self.held.item) && self.put(slot, self.held.item, 1) == 0 {
+            self.held.n -= 1;
+            if self.held.n == 0 {
+                self.held = Stack::default();
+            }
+        }
+    }
+
+    /// Shift click: send a stack to the other half of the inventory (armour goes on).
+    pub fn quick_move(&mut self, slot: usize) {
+        let s = self.slots[slot];
+        if s.is_empty() {
+            return;
+        }
+        self.slots[slot] = Stack::default();
+        let worn = armor(s.item).map(|a| ARMOR + a.0).filter(|&a| slot < ARMOR && self.slots[a].is_empty());
+        let left = if let Some(a) = worn {
+            self.slots[a] = s;
+            Stack::default()
+        } else if slot < HOTBAR {
+            self.stash(HOTBAR..BAG_END, s)
+        } else if slot < BAG_END {
+            self.stash(0..HOTBAR, s)
+        } else {
+            self.stash(0..BAG_END, s)
+        };
+        if !left.is_empty() {
+            self.slots[slot] = left;
+        }
+    }
+
+    /// Puts the mouse stack back when the inventory closes.
+    pub fn stow_held(&mut self) {
+        self.held = self.stash(0..BAG_END, self.held);
+    }
+
+    /// Merges and orders the backpack: blocks first, then tools and materials.
+    pub fn sort_bag(&mut self) {
+        let mut all: Vec<Stack> = self.slots[HOTBAR..BAG_END].iter().copied().filter(|s| !s.is_empty()).collect();
+        all.sort_by_key(|s| (s.item, s.wear));
+        for s in &mut self.slots[HOTBAR..BAG_END] {
+            *s = Stack::default();
+        }
+        for s in all {
+            self.stash(HOTBAR..BAG_END, s);
+        }
+    }
+}
+
+/// Pickaxe tier a block needs before it drops anything.
+pub fn tier_needed(b: Block) -> u8 {
+    match b {
+        IRON_ORE => 2,
+        CRYSTAL_ORE | GOLD_ORE => 3,
+        _ => 0,
+    }
+}
+
+/// What a block gives when broken with `tool` (AIR = nothing).
+pub fn drop_for(b: Block, tool: Item) -> Item {
+    if pick_tier(tool) < tier_needed(b) {
+        return AIR;
+    }
+    match b {
+        STONE => COBBLE,
+        GRASS | FARMLAND => DIRT,
+        COAL_ORE => COAL,
+        CRYSTAL_ORE => CRYSTAL,
+        BERRY_BUSH => BERRIES,
+        DEAD_BUSH => STICK,
+        TALL_GRASS => {
+            if tool == SHEARS {
+                TALL_GRASS
+            } else {
+                FIBER
+            }
+        }
+        WHEAT_0 | WHEAT_1 | WHEAT_2 => SEEDS,
+        WHEAT_3 => WHEAT,
+        WATER | BEDROCK | AIR => AIR,
+        b => b,
+    }
+}
+
+/// Seconds of holding the button needed to break `b` with `tool` in hand.
+pub fn break_time(b: Block, tool: Item) -> f32 {
+    let with = |kind: Kind, base: f32, gain: f32| match self::tool(tool, kind) {
+        Some(m) => (base * speed(m) * gain).max(0.06),
+        None => base,
+    };
+    match b {
+        STONE | COBBLE | BRICK | STONE_BRICK | SANDSTONE | FURNACE | COAL_ORE | IRON_ORE | CRYSTAL_ORE | GOLD_ORE
+        | MOSSY_COBBLE | IRON_BLOCK | GOLD_BLOCK => {
+            let hard = match b {
+                IRON_ORE | IRON_BLOCK | GOLD_BLOCK => 1.5,
+                CRYSTAL_ORE | GOLD_ORE => 2.2,
+                SANDSTONE => 0.7,
+                _ => 1.0,
+            };
+            with(Kind::Pick, 2.6 * hard, 1.0)
+        }
+        LOG | PLANKS | WORKBENCH | BED | BIRCH_LOG | BIRCH_PLANKS => with(Kind::Axe, 1.1, 2.0),
+        GRASS | DIRT | SAND | GRAVEL | CLAY | SNOW | FARMLAND => with(Kind::Shovel, 0.5, 2.0),
+        LEAVES | BIRCH_LEAVES | PINE_LEAVES | CLOTH | THATCH => {
+            if tool == SHEARS {
+                0.04
+            } else {
+                0.18
+            }
+        }
+        GLASS | LAMP => 0.15,
+        TORCH => 0.05,
+        b if is_plant(b) => 0.05,
+        _ => 0.3,
+    }
+}
+
+/// (damage, reach) of a melee hit with `tool` in hand.
+pub fn weapon(tool: Item) -> (i32, f32) {
+    match gear(tool) {
+        Some((Kind::Sword, m)) => (
+            match m {
+                Mat::Stone => 4,
+                Mat::Iron => 5,
+                Mat::Crystal => 7,
+                _ => 3,
+            },
+            4.6,
+        ),
+        Some((Kind::Axe, m)) => (
+            match m {
+                Mat::Iron => 3,
+                Mat::Crystal => 4,
+                _ => 2,
+            },
+            4.3,
+        ),
+        _ => match tool {
+            SPEAR => (2, 5.6),
+            FLINT_KNIFE => (2, 4.3),
+            _ => (1, 4.3),
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn slots_stack_split_and_move() {
+        let mut inv = Inventory::new();
+        assert_eq!(inv.add(COBBLE, 150), 0);
+        assert_eq!((inv.slots[0].n, inv.slots[1].n), (99, 51));
+        assert_eq!(inv.count(COBBLE), 150);
+        // tools do not stack
+        inv.add(IRON_PICK, 2);
+        assert_eq!((inv.slots[2].n, inv.slots[3].n), (1, 1));
+        // right click takes half, left click drops it elsewhere
+        inv.right_click(1);
+        assert_eq!((inv.held.n, inv.slots[1].n), (26, 25));
+        inv.click(20);
+        assert!(inv.held.is_empty());
+        assert_eq!(inv.slots[20], Stack::new(COBBLE, 26));
+        // merging overflows back onto the mouse
+        inv.click(20);
+        inv.click(0);
+        assert_eq!((inv.slots[0].n, inv.held.n), (99, 26));
+        inv.stow_held();
+        assert_eq!(inv.count(COBBLE), 150);
+        // the armour slot only takes armour
+        inv.click(2);
+        inv.click(ARMOR);
+        assert_eq!(inv.held.item, IRON_PICK);
+        inv.stow_held();
+        inv.add(IRON_CHEST, 1);
+        let at = inv.slots.iter().position(|s| s.item == IRON_CHEST).unwrap();
+        inv.quick_move(at);
+        assert_eq!(inv.slots[ARMOR + 1].item, IRON_CHEST);
+        assert!((inv.armor_factor() - 0.8).abs() < 0.001);
+        // taking drains the backpack before the hotbar; crafting consumes and produces
+        assert!(inv.take(COBBLE, 60));
+        assert_eq!(inv.slots[0].n, 90);
+        inv.add(STICK, 2);
+        let r = RECIPES.iter().find(|r| r.out.0 == STONE_PICK).unwrap();
+        assert!(inv.craft(r));
+        assert_eq!((inv.count(COBBLE), inv.count(STICK), inv.count(STONE_PICK)), (87, 0, 1));
+        // tools wear out and break
+        let at = inv.slots.iter().position(|s| s.item == STONE_PICK).unwrap();
+        for _ in 0..max_wear(STONE_PICK) - 1 {
+            assert!(!inv.wear_tool(at));
+        }
+        assert!(inv.wear_tool(at));
+        assert_eq!(inv.count(STONE_PICK), 0);
+        inv.sort_bag();
+        assert_eq!(inv.count(COBBLE), 87);
+    }
+
+    #[test]
+    fn every_recipe_item_is_named() {
+        for r in RECIPES {
+            for &(i, _) in r.ins.iter().chain([&r.out]) {
+                assert!(valid(i) && name(i) != "?", "item {i}");
+            }
+        }
+    }
+}
