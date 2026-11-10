@@ -173,6 +173,8 @@ struct Arrow {
     pos: Vec3,
     vel: Vec3,
     life: f32,
+    /// shot by a skeleton at the player
+    hostile: bool,
 }
 
 // ---------------------------------------------------------------- settings
@@ -340,6 +342,8 @@ struct Game {
     recipe_craftable: bool,
     shift: bool,
     arrows: Vec<Arrow>,
+    /// CUBEWILD_TEST_MOBS: line up one of each monster once the world is ready
+    test_mobs: bool,
     /// water block being fished, seconds waited, seconds until the bite
     fishing: Option<(IVec3, f32, f32)>,
     grow_acc: f32,
@@ -552,6 +556,7 @@ impl Game {
             recipe_craftable: false,
             shift: false,
             arrows: Vec::new(),
+            test_mobs: env("CUBEWILD_TEST_MOBS").is_some(),
             fishing: None,
             grow_acc: 0.0,
             auto_cur: 20,
@@ -640,10 +645,17 @@ impl Game {
         }
     }
 
-    fn loot(&mut self, meat: u32, hide: u32) {
-        self.give(items::MEAT, meat);
-        self.give(items::HIDE, hide);
-        self.say(if meat > 0 { format!("+{meat} Raw Meat   +{hide} Hide") } else { format!("+{hide} Hide") });
+    fn loot(&mut self, drops: mobs::Drops) {
+        let mut got = Vec::new();
+        for (item, n) in drops {
+            if n > 0 {
+                self.give(item, n);
+                got.push(format!("+{n} {}", items::name(item)));
+            }
+        }
+        if !got.is_empty() {
+            self.say(got.join("   "));
+        }
     }
 
     /// View distance in use: the setting, or less while the frame rate needs help.
@@ -775,8 +787,8 @@ impl Game {
                     self.hit_flash = 0.18;
                     let dead = self.mobs.hit(i, self.player.pos, damage);
                     self.wear_held();
-                    if let Some((meat, hide)) = dead {
-                        self.loot(meat, hide);
+                    if let Some(drops) = dead {
+                        self.loot(drops);
                     }
                 }
                 return;
@@ -925,7 +937,7 @@ impl Game {
             items::BOW => {
                 if self.inv.take(items::ARROW, 1) {
                     let dir = self.player.look_dir();
-                    self.arrows.push(Arrow { pos: self.player.eye() + dir * 0.4, vel: dir * 40.0 + self.player.vel * 0.5, life: 6.0 });
+                    self.arrows.push(Arrow { pos: self.player.eye() + dir * 0.4, vel: dir * 40.0 + self.player.vel * 0.5, life: 6.0, hostile: false });
                     self.place_cd = 0.7;
                     self.wear_held();
                 } else {
@@ -1149,7 +1161,13 @@ impl Game {
             self.time = (self.time + dt / DAY_SECS).rem_euclid(1.0);
             self.player.update(&self.world, &input, dt);
             let night = self.sun().1 < 0.3;
+            if std::mem::take(&mut self.test_mobs) {
+                self.mobs.spawn_test(&self.world, self.player.pos);
+            }
             let bites = self.mobs.update(&self.world, self.player.pos, input.sneak && !self.player.flying, night, dt);
+            for (pos, vel) in self.mobs.shots.drain(..) {
+                self.arrows.push(Arrow { pos, vel, life: 5.0, hostile: true });
+            }
             if self.bench.is_none() {
                 if bites > 0.0 {
                     self.strike(bites);
@@ -1171,9 +1189,19 @@ impl Game {
                 a.life -= dt;
                 let step = a.vel * dt;
                 let len = step.length().max(1e-4);
-                if let Some((i, _)) = self.mobs.pick(a.pos, step / len, len) {
-                    if let Some((meat, hide)) = self.mobs.hit(i, a.pos - step, 5) {
-                        self.loot(meat, hide);
+                if a.hostile {
+                    // a skeleton's arrow: only the player is in danger
+                    let p = self.player.pos;
+                    let (min, max) = (p - Vec3::new(PLAYER_HW, 0.0, PLAYER_HW), p + Vec3::new(PLAYER_HW, PLAYER_H, PLAYER_HW));
+                    if player::ray_aabb(a.pos, step / len, min, max).is_some_and(|t| t <= len) {
+                        if self.bench.is_none() {
+                            self.strike(3.0);
+                        }
+                        return false;
+                    }
+                } else if let Some((i, _)) = self.mobs.pick(a.pos, step / len, len) {
+                    if let Some(drops) = self.mobs.hit(i, a.pos - step, 5) {
+                        self.loot(drops);
                     }
                     self.hit_flash = 0.18;
                     return false;
@@ -1442,7 +1470,10 @@ impl Game {
                 format!("Position  {:.1}, {:.1}, {:.1}", p.x, p.y, p.z),
                 format!("Worst frame  {:.1} ms", self.worst_ms),
                 format!("View {} chunks   drawn {}   quads {}", self.world.radius, self.drawn.0, self.drawn.1),
-                format!("Animals {}   {}", self.mobs.list.len(), self.gfx.adapter_name),
+                {
+                    let monsters = self.mobs.list.iter().filter(|m| m.kind.is_monster()).count();
+                    format!("Animals {}   Monsters {}   {}", self.mobs.list.len() - monsters, monsters, self.gfx.adapter_name)
+                },
                 {
                     let hours = (self.time * 24.0 + 6.0).rem_euclid(24.0);
                     format!("Time {:02}:{:02}   health {:.1}   food {:.1}", hours as u32, (hours.fract() * 60.0) as u32, self.health, self.food)
