@@ -2,7 +2,7 @@
 
 A small open-world voxel sandbox in Rust (wgpu/Vulkan + winit): build with blocks, explore
 endless terrain with caves, ores and deserts, hunt deer, boar and hare, and survive the
-wolves that come out at night.
+wolves and monsters that come out at night.
 
 ## Run
 
@@ -70,6 +70,15 @@ unlocks the furnace, bed, iron tools, crystal pickaxe and crystal lamp, and a **
   die you keep your items and wake at your spawn point.
 - **Day and night** take 12 minutes. Wolves spawn at night and hunt you. Right click a bed
   to set your spawn point and, at night, sleep until morning.
+- **Monsters** come out at night, never within 9 blocks of a torch or lamp, and are gone
+  by morning: sunlight burns zombies and skeletons, and the rest slip away once out of
+  sight. Sneaking shortens the distance at which they notice you.
+  - **Zombies** shamble at you in ones and twos and hit hard. They drop cloth and, now
+    and then, an iron ingot.
+  - **Skeletons** keep their distance and shoot arrows; break their line of sight or
+    close in. They drop arrows and sometimes flint.
+  - **Giant spiders** are fast, climb walls and pounce. They drop plant fibre.
+  - **Slimes** hop after you. They drop clay.
 
 Edited chunks, position, inventory, health and time of day are saved per world seed, and
 settings separately:
@@ -108,6 +117,6 @@ Intel HD 620, where geometry is).
 - `src/world.rs` — blocks, terrain, caves and ores, greedy mesher with AO and sky exposure, chunk streaming
 - `src/gfx.rs` — renderer (one draw call per chunk, 4-byte packed vertices)
 - `src/player.rs` — movement, collision, ray casting
-- `src/mobs.rs` — animals and wolves
+- `src/mobs.rs` — animals, wolves and monsters
 - `src/items.rs` — items, inventory, recipes, mining times
 - `src/ui.rs`, `src/textures.rs` — UI widgets and Noto Sans text, procedural block/item textures
