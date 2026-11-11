@@ -104,6 +104,22 @@ pub const DRY_TUFT: Block = 73;
 /// leans out of the wall and is the `TORCH` item again when broken.
 pub const WALL_TORCH: Block = 74;
 pub const WALL_TORCH_END: Block = 78;
+/// Dyed wool, colours 1..=15 of `COLOURS` (colour 0, white, is `CLOTH`). World-only
+/// ids: their items are `items::WOOL_ITEM` + colour - 1.
+pub const WOOL: Block = 78;
+pub const WOOL_END: Block = 93;
+/// first texture layer of the dyed wools
+pub const WOOL_LAYER: u32 = 76;
+/// The sixteen colours of wool and dye: white, orange, magenta, light blue, yellow,
+/// lime, pink, grey, light grey, cyan, purple, blue, brown, green, red, black.
+pub const COLOURS: [[u8; 3]; 16] = [
+    [234, 236, 236], [240, 118, 20], [190, 68, 180], [58, 176, 218], [248, 198, 40], [112, 186, 26], [238, 142, 172], [62, 68, 72],
+    [142, 142, 134], [22, 138, 146], [122, 42, 172], [52, 56, 158], [114, 72, 40], [84, 108, 28], [160, 38, 34], [22, 22, 26],
+];
+#[inline]
+pub fn is_wool(b: Block) -> bool {
+    b == CLOTH || (WOOL..WOOL_END).contains(&b)
+}
 /// A torch, standing or on a wall.
 #[inline]
 pub fn is_torch(b: Block) -> bool {
@@ -545,6 +561,7 @@ pub fn tex_for(b: Block, face: usize) -> u32 {
         REEDS => 73,
         FLOWER_BLUE => 74,
         DRY_TUFT => 75,
+        b if (WOOL..WOOL_END).contains(&b) => WOOL_LAYER + (b - WOOL) as u32,
         b if is_slab(b) => tex_for(SHAPE_FULL[slab_mat(b) as usize], face),
         b if is_ladder(b) => LADDER_LAYER,
         b if is_trapdoor(b) => TRAP_LAYER,
@@ -1835,6 +1852,34 @@ impl World {
             s.lights.push((wp, b));
         }
         true
+    }
+
+    /// Edits many blocks with one remesh per chunk touched (an explosion). Returns the
+    /// edits that took (bedrock and unloaded places are left alone).
+    pub fn set_many(&mut self, gfx: &Gfx, edits: &[(IVec3, Block)]) -> Vec<(IVec3, Block)> {
+        let mut done = Vec::new();
+        let mut keys: Vec<Key> = Vec::new();
+        for &(p, b) in edits {
+            let old = self.get_block(p.x, p.y, p.z);
+            if self.write_block(p.x, p.y, p.z, b) {
+                done.push((p, old));
+                let (lx, lz) = (p.x & 15, p.z & 15);
+                let xs: &[i32] = if lx <= 1 { &[0, -1] } else if lx >= 14 { &[0, 1] } else { &[0] };
+                let zs: &[i32] = if lz <= 1 { &[0, -1] } else if lz >= 14 { &[0, 1] } else { &[0] };
+                for &dz in zs {
+                    for &dx in xs {
+                        let k = ((p.x >> 4) + dx, (p.z >> 4) + dz);
+                        if !keys.contains(&k) {
+                            keys.push(k);
+                        }
+                    }
+                }
+            }
+        }
+        for k in keys {
+            self.remesh_now(gfx, k);
+        }
+        done
     }
 
     /// Edits a block and the one above it with a single remesh (both halves of a door).

@@ -34,6 +34,11 @@ pub enum Snd {
     Thunder,
     Fizz,
     Crackle,
+    /// a puffcap's fuse, and its burst
+    Fuse,
+    Boom,
+    Shear,
+    Bark,
 }
 
 /// What a block sounds like under a foot or a pick.
@@ -657,6 +662,67 @@ fn build_bank(rate: f32) -> Bank {
         }
         scaled(v, 0.14)
     }));
+    {
+        // a fuse: a hiss that rises, spitting now and then
+        let len = 1.6;
+        let n = s.len(len);
+        let mut hp = Bq::new(Fk::High, s.rate, 1800.0, 0.7);
+        let mut lp = Bq::new(Fk::Low, s.rate, 7000.0, 0.7);
+        let rate = s.rate;
+        let mut v: Vec<f32> = (0..n)
+            .map(|i| {
+                let t = i as f32 / rate / len;
+                lp.run(hp.run(s.noise())) * (0.25 + 0.75 * t) * ((1.0 - t) / 0.05).min(1.0)
+            })
+            .collect();
+        for g in 0..10 {
+            let c = s.tick(2500.0 + 300.0 * g as f32);
+            let x = s.between(0.0, len - 0.1);
+            let at = s.len(x);
+            mix(&mut v, &c, 0.8, at);
+        }
+        other.push((Snd::Fuse, scaled(v, 0.3)));
+    }
+    {
+        // a burst: a crack and a short, heavy rumble
+        let mut v = s.burst(0.35, 0.0005, 0.06, 200.0, 7000.0, 1200.0);
+        let n = s.len(1.8);
+        let mut lp = Bq::new(Fk::Low, s.rate, 160.0, 0.9);
+        let rate = s.rate;
+        let roll: Vec<f32> = (0..n)
+            .map(|i| {
+                let x = i as f32 / rate;
+                lp.run(s.noise()) * (x / 0.01).min(1.0) * (-x / 0.45).exp()
+            })
+            .collect();
+        mix(&mut v, &roll, 3.5, 0);
+        let thump = s.tone(0.5, 70.0, 35.0, 0.002, 0.15, 0.3);
+        mix(&mut v, &thump, 1.2, 0);
+        other.push((Snd::Boom, scaled(v, 0.85)));
+    }
+    {
+        // shears: two quick metal snips
+        let mut v = Vec::new();
+        for g in 0..2 {
+            let r = s.ring(0.06, &[(3200.0, 30.0, 1.0), (4700.0, 40.0, 0.6), (6100.0, 50.0, 0.3)], 0.001);
+            let at = s.len(g as f32 * 0.11);
+            mix(&mut v, &r, 1.0, at);
+            let g2 = s.grains(5, 0.03, 0.01, 2000.0, 6000.0, 1.0, 0.0);
+            mix(&mut v, &g2, 0.4, at);
+        }
+        other.push((Snd::Shear, scaled(v, 0.3)));
+    }
+    {
+        // a dog's bark: two short woofs
+        let mut v = Vec::new();
+        for g in 0..2 {
+            let f = s.between(270.0, 310.0);
+            let b = s.call(0.13, &|t| f * (1.0 - 0.35 * t), [(750.0, 140.0), (1250.0, 170.0), (2500.0, 260.0)], [(500.0, 110.0), (900.0, 140.0), (2300.0, 250.0)], 0.5, 0.5, 0.004, 0.06);
+            let at = s.len(g as f32 * 0.24);
+            mix(&mut v, &b, 1.0, at);
+        }
+        other.push((Snd::Bark, leveled(v, 0.11, 0.7)));
+    }
     sounds.extend(other.into_iter().map(|(k, v)| (k, vec![v])));
     Bank { sounds }
 }
@@ -671,7 +737,8 @@ pub fn surface(b: crate::world::Block) -> Surface {
         SAND | RED_SAND | SANDSTONE => Surface::Sand,
         SNOW => Surface::Snow,
         GLASS | PANE | LAMP | ICE => Surface::Glass,
-        LEATHER | CLOTH | BED => Surface::Cloth,
+        LEATHER | BED => Surface::Cloth,
+        b if is_wool(b) => Surface::Cloth,
         LOG | BIRCH_LOG | PLANKS | BIRCH_PLANKS | WORKBENCH | CHEST | LOOT_CHEST | FENCE | BIRCH_FENCE => Surface::Wood,
         b if is_door(b) || is_trapdoor(b) || is_ladder(b) || is_torch(b) => Surface::Wood,
         b if is_slab(b) => surface(SHAPE_FULL[slab_mat(b) as usize]),
@@ -1068,11 +1135,45 @@ fn creature(s: &mut Synth, k: Kind, c: Call, take: usize) -> Vec<f32> {
         }
         (Kind::Villager, Call::Hurt) => s.call(0.3, &|t| (230.0 - 70.0 * t) * j, UH, MM, 0.3, 0.2, 0.01, 0.12),
         (Kind::Villager, Call::Death) => s.call(0.9, &|t| (190.0 - 100.0 * t) * j, UH, MM, 0.45, 0.25, 0.02, 0.5),
+        (Kind::Sheep, c) => {
+            // "baa": an open bleat with a quick flutter in it
+            let (len, f0, fall) = match c {
+                Call::Idle => (s.between(0.5, 0.75), 235.0, 0.9),
+                Call::Hurt => (0.3, 330.0, 0.85),
+                Call::Death => (0.8, 280.0, 0.55),
+            };
+            let flutter = s.between(8.0, 11.0);
+            let mut v = s.call(len, &|t| f0 * j * (1.0 - (1.0 - fall) * t) * (1.0 + 0.045 * (t * len * TAU * flutter).sin()), EH, AA, 0.25, 0.35, 0.04, 0.2);
+            let n = v.len().max(1) as f32;
+            for (i, x) in v.iter_mut().enumerate() {
+                // the flutter is in the loudness too
+                *x *= 0.75 + 0.25 * ((i as f32 / n) * len * TAU * flutter).sin();
+            }
+            v
+        }
+        (Kind::Puffcap, c) => {
+            // wheezing puffs from somewhere under the cap
+            let puffs = match c {
+                Call::Idle => 2 + take,
+                Call::Hurt => 1,
+                Call::Death => 4,
+            };
+            let mut v = Vec::new();
+            for g in 0..puffs {
+                let len = s.between(0.14, 0.22) * if c == Call::Death { 1.6 } else { 1.0 };
+                let f = s.between(110.0, 150.0) * j * if c == Call::Hurt { 2.2 } else { 1.0 };
+                let breathy = if c == Call::Hurt { 0.6 } else { 2.5 };
+                let p = s.call(len, &|t| f * (1.0 - 0.3 * t), OH, UH, breathy, 0.2, 0.02, len * 0.6);
+                let at = s.len(g as f32 * 0.26);
+                mix(&mut v, &p, 1.0 - g as f32 * 0.12, at);
+            }
+            v
+        }
     }
 }
 
 /// Every kind of creature, for building their voices.
-const KINDS: [Kind; 9] = [Kind::Deer, Kind::Boar, Kind::Hare, Kind::Wolf, Kind::Zombie, Kind::Skeleton, Kind::Spider, Kind::Slime, Kind::Villager];
+use crate::mobs::KINDS;
 
 #[cfg(test)]
 mod tests {
@@ -1087,6 +1188,6 @@ mod tests {
             let peak = s.iter().fold(0.0f32, |m, v| m.max(v.abs()));
             assert!(peak.is_finite() && peak > 0.05 && peak <= 1.0, "sound {i} peak {peak}");
         }
-        assert_eq!(b.sounds.len(), 8 * 4 + 9 * 3 + 16);
+        assert_eq!(b.sounds.len(), 8 * 4 + 11 * 3 + 20);
     }
 }

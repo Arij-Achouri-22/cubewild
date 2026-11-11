@@ -77,7 +77,15 @@ pub const TRAPDOOR: Item = 133;
 /// oak, birch, cobblestone, stone brick (the order of `SHAPE_FULL`)
 pub const STAIRS: Item = 134;
 pub const BOAT: Item = 138;
-pub const ITEM_END: Item = 139;
+/// dyes, one per colour of `COLOURS` (+ colour)
+pub const DYE: Item = 139;
+/// from skeletons: tames wolves, grinds into white dye
+pub const BONE: Item = 155;
+/// what villagers trade in
+pub const GEM: Item = 156;
+/// dyed wool (+ colour - 1; white wool is `CLOTH`)
+pub const WOOL_ITEM: Item = 157;
+pub const ITEM_END: Item = 172;
 /// slots in a chest
 pub const CHEST_SLOTS: usize = 27;
 /// first texture layer holding item icons
@@ -87,7 +95,21 @@ pub const ICON_FOOD: u32 = ICON_BASE + 101;
 pub const ICON_AIR: u32 = ICON_BASE + 102;
 
 pub fn is_block(i: Item) -> bool {
-    i != AIR && i < 64
+    (i != AIR && i < 64) || is_wool_item(i)
+}
+
+pub fn is_wool_item(i: Item) -> bool {
+    (WOOL_ITEM..WOOL_ITEM + 15).contains(&i)
+}
+
+/// The block an item puts down (most block items are their own block).
+pub fn block_of(i: Item) -> Block {
+    if is_wool_item(i) { WOOL + (i - WOOL_ITEM) } else { i }
+}
+
+/// The colour of a dye item.
+pub fn dye_colour(i: Item) -> Option<u8> {
+    (DYE..DYE + 16).contains(&i).then(|| i - DYE)
 }
 
 pub fn valid(i: Item) -> bool {
@@ -143,7 +165,7 @@ pub fn name(i: Item) -> &'static str {
         GOLD_BLOCK => "Gold Block",
         IRON_BLOCK => "Iron Block",
         MOSSY_COBBLE => "Mossy Cobblestone",
-        CLOTH => "Cloth",
+        CLOTH => "White Wool",
         THATCH => "Thatch",
         FARMLAND => "Farmland",
         PANE => "Window Pane",
@@ -205,6 +227,39 @@ pub fn name(i: Item) -> &'static str {
         BUCKET => "Bucket",
         WATER_BUCKET => "Water Bucket",
         BOAT => "Boat",
+        BONE => "Bone",
+        GEM => "Gem",
+        i if i == DYE + 0 => "White Dye",
+        i if i == DYE + 1 => "Orange Dye",
+        i if i == DYE + 2 => "Magenta Dye",
+        i if i == DYE + 3 => "Light Blue Dye",
+        i if i == DYE + 4 => "Yellow Dye",
+        i if i == DYE + 5 => "Lime Dye",
+        i if i == DYE + 6 => "Pink Dye",
+        i if i == DYE + 7 => "Grey Dye",
+        i if i == DYE + 8 => "Light Grey Dye",
+        i if i == DYE + 9 => "Cyan Dye",
+        i if i == DYE + 10 => "Purple Dye",
+        i if i == DYE + 11 => "Blue Dye",
+        i if i == DYE + 12 => "Brown Dye",
+        i if i == DYE + 13 => "Green Dye",
+        i if i == DYE + 14 => "Red Dye",
+        i if i == DYE + 15 => "Black Dye",
+        i if i == WOOL_ITEM + 0 => "Orange Wool",
+        i if i == WOOL_ITEM + 1 => "Magenta Wool",
+        i if i == WOOL_ITEM + 2 => "Light Blue Wool",
+        i if i == WOOL_ITEM + 3 => "Yellow Wool",
+        i if i == WOOL_ITEM + 4 => "Lime Wool",
+        i if i == WOOL_ITEM + 5 => "Pink Wool",
+        i if i == WOOL_ITEM + 6 => "Grey Wool",
+        i if i == WOOL_ITEM + 7 => "Light Grey Wool",
+        i if i == WOOL_ITEM + 8 => "Cyan Wool",
+        i if i == WOOL_ITEM + 9 => "Purple Wool",
+        i if i == WOOL_ITEM + 10 => "Blue Wool",
+        i if i == WOOL_ITEM + 11 => "Brown Wool",
+        i if i == WOOL_ITEM + 12 => "Green Wool",
+        i if i == WOOL_ITEM + 13 => "Red Wool",
+        i if i == WOOL_ITEM + 14 => "Black Wool",
         FISHING_ROD => "Fishing Rod",
         RAW_FISH => "Raw Fish",
         COOKED_FISH => "Cooked Fish",
@@ -242,6 +297,8 @@ pub fn icon(i: Item) -> u32 {
         LADDER_LAYER
     } else if i == TRAPDOOR {
         TRAP_LAYER
+    } else if is_wool_item(i) {
+        tex_for(block_of(i), 0)
     } else if is_block(i) {
         tex_for(i, if i == FURNACE { 4 } else { 0 })
     } else {
@@ -497,6 +554,10 @@ pub fn desc(i: Item) -> &'static str {
         BUCKET => "Right click water to scoop it up.",
         WATER_BUCKET => "Right click to pour the water out.",
         BOAT => "Right click water to put it in. Right click it to get in, Shift to get out.",
+        BONE => "Wolves love them. Also grinds into white dye.",
+        GEM => "Villagers trade in these.",
+        i if dye_colour(i).is_some() => "Dyes wool and sheep. Mix two to get a new colour.",
+        i if is_wool_item(i) => "Soft, coloured building block. Shear sheep or dye white wool.",
         FISHING_ROD => "Hold right click on water and wait for a bite.",
         BOW => "Right click to shoot an arrow.",
         ARROW => "Ammunition for the bow.",
@@ -562,6 +623,37 @@ pub const RECIPES: &[Recipe] = &[
     r(Cat::Utility, (TRAPDOOR, 2), &[(PLANKS, 6)], WORKBENCH),
     r(Cat::Utility, (BUCKET, 1), &[(IRON_INGOT, 3)], WORKBENCH),
     r(Cat::Utility, (BOAT, 1), &[(PLANKS, 5)], WORKBENCH),
+    r(Cat::Materials, (DYE + 14, 2), &[(FLOWER_RED, 1)], AIR),
+    r(Cat::Materials, (DYE + 4, 2), &[(FLOWER_YELLOW, 1)], AIR),
+    r(Cat::Materials, (DYE + 11, 2), &[(FLOWER_BLUE, 1)], AIR),
+    r(Cat::Materials, (DYE + 15, 1), &[(COAL, 1)], AIR),
+    r(Cat::Materials, (DYE + 0, 3), &[(BONE, 1)], AIR),
+    r(Cat::Materials, (DYE + 13, 1), &[(CACTUS, 1)], AIR),
+    r(Cat::Materials, (DYE + 12, 1), &[(MUSHROOM, 1)], AIR),
+    r(Cat::Materials, (DYE + 1, 2), &[(DYE + 14, 1), (DYE + 4, 1)], AIR),
+    r(Cat::Materials, (DYE + 10, 2), &[(DYE + 14, 1), (DYE + 11, 1)], AIR),
+    r(Cat::Materials, (DYE + 6, 2), &[(DYE + 14, 1), (DYE + 0, 1)], AIR),
+    r(Cat::Materials, (DYE + 3, 2), &[(DYE + 11, 1), (DYE + 0, 1)], AIR),
+    r(Cat::Materials, (DYE + 5, 2), &[(DYE + 13, 1), (DYE + 0, 1)], AIR),
+    r(Cat::Materials, (DYE + 9, 2), &[(DYE + 11, 1), (DYE + 13, 1)], AIR),
+    r(Cat::Materials, (DYE + 7, 2), &[(DYE + 15, 1), (DYE + 0, 1)], AIR),
+    r(Cat::Materials, (DYE + 8, 2), &[(DYE + 7, 1), (DYE + 0, 1)], AIR),
+    r(Cat::Materials, (DYE + 2, 2), &[(DYE + 10, 1), (DYE + 6, 1)], AIR),
+    r(Cat::Building, (WOOL_ITEM + 0, 1), &[(CLOTH, 1), (DYE + 1, 1)], AIR),
+    r(Cat::Building, (WOOL_ITEM + 1, 1), &[(CLOTH, 1), (DYE + 2, 1)], AIR),
+    r(Cat::Building, (WOOL_ITEM + 2, 1), &[(CLOTH, 1), (DYE + 3, 1)], AIR),
+    r(Cat::Building, (WOOL_ITEM + 3, 1), &[(CLOTH, 1), (DYE + 4, 1)], AIR),
+    r(Cat::Building, (WOOL_ITEM + 4, 1), &[(CLOTH, 1), (DYE + 5, 1)], AIR),
+    r(Cat::Building, (WOOL_ITEM + 5, 1), &[(CLOTH, 1), (DYE + 6, 1)], AIR),
+    r(Cat::Building, (WOOL_ITEM + 6, 1), &[(CLOTH, 1), (DYE + 7, 1)], AIR),
+    r(Cat::Building, (WOOL_ITEM + 7, 1), &[(CLOTH, 1), (DYE + 8, 1)], AIR),
+    r(Cat::Building, (WOOL_ITEM + 8, 1), &[(CLOTH, 1), (DYE + 9, 1)], AIR),
+    r(Cat::Building, (WOOL_ITEM + 9, 1), &[(CLOTH, 1), (DYE + 10, 1)], AIR),
+    r(Cat::Building, (WOOL_ITEM + 10, 1), &[(CLOTH, 1), (DYE + 11, 1)], AIR),
+    r(Cat::Building, (WOOL_ITEM + 11, 1), &[(CLOTH, 1), (DYE + 12, 1)], AIR),
+    r(Cat::Building, (WOOL_ITEM + 12, 1), &[(CLOTH, 1), (DYE + 13, 1)], AIR),
+    r(Cat::Building, (WOOL_ITEM + 13, 1), &[(CLOTH, 1), (DYE + 14, 1)], AIR),
+    r(Cat::Building, (WOOL_ITEM + 14, 1), &[(CLOTH, 1), (DYE + 15, 1)], AIR),
     r(Cat::Utility, (BOAT, 1), &[(BIRCH_PLANKS, 5)], WORKBENCH),
     r(Cat::Utility, (COMPASS, 1), &[(IRON_INGOT, 4), (CRYSTAL, 1)], WORKBENCH),
     r(Cat::Utility, (CLOCK, 1), &[(GOLD_INGOT, 4), (CRYSTAL, 1)], WORKBENCH),
@@ -971,6 +1063,7 @@ pub fn item_of(b: Block) -> Item {
         b if is_ladder(b) => LADDER,
         b if is_trapdoor(b) => TRAPDOOR,
         b if is_torch(b) => TORCH,
+        b if (WOOL..WOOL_END).contains(&b) => WOOL_ITEM + (b - WOOL),
         LOOT_CHEST => CHEST,
         b if is_grassy(b) => GRASS,
         JUNGLE_LEAVES | ACACIA_LEAVES => LEAVES,
@@ -1047,7 +1140,7 @@ pub fn break_time(b: Block, tool: Item) -> f32 {
         b if is_grassy(b) => with(Kind::Shovel, 0.5, 2.0),
         TERRACOTTA | TERRACOTTA_PALE | TERRACOTTA_DARK => with(Kind::Pick, 1.6, 1.0),
         ICE => with(Kind::Pick, 0.6, 1.0),
-        b if is_leaves(b) || b == CLOTH || b == THATCH => {
+        b if is_leaves(b) || is_wool(b) || b == THATCH => {
             if tool == SHEARS {
                 0.04
             } else {

@@ -1,13 +1,15 @@
 //! Animals: huntable deer, boar and hare, and wolves that hunt you at night.
 //! Monsters: zombies, skeleton archers, giant spiders and slimes that roam the dark.
 //! Villagers: the peaceful people of the villages, who keep to their paths and houses.
+//! Farm life: sheep to shear and dye, animals that follow their food and breed, wolves
+//! tamed with bones into dogs. And the puffcap, a mushroom that creeps up and bursts.
 
 use crate::gfx::{EntVert, EMISSIVE};
-use crate::items::{Item, ARROW, FIBER, FLINT, HIDE, IRON_INGOT, MEAT};
+use crate::items::{self, Item, ARROW, BERRIES, BONE, COOKED_MEAT, FIBER, HIDE, IRON_INGOT, MEAT, SEEDS, SHEARS, WHEAT};
 use crate::path::{settle, walk_line, Body, Finder, Probe};
 use crate::player::{collides, move_step, ray_aabb, raycast_with};
 use crate::village::{self, Village};
-use crate::world::{hash2, is_grassy, is_ladder, is_leaves, is_solid, World, AIR, CLAY, CLOTH, LAVA, SEA, SNOW, WATER};
+use crate::world::{hash2, is_grassy, is_ladder, is_leaves, is_solid, World, AIR, CLAY, CLOTH, COLOURS, LAVA, MUSHROOM, SEA, SNOW, WATER};
 use glam::{IVec3, Mat4, Vec3};
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -39,11 +41,31 @@ pub enum Kind {
     Spider,
     Slime,
     Villager,
+    Sheep,
+    Puffcap,
 }
+
+/// Every kind, in the order they are saved by.
+pub const KINDS: [Kind; 11] = [Kind::Deer, Kind::Boar, Kind::Hare, Kind::Wolf, Kind::Zombie, Kind::Skeleton, Kind::Spider, Kind::Slime, Kind::Villager, Kind::Sheep, Kind::Puffcap];
+
+/// seconds a puffcap's fuse burns before it bursts
+pub const FUSE: f32 = 1.5;
+/// seconds a baby takes to grow up
+const GROW: f32 = 600.0;
 
 impl Kind {
     pub fn is_monster(self) -> bool {
-        matches!(self, Kind::Zombie | Kind::Skeleton | Kind::Spider | Kind::Slime)
+        matches!(self, Kind::Zombie | Kind::Skeleton | Kind::Spider | Kind::Slime | Kind::Puffcap)
+    }
+    /// What it eats: held, it lures the animal; fed, it breeds (or heals a dog).
+    pub fn food(self) -> &'static [Item] {
+        match self {
+            Kind::Sheep | Kind::Deer => &[WHEAT],
+            Kind::Boar => &[BERRIES, MUSHROOM as Item],
+            Kind::Hare => &[SEEDS, BERRIES],
+            Kind::Wolf => &[MEAT, COOKED_MEAT],
+            _ => &[],
+        }
     }
     /// the sun burns the undead
     fn undead(self) -> bool {
@@ -83,14 +105,28 @@ fn spec(k: Kind) -> Spec {
         Kind::Spider => sp(0.4, 0.6, 5, 1.4, 5.6, 0.0, 0, 0, 16.0, 2.0),
         Kind::Slime => sp(0.4, 0.7, 5, 2.2, 3.6, 0.0, 0, 0, 14.0, 2.0),
         Kind::Villager => sp(0.3, 1.8, 8, 1.5, 4.2, 0.0, 0, 0, 0.0, 0.0),
+        Kind::Sheep => sp(0.32, 1.25, 4, 1.1, 4.8, 0.0, 2, 0, 0.0, 0.0),
+        // it does no biting: it bursts
+        Kind::Puffcap => sp(0.3, 1.3, 8, 1.2, 3.4, 0.0, 0, 0, 18.0, 0.0),
     }
 }
 
-fn drops(k: Kind, rng: &mut Rng) -> Drops {
+/// The wool item of a colour.
+pub fn wool_item(c: u8) -> Item {
+    if c == 0 { CLOTH as Item } else { items::WOOL_ITEM + c - 1 }
+}
+
+fn drops(m: &Mob, rng: &mut Rng) -> Drops {
+    let k = m.kind;
     let s = spec(k);
+    if m.baby < 1.0 {
+        return [(0, 0), (0, 0)];
+    }
     match k {
-        Kind::Zombie => [(CLOTH as Item, 1), (IRON_INGOT, (rng.next() % 6 == 0) as u32)],
-        Kind::Skeleton => [(ARROW, 1 + rng.next() % 3), (FLINT, (rng.next() % 3 == 0) as u32)],
+        Kind::Zombie => [(FIBER, 1 + rng.next() % 2), (IRON_INGOT, (rng.next() % 6 == 0) as u32)],
+        Kind::Skeleton => [(ARROW, rng.next() % 3), (BONE, 1 + rng.next() % 2)],
+        Kind::Sheep => [(MEAT, 1 + rng.next() % 2), (wool_item(m.wool), !m.sheared as u32)],
+        Kind::Puffcap => [(MUSHROOM as Item, 1 + rng.next() % 2), (0, 0)],
         Kind::Spider => [(FIBER, 1 + rng.next() % 2), (0, 0)],
         Kind::Slime => [(CLAY as Item, 1 + rng.next() % 2), (0, 0)],
         Kind::Villager => [(0, 0), (0, 0)],
@@ -150,6 +186,49 @@ pub struct Mob {
     slot: usize,
     /// where a villager is walking to
     goal: Option<Vec3>,
+    /// a sheep's colour (see `COLOURS`), shorn or not, and seconds until it may grow back
+    pub wool: u8,
+    pub sheared: bool,
+    regrow: f32,
+    /// seconds left of looking for a mate, and until it can breed again
+    pub love: f32,
+    breed_cd: f32,
+    /// 0 newborn .. 1 grown
+    pub baby: f32,
+    /// a dog: follows the player, fights monsters; sitting dogs stay put
+    pub tame: bool,
+    pub sitting: bool,
+    /// saved with the world and never wanders off (pets, and animals that were bred)
+    pub keep: bool,
+    /// a puffcap's fuse: seconds burnt, below 0 when not lit
+    pub fuse: f32,
+}
+
+/// What happened to the creatures this frame, for the game to act on.
+pub enum MobEvent {
+    Born { kind: Kind, pos: Vec3 },
+    /// slain by something other than the player (a dog)
+    Killed { kind: Kind, pos: Vec3, drops: Drops },
+    /// a puffcap's fuse was lit
+    Fuse { pos: Vec3 },
+    Explode { pos: Vec3 },
+}
+
+/// What using an item on a creature did.
+pub enum Use {
+    Nothing,
+    /// ate the item (a baby grows a little faster)
+    Fed,
+    /// ate it and is now looking for a mate
+    Love,
+    Sheared { item: Item, n: u32 },
+    Dyed,
+    Tamed,
+    /// the bone was eaten but the wolf is not won over yet
+    NotYet,
+    Healed,
+    Sit(bool),
+    Trade,
 }
 
 /// Plans a mob's way to `target`: straight if that works, otherwise round the obstacles.
@@ -210,6 +289,25 @@ pub struct Mobs {
     pub ignore: bool,
     /// villagers that were killed: (the square of their village, their home in it)
     gone: HashSet<((i32, i32), usize)>,
+    /// what happened this frame (see `MobEvent`): the game takes them
+    pub events: Vec<MobEvent>,
+}
+
+/// A wild sheep's coat: mostly white, now and then grey, black, brown or pink.
+fn natural_wool(rng: &mut Rng) -> u8 {
+    match rng.next() % 100 {
+        0..=80 => 0,
+        81..=85 => 7,
+        86..=90 => 8,
+        91..=95 => 15,
+        96..=98 => 12,
+        _ => 6,
+    }
+}
+
+/// How a villager is dressed (and so what they trade in).
+fn look(m: &Mob) -> u32 {
+    hash2(m.village.as_ref().map_or(0, |v| v.region.0 as u32 ^ (v.region.1 as u32).rotate_left(16)), m.slot as i32, 7)
 }
 
 /// cells one route search may expand; with one search a frame this bounds the cost
@@ -223,7 +321,7 @@ const SAFE_LIGHT: f32 = 9.0;
 
 impl Mobs {
     pub fn new(seed: u64) -> Mobs {
-        Mobs { list: Vec::new(), shots: Vec::new(), rng: Rng(seed | 1), spawn_timer: 0.0, finder: Finder::default(), ignore: false, gone: HashSet::new() }
+        Mobs { list: Vec::new(), shots: Vec::new(), rng: Rng(seed | 1), spawn_timer: 0.0, finder: Finder::default(), ignore: false, gone: HashSet::new(), events: Vec::new() }
     }
 
     /// Puts the people of the villages round the player into their houses: everyone who
@@ -257,7 +355,7 @@ impl Mobs {
         let dist = self.rng.range(26.0, 72.0);
         let (bx, bz) = (player.x + ang.cos() * dist, player.z + ang.sin() * dist);
         let (mut animals, mut wolves, mut monsters) = (0, 0, 0);
-        for m in &self.list {
+        for m in self.list.iter().filter(|m| !m.keep) {
             match m.kind {
                 Kind::Wolf => wolves += 1,
                 Kind::Villager => {}
@@ -271,6 +369,7 @@ impl Mobs {
         if world.surface_y(px, pz).is_some_and(|top| top - py > 6) && world.sky_level(px, py, pz) == 0 {
             let deep = ((SEA + 6 - py) as f32 / 36.0).clamp(0.0, 1.0);
             if monsters < 3 + (deep * 9.0) as usize && self.rng.f() < 0.25 + 0.6 * deep {
+                let roll = self.rng.next() % 10;
                 for _ in 0..8 {
                     let (dx, dz) = (self.rng.range(-22.0, 22.0), self.rng.range(-22.0, 22.0));
                     if dx * dx + dz * dz < 81.0 {
@@ -287,11 +386,12 @@ impl Mobs {
                     if world.sky_level(x, y, z) != 0 || !world.lights_near(pos, SAFE_LIGHT).is_empty() {
                         continue;
                     }
-                    let kind = match self.rng.next() % 10 {
-                        0..=3 => Kind::Zombie,
-                        4..=6 => Kind::Skeleton,
-                        7..=8 => Kind::Spider,
-                        _ => Kind::Slime,
+                    let kind = match roll {
+                        0..=2 => Kind::Zombie,
+                        3..=5 => Kind::Skeleton,
+                        6..=7 => Kind::Spider,
+                        8 => Kind::Slime,
+                        _ => Kind::Puffcap,
                     };
                     self.add(kind, pos);
                     break;
@@ -302,18 +402,20 @@ impl Mobs {
         let roll = self.rng.next() % 6;
         let kind = if night && monsters < MAX_MONSTERS && roll < 3 {
             match self.rng.next() % 10 {
-                0..=3 => Kind::Zombie,
-                4..=6 => Kind::Skeleton,
-                7..=8 => Kind::Spider,
-                _ => Kind::Slime,
+                0..=2 => Kind::Zombie,
+                3..=5 => Kind::Skeleton,
+                6..=7 => Kind::Spider,
+                8 => Kind::Slime,
+                _ => Kind::Puffcap,
             }
         } else if night && wolves < MAX_WOLVES && roll == 3 {
             Kind::Wolf
         } else if animals < MAX_ANIMALS && roll >= 4 {
             // herds refill slowly, so hunted land stays quiet for a while
             match self.rng.next() % 10 {
-                0..=3 => Kind::Deer,
-                4..=6 => Kind::Boar,
+                0..=2 => Kind::Deer,
+                3..=4 => Kind::Boar,
+                5..=7 => Kind::Sheep,
                 _ => Kind::Hare,
             }
         } else {
@@ -321,6 +423,7 @@ impl Mobs {
         };
         let group = match kind {
             Kind::Zombie | Kind::Wolf | Kind::Deer | Kind::Hare => 1 + self.rng.next() % 2,
+            Kind::Sheep => 2 + self.rng.next() % 2,
             _ => 1,
         };
         for _ in 0..group {
@@ -347,10 +450,31 @@ impl Mobs {
 
     /// Puts one of every monster in a row in front of `p` (CUBEWILD_TEST_MOBS).
     pub fn spawn_test(&mut self, world: &World, p: Vec3) {
-        for (i, kind) in [Kind::Zombie, Kind::Skeleton, Kind::Spider, Kind::Slime].into_iter().enumerate() {
-            let (x, z) = ((p.x + i as f32 * 2.0 - 3.0).floor() as i32, (p.z + 7.0).floor() as i32);
+        for (i, kind) in [Kind::Zombie, Kind::Skeleton, Kind::Spider, Kind::Slime, Kind::Puffcap].into_iter().enumerate() {
+            let (x, z) = ((p.x + i as f32 * 2.2 - 4.4).floor() as i32, (p.z + 14.0).floor() as i32);
             if let Some(y) = world.surface_y(x, z) {
                 self.add(kind, Vec3::new(x as f32 + 0.5, y as f32 + 1.01, z as f32 + 0.5));
+            }
+        }
+        // and the farm: a white sheep, a red one, a shorn one, a lamb, a sheep in love,
+        // and a sitting dog
+        for i in 0..6 {
+            let (x, z) = ((p.x + i as f32 * 1.9 - 4.75).floor() as i32, (p.z + 9.0).floor() as i32);
+            let Some(y) = world.surface_y(x, z) else { continue };
+            let kind = if i == 5 { Kind::Wolf } else { Kind::Sheep };
+            self.add(kind, Vec3::new(x as f32 + 0.5, y as f32 + 1.01, z as f32 + 0.5));
+            let m = self.list.last_mut().unwrap();
+            m.yaw = std::f32::consts::PI;
+            m.heading = m.yaw;
+            m.timer = 1000.0;
+            m.keep = true;
+            match i {
+                0 => m.wool = 0,
+                1 => m.wool = 14,
+                2 => m.sheared = true,
+                3 => m.baby = 0.0,
+                4 => (m.love, m.wool) = (1000.0, 11),
+                _ => (m.tame, m.sitting) = (true, true),
             }
         }
     }
@@ -391,13 +515,143 @@ impl Mobs {
                 village: None,
                 slot: 0,
                 goal: None,
+                wool: if kind == Kind::Sheep { natural_wool(&mut self.rng) } else { 0 },
+                sheared: false,
+                regrow: 0.0,
+                love: 0.0,
+                breed_cd: 0.0,
+                baby: 1.0,
+                tame: false,
+                sitting: false,
+                keep: false,
+                fuse: -1.0,
             });
+        }
+    }
+
+    /// Puts a creature into the world and returns its index (for babies and loading).
+    pub fn spawn(&mut self, kind: Kind, pos: Vec3) -> usize {
+        self.add(kind, pos);
+        self.list.len() - 1
+    }
+
+    /// Keeps a villager standing where they are for a moment (while trading).
+    pub fn hold(&mut self, i: usize) {
+        let m = &mut self.list[i];
+        m.goal = None;
+        m.timer = m.timer.max(2.0);
+    }
+
+    /// The villager's home: its village's square and its house in it.
+    pub fn villager_id(&self, i: usize) -> Option<((i32, i32), usize)> {
+        let m = self.list.get(i)?;
+        (m.kind == Kind::Villager).then(|| m.village.as_ref().map(|v| (v.region, m.slot))).flatten()
+    }
+
+    /// A villager's trade, read from how they are dressed (0..6, see `trade`).
+    pub fn profession(&self, i: usize) -> u32 {
+        let m = &self.list[i];
+        look(m) % 6
+    }
+
+    /// Uses `item` on creature `i`: feeding, shearing, dyeing, taming, telling a dog to sit.
+    pub fn interact(&mut self, i: usize, item: Item) -> Use {
+        let rng = &mut self.rng;
+        let m = &mut self.list[i];
+        if m.dead >= 0.0 {
+            return Use::Nothing;
+        }
+        if m.kind == Kind::Villager {
+            return Use::Trade;
+        }
+        if m.kind == Kind::Sheep {
+            if item == SHEARS && !m.sheared && m.baby >= 1.0 {
+                m.sheared = true;
+                m.regrow = rng.range(40.0, 90.0);
+                return Use::Sheared { item: wool_item(m.wool), n: 1 + rng.next() % 3 };
+            }
+            if let Some(c) = items::dye_colour(item) {
+                if c != m.wool {
+                    m.wool = c;
+                    return Use::Dyed;
+                }
+                return Use::Nothing;
+            }
+        }
+        if m.kind == Kind::Wolf && !m.tame {
+            if item == BONE {
+                if rng.next() % 3 == 0 {
+                    m.tame = true;
+                    m.keep = true;
+                    m.flee = 0.0;
+                    m.sitting = false;
+                    return Use::Tamed;
+                }
+                return Use::NotYet;
+            }
+            return Use::Nothing;
+        }
+        if m.kind.food().contains(&item) {
+            let max = spec(m.kind).hp;
+            if m.tame && m.hp < max {
+                m.hp = (m.hp + 4).min(max);
+                return Use::Healed;
+            }
+            if m.baby < 1.0 {
+                m.baby = (m.baby + 0.1).min(1.0);
+                return Use::Fed;
+            }
+            if m.breed_cd <= 0.0 && m.love <= 0.0 {
+                m.love = 25.0;
+                m.keep = true;
+                return Use::Love;
+            }
+            return Use::Nothing;
+        }
+        if m.tame {
+            m.sitting = !m.sitting;
+            return Use::Sit(m.sitting);
+        }
+        Use::Nothing
+    }
+
+    /// The creatures worth keeping, one per line: kind, place, facing and their state.
+    pub fn save(&self, path: &std::path::Path) {
+        let mut out = String::new();
+        for m in self.list.iter().filter(|m| m.keep && m.dead < 0.0) {
+            let k = KINDS.iter().position(|&k| k == m.kind).unwrap_or(0);
+            out += &format!("{} {} {} {} {} {} {} {} {} {} {}\n", k, m.pos.x, m.pos.y, m.pos.z, m.yaw, m.wool, m.sheared as u8, m.tame as u8, m.sitting as u8, m.baby, m.hp);
+        }
+        if let Err(e) = std::fs::write(path, out) {
+            eprintln!("cubewild: failed to save animals: {e}");
+        }
+    }
+
+    pub fn load(&mut self, path: &std::path::Path) {
+        for line in std::fs::read_to_string(path).unwrap_or_default().lines() {
+            let v: Vec<f32> = line.split_whitespace().filter_map(|t| t.parse().ok()).collect();
+            if v.len() < 11 || !v.iter().all(|x| x.is_finite()) {
+                continue;
+            }
+            let Some(&kind) = KINDS.get(v[0] as usize) else { continue };
+            let i = self.spawn(kind, Vec3::new(v[1], v[2], v[3]));
+            let m = &mut self.list[i];
+            m.yaw = v[4];
+            m.heading = v[4];
+            m.wool = (v[5] as u8).min(15);
+            m.sheared = v[6] > 0.5;
+            m.tame = v[7] > 0.5;
+            m.sitting = v[8] > 0.5;
+            m.baby = v[9].clamp(0.0, 1.0);
+            m.hp = (v[10] as i32).clamp(1, spec(kind).hp);
+            m.keep = true;
         }
     }
 
     /// Advances every animal and monster. Returns the damage they dealt to the player
     /// up close; arrows shot by skeletons are left in `shots`.
-    pub fn update(&mut self, world: &World, player: Vec3, sneaking: bool, night: bool, dt: f32) -> f32 {
+    /// `lure` is the item in the player's hand: animals follow their food.
+    pub fn update(&mut self, world: &World, player: Vec3, sneaking: bool, night: bool, lure: Item, dt: f32) -> f32 {
         let mut damage = 0.0;
         self.spawn_timer -= dt;
         if self.spawn_timer <= 0.0 {
@@ -405,16 +659,49 @@ impl Mobs {
             self.try_spawn(world, player, night);
         }
         // wolves and monsters slink away at dawn once they are out of sight
+        // (kept animals and pets stay)
         self.list.retain(|m| {
-            night || !(m.kind == Kind::Wolf || m.kind.is_monster()) || (m.pos - player).length_squared() < 34.0 * 34.0
+            m.keep || night || !(m.kind == Kind::Wolf || m.kind.is_monster()) || (m.pos - player).length_squared() < 34.0 * 34.0
         });
         // animals whose chunk got unloaded are removed rather than left frozen in place
+        // (kept ones wait there, frozen, for the player to come back)
         self.list.retain(|m| {
             m.dead < 1.3
-                && (m.pos - player).length_squared() < 120.0 * 120.0
                 && m.pos.y > -10.0
-                && world.is_loaded(m.pos.x.floor() as i32, m.pos.z.floor() as i32)
+                && (m.keep || ((m.pos - player).length_squared() < 120.0 * 120.0 && world.is_loaded(m.pos.x.floor() as i32, m.pos.z.floor() as i32)))
         });
+        // before anyone moves: who each animal in love is heading for, and which
+        // monster each dog is after
+        let n = self.list.len();
+        let mut mate: Vec<Option<usize>> = vec![None; n];
+        let mut prey: Vec<Option<usize>> = vec![None; n];
+        for i in 0..n {
+            let a = &self.list[i];
+            if a.dead >= 0.0 {
+                continue;
+            }
+            if a.love > 0.0 && a.baby >= 1.0 {
+                mate[i] = (0..n)
+                    .filter(|&j| j != i)
+                    .filter(|&j| {
+                        let b = &self.list[j];
+                        b.kind == a.kind && b.love > 0.0 && b.baby >= 1.0 && b.dead < 0.0 && (b.pos - a.pos).length_squared() < 12.0 * 12.0
+                    })
+                    .min_by(|&x, &y| (self.list[x].pos - a.pos).length_squared().total_cmp(&(self.list[y].pos - a.pos).length_squared()));
+            }
+            if a.tame && !a.sitting {
+                prey[i] = (0..n)
+                    .filter(|&j| {
+                        let b = &self.list[j];
+                        b.kind.is_monster() && b.dead < 0.0 && (b.pos - a.pos).length_squared() < 12.0 * 12.0 && (b.pos - player).length_squared() < 20.0 * 20.0
+                    })
+                    .min_by(|&x, &y| (self.list[x].pos - a.pos).length_squared().total_cmp(&(self.list[y].pos - a.pos).length_squared()));
+            }
+        }
+        let targets: Vec<Option<Vec3>> = (0..n).map(|i| mate[i].or(prey[i]).map(|j| self.list[j].pos)).collect();
+        let mut births: Vec<(usize, usize)> = Vec::new();
+        let mut bites: Vec<(usize, Vec3)> = Vec::new();
+        let events = &mut self.events;
         let ignore = self.ignore;
         let rng = &mut self.rng;
         let shots = &mut self.shots;
@@ -422,12 +709,37 @@ impl Mobs {
         let mut probe = Probe::new(world);
         // route searches allowed this frame; the others wait their turn
         let mut searches = 1;
-        for m in &mut self.list {
+        for (idx, m) in self.list.iter_mut().enumerate() {
             let s = spec(m.kind);
-            m.age += dt;
-            m.hurt = (m.hurt - dt).max(0.0);
             let to_player = player - m.pos;
             let dist = to_player.length();
+            // a dog left far behind catches up
+            if m.tame && !m.sitting && m.dead < 0.0 && dist > 28.0 {
+                let back = Vec3::new(-to_player.x, 0.0, -to_player.z).normalize_or(Vec3::X) * 2.0;
+                if !collides(world, player + back, s.hw, s.h) {
+                    m.pos = player + back;
+                    m.vel = Vec3::ZERO;
+                }
+            }
+            if m.keep && !world.is_loaded(m.pos.x.floor() as i32, m.pos.z.floor() as i32) {
+                continue;
+            }
+            let to_player = player - m.pos;
+            let dist = to_player.length();
+            m.age += dt;
+            m.hurt = (m.hurt - dt).max(0.0);
+            m.love = (m.love - dt).max(0.0);
+            m.breed_cd -= dt;
+            if m.baby < 1.0 {
+                m.baby = (m.baby + dt / GROW).min(1.0);
+            }
+            if m.sheared {
+                // grazing grows the wool back
+                m.regrow -= dt;
+                if m.regrow <= 0.0 && m.grazing {
+                    m.sheared = false;
+                }
+            }
             let mut speed = 0.0;
             // direction to look in when it differs from the direction of travel
             let mut face: Option<f32> = None;
@@ -463,8 +775,52 @@ impl Mobs {
                 } else {
                     s.sight
                 };
-                hunting = m.flee <= 0.0 && dist < sight;
-                if m.kind == Kind::Villager && m.flee <= 0.0 {
+                hunting = m.flee <= 0.0 && dist < sight && !m.tame;
+                let lured = !m.kind.is_monster() && !(m.kind == Kind::Wolf && !m.tame) && m.kind.food().contains(&lure) && dist < 10.0 && m.flee <= 0.0;
+                if m.tame && m.sitting {
+                    // sits where it was told, watching the player
+                    face = Some(to_player.x.atan2(to_player.z));
+                } else if let (Some(t), true) = (targets[idx], m.love > 0.0 || m.tame) {
+                    // off to its mate, or after a monster
+                    let d = t - m.pos;
+                    let flat = Vec3::new(d.x, 0.0, d.z).length();
+                    m.heading = d.x.atan2(d.z);
+                    if m.love > 0.0 {
+                        speed = if flat > 1.1 { s.walk } else { 0.0 };
+                        if flat < 1.3 {
+                            births.push((idx, mate[idx].unwrap()));
+                        }
+                    } else {
+                        speed = if flat > 1.0 { s.run } else { 0.0 };
+                        if flat < 1.6 && d.y.abs() < 1.8 && m.bite <= 0.0 {
+                            m.bite = 0.9;
+                            bites.push((prey[idx].unwrap(), m.pos));
+                        }
+                    }
+                } else if m.tame {
+                    // a dog keeps close to the player
+                    m.heading = to_player.x.atan2(to_player.z);
+                    if dist > 3.5 {
+                        speed = if dist > 9.0 { s.run } else { s.walk * 1.6 };
+                        m.repath -= dt;
+                        m.distrust -= dt;
+                        if m.repath <= 0.0 {
+                            plan(m, &s, player, 3, &mut probe, finder, &mut searches, rng);
+                        }
+                        follow(m, &s);
+                    } else {
+                        face = Some(m.heading);
+                    }
+                } else if lured && m.love <= 0.0 {
+                    // follows the food in the player's hand, and waits in front of them
+                    m.grazing = false;
+                    m.heading = to_player.x.atan2(to_player.z);
+                    if dist > 2.4 {
+                        speed = s.walk * 1.3;
+                    } else {
+                        face = Some(m.heading);
+                    }
+                } else if m.kind == Kind::Villager && m.flee <= 0.0 {
                     // home for the night; by day, now standing about, now off to another
                     // part of the village
                     let home = m.village.as_ref().map_or(m.pos, |v| v.homes[m.slot]);
@@ -544,6 +900,28 @@ impl Mobs {
                                     let jitter = Vec3::new(rng.range(-0.9, 0.9), rng.range(-0.6, 0.6), rng.range(-0.9, 0.9));
                                     shots.push((from, (aim - from) / t + Vec3::Y * (10.0 * t) + jitter));
                                 }
+                            }
+                        }
+                        Kind::Puffcap => {
+                            // creeps close, then its fuse burns; it gives up if you get away
+                            let close = flat < 2.6 && to_player.y.abs() < 2.0;
+                            if m.fuse >= 0.0 {
+                                if dist > 5.5 {
+                                    m.fuse = -1.0;
+                                } else {
+                                    m.fuse += dt;
+                                    face = Some(toward);
+                                    if m.fuse >= FUSE {
+                                        events.push(MobEvent::Explode { pos: m.pos + Vec3::Y * 0.6 });
+                                        m.dead = 1.3; // gone in the blast, leaving nothing
+                                        m.hp = 0;
+                                    }
+                                }
+                            } else if close {
+                                m.fuse = 0.0;
+                                events.push(MobEvent::Fuse { pos: m.pos });
+                            } else if chase {
+                                speed = s.run;
                             }
                         }
                         Kind::Spider => {
@@ -685,6 +1063,36 @@ impl Mobs {
             m.graze += (graze_target - m.graze) * (1.0 - (-dt * 5.0).exp());
             m.phase += hs * dt * 4.2;
         }
+        // pairs that met make a baby between them
+        for (a, b) in births {
+            if self.list[a].love <= 0.0 || self.list[b].love <= 0.0 {
+                continue;
+            }
+            let (kind, pos) = (self.list[a].kind, (self.list[a].pos + self.list[b].pos) * 0.5);
+            let (wool, tame) = (if self.rng.f() < 0.5 { self.list[a].wool } else { self.list[b].wool }, self.list[a].tame);
+            for k in [a, b] {
+                let m = &mut self.list[k];
+                m.love = 0.0;
+                m.breed_cd = 240.0;
+                m.keep = true;
+            }
+            let c = self.spawn(kind, pos);
+            let m = &mut self.list[c];
+            m.baby = 0.0;
+            m.keep = true;
+            m.wool = wool;
+            m.tame = tame;
+            self.events.push(MobEvent::Born { kind, pos });
+        }
+        // dogs' bites
+        for (t, from) in bites {
+            if t < self.list.len() && self.list[t].dead < 0.0 {
+                let (kind, pos) = (self.list[t].kind, self.list[t].pos);
+                if let Some(drops) = self.hit(t, from, 3) {
+                    self.events.push(MobEvent::Killed { kind, pos, drops });
+                }
+            }
+        }
         damage
     }
 
@@ -719,6 +1127,7 @@ impl Mobs {
         m.hurt = 0.3;
         // prey bolts, a wolf backs off for a moment, monsters just keep coming
         m.flee = match m.kind {
+            Kind::Wolf if m.tame => 0.0,
             Kind::Wolf => 0.7,
             k if k.is_monster() => 0.0,
             _ => 6.0,
@@ -728,9 +1137,11 @@ impl Mobs {
         away.y = 0.0;
         let away = away.normalize_or_zero();
         m.vel += away * 6.0 + Vec3::new(0.0, 5.0, 0.0);
+        m.fuse = -1.0;
+        m.sitting = false;
         if m.hp <= 0 {
             m.dead = 0.0;
-            return Some(drops(m.kind, &mut self.rng));
+            return Some(drops(m, &mut self.rng));
         }
         None
     }
@@ -764,7 +1175,18 @@ impl Mobs {
             // hares bound along; everything breathes a little so nothing looks frozen
             let hop = if m.kind == Kind::Hare && alive { (m.phase * 1.4).sin().abs() * 0.16 * moving } else { 0.0 };
             let breathe = if alive { (m.age * 2.2).sin() * 0.012 } else { 0.0 };
-            let mut base = Mat4::from_translation(rel + Vec3::new(0.0, hop, 0.0)) * Mat4::from_rotation_y(m.yaw);
+            // babies are small; a sitting dog sinks onto its haunches
+            let grown = 0.5 + 0.5 * m.baby;
+            let sit = if m.sitting { -0.14 } else { 0.0 };
+            let mut base = Mat4::from_translation(rel + Vec3::new(0.0, hop + sit, 0.0)) * Mat4::from_rotation_y(m.yaw) * Mat4::from_scale(Vec3::splat(grown));
+            if m.love > 0.0 && alive {
+                // a pair of little hearts over its head
+                let h = spec(m.kind).h * grown + 0.3 + (m.age * 2.0).sin() * 0.06;
+                let hm = Mat4::from_translation(rel + Vec3::Y * h) * Mat4::from_rotation_y(m.age * 1.5);
+                push_box(out, &hm, Vec3::new(-0.09, 0.0, -0.03), Vec3::new(-0.01, 0.09, 0.03), [230, 40, 70], EMISSIVE);
+                push_box(out, &hm, Vec3::new(0.01, 0.0, -0.03), Vec3::new(0.09, 0.09, 0.03), [230, 40, 70], EMISSIVE);
+                push_box(out, &hm, Vec3::new(-0.06, -0.07, -0.03), Vec3::new(0.06, 0.02, 0.03), [230, 40, 70], EMISSIVE);
+            }
             if m.dead >= 0.0 {
                 let a = (m.dead / 0.35).min(1.0) * std::f32::consts::FRAC_PI_2;
                 base = base * Mat4::from_rotation_z(a);
@@ -789,6 +1211,7 @@ impl Mobs {
                 Kind::Boar => Vec3::new(0.0, 0.62, 0.46),
                 Kind::Hare => Vec3::new(0.0, 0.32, 0.14),
                 Kind::Wolf => Vec3::new(0.0, 0.66, 0.4),
+                Kind::Sheep => Vec3::new(0.0, 0.84, 0.44),
                 _ => Vec3::ZERO,
             };
             let head = base * Mat4::from_translation(head_pivot) * Mat4::from_rotation_x(head_ang) * Mat4::from_translation(-head_pivot);
@@ -866,10 +1289,37 @@ impl Mobs {
                     part(&head, [-0.05, 0.68, 0.9], [0.05, 0.74, 0.96], [20, 20, 22]); // nose
                     part(&head, [-0.16, 0.9, 0.44], [-0.07, 1.04, 0.52], dark); // ears
                     part(&head, [0.07, 0.9, 0.44], [0.16, 1.04, 0.52], dark);
-                    part(&head, [-0.13, 0.76, 0.715], [-0.07, 0.81, 0.725], [255, 214, 70]); // eyes
-                    part(&head, [0.07, 0.76, 0.715], [0.13, 0.81, 0.725], [255, 214, 70]);
+                    // (a dog's eyes are warm brown, and it wears a red collar)
+                    let eye = if m.tame { [90, 60, 30] } else { [255, 214, 70] };
+                    part(&head, [-0.13, 0.76, 0.715], [-0.07, 0.81, 0.725], eye); // eyes
+                    part(&head, [0.07, 0.76, 0.715], [0.13, 0.81, 0.725], eye);
+                    if m.tame {
+                        part(&body, [-0.18, 0.56, 0.36], [0.18, 0.84, 0.46], [196, 36, 36]);
+                    }
                     drop(part);
                     legs(out, 0.14, 0.34, 0.44, 0.06, dark);
+                }
+                Kind::Sheep => {
+                    let wool = COLOURS[m.wool as usize];
+                    let (face, dark) = ([214, 196, 172], [74, 62, 54]);
+                    if m.sheared {
+                        part(&body, [-0.2, 0.5, -0.46], [0.2, 0.86, 0.44], [222, 206, 186]);
+                    } else {
+                        // a thick coat, a little uneven on top
+                        part(&body, [-0.3, 0.42, -0.56], [0.3, 1.02, 0.52], wool);
+                        part(&body, [-0.24, 1.02, -0.4], [0.24, 1.08, 0.3], wool.map(|v| (v as u16 * 9 / 10) as u8));
+                    }
+                    part(&head, [-0.15, 0.7, 0.46], [0.15, 1.02, 0.8], face); // head
+                    part(&head, [-0.08, 0.72, 0.8], [0.08, 0.84, 0.84], dark); // muzzle
+                    part(&head, [-0.13, 0.86, 0.79], [-0.07, 0.91, 0.805], [30, 26, 24]); // eyes
+                    part(&head, [0.07, 0.86, 0.79], [0.13, 0.91, 0.805], [30, 26, 24]);
+                    part(&head, [-0.25, 0.88, 0.52], [-0.15, 0.94, 0.62], face); // ears
+                    part(&head, [0.15, 0.88, 0.52], [0.25, 0.94, 0.62], face);
+                    if !m.sheared {
+                        part(&head, [-0.16, 0.96, 0.46], [0.16, 1.06, 0.66], wool); // tuft
+                    }
+                    drop(part);
+                    legs(out, 0.18, 0.36, 0.46, 0.07, if m.sheared { face } else { dark });
                 }
                 _ => {}
             }
@@ -960,9 +1410,31 @@ fn draw_monster(out: &mut Vec<EntVert>, m: &Mob, base: &Mat4, swing: f32, tint: 
                 part(&body, [sx * 0.17 - 0.07, 0.36, 0.4], [sx * 0.17 + 0.07, 0.52, 0.41], [20, 44, 44], O);
             }
         }
+        Kind::Puffcap => {
+            // a stout mushroom on stubby feet; when its fuse burns it swells and flashes
+            let lit = m.fuse >= 0.0;
+            let swell = if lit { 1.0 + 0.28 * (m.fuse / FUSE).min(1.0) } else { 1.0 };
+            let flash = lit && (m.fuse * m.fuse * 14.0).sin() > 0.0;
+            let w = |c: [u8; 3]| if flash { [255, 255, 255] } else { c };
+            let (stalk, cap, spot, gill) = ([226, 214, 186], [186, 44, 38], [246, 240, 228], [180, 150, 120]);
+            let body = *base * Mat4::from_translation(Vec3::new(0.0, 0.2, 0.0)) * Mat4::from_scale(Vec3::new(swell, 1.0 + (swell - 1.0) * 0.5, swell)) * Mat4::from_translation(Vec3::new(0.0, -0.2, 0.0));
+            part(&body, [-0.2, 0.18, -0.2], [0.2, 0.86, 0.2], w(stalk), O); // stalk
+            part(&body, [-0.46, 0.84, -0.46], [0.46, 0.92, 0.46], w(gill), O); // gills
+            part(&body, [-0.48, 0.92, -0.48], [0.48, 1.22, 0.48], w(cap), O); // cap
+            part(&body, [-0.34, 1.22, -0.34], [0.34, 1.3, 0.34], w(cap), O);
+            for (x, z) in [(-0.3, 0.2), (0.22, -0.28), (0.05, 0.36), (-0.36, -0.22), (0.38, 0.12)] {
+                part(&body, [x - 0.07, 1.205, z - 0.07], [x + 0.07, 1.31, z + 0.07], w(spot), O);
+            }
+            // a little sleepy face on the stalk
+            for sx in [-1.0f32, 1.0] {
+                part(&body, [sx * 0.08 - 0.03, 0.6, 0.2], [sx * 0.08 + 0.03, 0.66, 0.21], [30, 24, 20], O);
+                part(&limb([sx * 0.11, 0.2, 0.0], sx * swing * 0.6), [-0.08, -0.2, -0.09], [0.08, 0.0, 0.11], w(stalk), O);
+            }
+            part(&body, [-0.05, 0.5, 0.2], [0.05, 0.53, 0.21], [90, 50, 40], O);
+        }
         Kind::Villager => {
             // dressed each in their own colours, some in a straw hat, some in a cap
-            let look = hash2(m.village.as_ref().map_or(0, |v| v.region.0 as u32 ^ (v.region.1 as u32).rotate_left(16)), m.slot as i32, 7);
+            let look = look(m);
             const TUNICS: [[u8; 3]; 6] = [[156, 62, 52], [58, 92, 150], [84, 124, 62], [190, 140, 56], [112, 70, 120], [200, 188, 160]];
             const SKINS: [[u8; 3]; 4] = [[232, 190, 152], [204, 156, 112], [160, 112, 76], [116, 78, 54]];
             const HAIRS: [[u8; 3]; 4] = [[52, 38, 28], [110, 72, 38], [176, 140, 76], [150, 150, 150]];
@@ -1023,5 +1495,68 @@ pub fn push_box(out: &mut Vec<EntVert>, m: &Mat4, min: Vec3, max: Vec3, c: [u8; 
         for i in [0, 1, 2, 0, 2, 3] {
             out.push(EntVert { pos: q[i].into(), color: col });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn field() -> World {
+        World::flat(|_, y, _| (y == 9).then_some(crate::world::GRASS))
+    }
+
+    #[test]
+    fn two_animals_in_love_make_a_baby() {
+        let w = field();
+        let mut mobs = Mobs::new(5);
+        mobs.ignore = true;
+        let a = mobs.spawn(Kind::Sheep, Vec3::new(2.5, 10.0, 2.5));
+        let b = mobs.spawn(Kind::Sheep, Vec3::new(5.5, 10.0, 2.5));
+        assert!(matches!(mobs.interact(a, WHEAT), Use::Love));
+        assert!(matches!(mobs.interact(b, WHEAT), Use::Love));
+        let player = Vec3::new(30.0, 10.0, 30.0);
+        for _ in 0..(8.0 * 60.0) as usize {
+            mobs.update(&w, player, false, false, AIR, 1.0 / 60.0);
+            if mobs.list.iter().any(|m| m.baby < 1.0) {
+                break;
+            }
+        }
+        let baby = mobs.list.iter().find(|m| m.baby < 1.0).expect("a lamb is born");
+        assert!(baby.kind == Kind::Sheep && baby.keep);
+        assert!(mobs.events.iter().any(|e| matches!(e, MobEvent::Born { kind: Kind::Sheep, .. })));
+        // the parents cannot breed again straight away
+        assert!(matches!(mobs.interact(a, WHEAT), Use::Nothing));
+    }
+
+    #[test]
+    fn a_shorn_sheep_gives_its_colour_and_a_dyed_one_changes() {
+        let mut mobs = Mobs::new(9);
+        let i = mobs.spawn(Kind::Sheep, Vec3::new(0.5, 10.0, 0.5));
+        assert!(matches!(mobs.interact(i, items::DYE + 14), Use::Dyed));
+        match mobs.interact(i, SHEARS) {
+            Use::Sheared { item, n } => assert!(item == items::WOOL_ITEM + 13 && (1..=3).contains(&n)),
+            _ => panic!("shears shear"),
+        }
+        assert!(matches!(mobs.interact(i, SHEARS), Use::Nothing));
+    }
+
+    #[test]
+    fn a_puffcap_next_to_the_player_bursts() {
+        let w = field();
+        let mut mobs = Mobs::new(3);
+        mobs.spawn(Kind::Puffcap, Vec3::new(4.5, 10.0, 2.5));
+        let player = Vec3::new(2.5, 10.0, 2.5);
+        let mut lit = false;
+        for _ in 0..(4.0 * 60.0) as usize {
+            mobs.update(&w, player, false, true, AIR, 1.0 / 60.0);
+            lit |= mobs.events.iter().any(|e| matches!(e, MobEvent::Fuse { .. }));
+            if mobs.events.iter().any(|e| matches!(e, MobEvent::Explode { .. })) {
+                assert!(lit, "the fuse burns first");
+                return;
+            }
+            mobs.events.clear();
+        }
+        panic!("no burst");
     }
 }
