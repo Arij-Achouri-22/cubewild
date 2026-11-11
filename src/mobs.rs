@@ -5,7 +5,7 @@ use crate::gfx::{EntVert, EMISSIVE};
 use crate::items::{Item, ARROW, FIBER, FLINT, HIDE, IRON_INGOT, MEAT};
 use crate::path::{settle, walk_line, Body, Finder, Probe};
 use crate::player::{collides, move_step, ray_aabb, raycast_with};
-use crate::world::{is_ladder, is_leaves, is_solid, World, AIR, CLAY, CLOTH, GRASS, LAVA, SEA, SNOW, WATER};
+use crate::world::{is_grassy, is_ladder, is_leaves, is_solid, World, AIR, CLAY, CLOTH, LAVA, SEA, SNOW, WATER};
 use glam::{IVec3, Mat4, Vec3};
 
 pub struct Rng(pub u64);
@@ -246,7 +246,7 @@ impl Mobs {
                 if !is_solid(top) || is_leaves(top) || !world.lights_near(pos, SAFE_LIGHT).is_empty() {
                     continue;
                 }
-            } else if top != GRASS && !(top == SNOW && kind == Kind::Hare) {
+            } else if !is_grassy(top) && !(top == SNOW && kind == Kind::Hare) {
                 continue;
             }
             let s = spec(kind);

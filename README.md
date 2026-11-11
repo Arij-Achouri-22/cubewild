@@ -1,7 +1,7 @@
 # Cubewild
 
 A small open-world voxel sandbox in Rust (wgpu/Vulkan + winit): build with blocks, explore
-endless terrain with caves, ores and deserts, hunt deer, boar and hare, and survive the
+an endless world of seas, deserts, jungles, snowfields and mountains, with caves and ores, hunt deer, boar and hare, and survive the
 wolves and monsters that come out at night.
 
 ## Run
@@ -37,6 +37,29 @@ the pause menu brings you back.
   and click the list with a stack on the mouse to get rid of it.
 
 A world keeps the mode it was made in.
+
+## The world
+
+A new world is laid out the way Minecraft 1.18+ lays out its own: slow maps of how far
+inland, how eroded, how warm and how wet a place is shape the ground and pick its biome, so
+the country changes as you travel (F3 names the biome you stand in).
+
+- **Seas**: about three tenths of the world, from shelves to deep ocean, warm with sandy
+  beds or frozen over with pack ice and icebergs. **Rivers** wind through every country
+  down at sea level, and freeze in the cold. **Beaches** line the coasts.
+- **Plains and meadows**: open grass with scattered trees and patches of red, yellow and
+  blue flowers. **Forests** of oak and birch, with mushrooms, berries and ferns.
+- **Taiga**: pine woods with ferns and berries; further into the cold, **snowy taiga** and
+  **snowy plains**, where the grass lies under snow and still water is ice.
+- **Desert**: sand over sandstone, cacti and dead bushes. **Badlands**: hot, rugged country
+  that stands in terraces of banded terracotta over red sand.
+- **Savanna**: dry yellow grass and flat-topped trees. **Jungle**: giant trees over thick
+  undergrowth. **Swamp**: drowned flat land, dark grass, reeds and squat wide oaks.
+- **Mountains** rise inland; it gets colder with height, so their slopes turn to pine
+  woods, then bare rock, then snow (hot country keeps bare peaks).
+
+Worlds made before biomes existed keep their old terrain: a world stays with the generator
+it was made with, so nothing already built is disturbed. Start a new world to see the rest.
 
 ## Controls
 

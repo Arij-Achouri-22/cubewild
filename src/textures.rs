@@ -2,7 +2,7 @@
 
 pub const TEX: usize = 16;
 /// first layer holding item and HUD icons
-pub const ICON_BASE: usize = 64;
+pub const ICON_BASE: usize = 96;
 /// textures added after the icons: chest side, chest top, ladder, trapdoor
 pub const EXTRA_BASE: usize = ICON_BASE + 103;
 /// icons of the four slabs and two fences
@@ -71,6 +71,9 @@ fn pixel(layer: usize, x: i32, y: i32) -> [u8; 4] {
         let n = h(layer as u32, x, y);
         let c = if layer == ARM_TEX { [226.0, 176.0, 134.0] } else { [176.0, 92.0, 52.0] };
         return shade(c, 0.93 + n * 0.07);
+    }
+    if (57..ICON_BASE).contains(&layer) {
+        return biome_pixel(layer, x, y);
     }
     // (doors keep the numbering their drawing code was written for)
     let layer = if layer >= DOOR_TEX { layer - DOOR_TEX + 56 } else { layer };
@@ -477,6 +480,104 @@ fn pixel(layer: usize, x: i32, y: i32) -> [u8; 4] {
     }
 }
 
+
+/// Blocks of the biomes (layers 57 up to the icons; `world::tex_for` has the list).
+fn biome_pixel(layer: usize, x: i32, y: i32) -> [u8; 4] {
+    let l = layer as u32;
+    let n = h(l, x, y);
+    let tint = |c: [f32; 3]| {
+        let k = if n > 0.88 { 0.8 } else { 0.9 + n * 0.22 };
+        shade(c, k)
+    };
+    // a side of grassy soil: a fringe of `c` over dirt
+    let side = |c: [f32; 3]| {
+        let edge = 2 + (h(l + 50, x, 0) * 3.0) as i32;
+        if y < edge { tint(c) } else { dirt(2, x, y) }
+    };
+    let leaf = |c: [f32; 3]| {
+        let k = if n > 0.8 { 0.62 } else if n < 0.15 { 1.18 } else { 0.86 + n * 0.2 };
+        shade(c, k)
+    };
+    const DRY: [f32; 3] = [176.0, 166.0, 78.0];
+    const LUSH: [f32; 3] = [58.0, 172.0, 44.0];
+    const SWAMP: [f32; 3] = [86.0, 112.0, 62.0];
+    match layer {
+        // ice: pale blue with fine cracks
+        57 => {
+            let crack = (x + y * 3) % 11 == 0 && h(l + 1, x / 3, y / 3) > 0.4 || (x * 2 + 15 - y) % 13 == 0 && h(l + 2, x / 4, y / 2) > 0.55;
+            if crack { [214, 236, 250, 255] } else { shade([150.0, 196.0, 240.0], 0.94 + n * 0.08) }
+        }
+        58 => shade([196.0, 106.0, 50.0], 0.93 + n * 0.1),
+        59 | 60 | 61 => {
+            let c = match layer {
+                59 => [164.0, 88.0, 56.0],
+                60 => [214.0, 182.0, 158.0],
+                _ => [104.0, 62.0, 48.0],
+            };
+            // fired clay: smooth, in faint level layers
+            shade(c, 0.9 + h(l, x / 5, y / 2) * 0.1 + n * 0.05)
+        }
+        62 => {
+            // snow lying over the edge of the soil
+            let edge = 3 + (h(l + 50, x, 0) * 3.0) as i32;
+            if y < edge { shade([238.0, 243.0, 250.0], 0.95 + n * 0.05) } else { dirt(2, x, y) }
+        }
+        63 => tint(DRY),
+        64 => side(DRY),
+        65 => tint(LUSH),
+        66 => side(LUSH),
+        67 => tint(SWAMP),
+        68 => side(SWAMP),
+        69 => leaf([36.0, 136.0, 30.0]),
+        70 => leaf([118.0, 142.0, 48.0]),
+        71 => {
+            // needles with snow lying on them
+            if h(l + 4, x / 3, y / 2) > 0.62 || (n > 0.9) { shade([226.0, 234.0, 244.0], 0.93 + n * 0.07) } else { shade([40.0, 92.0, 62.0], 0.84 + n * 0.22) }
+        }
+        72 => {
+            // fern: fronds arching out from the middle
+            let dx = (x as f32 - 7.5).abs();
+            let arch = 15.0 - (dx * 1.9 - dx * dx * 0.2) - 2.0;
+            let frond = dx < 7.0 && (y as f32) >= arch - 1.5 && (y as f32) <= arch + 1.5 + (7.0 - dx) * 0.7 && (x + y) % 3 != 0;
+            if frond || ((7..=8).contains(&x) && y >= 6) { shade([44.0, 128.0, 52.0], 0.8 + n * 0.35) } else { CLEAR }
+        }
+        73 => {
+            // reeds: a few upright canes with joints
+            let cane = matches!(x, 2 | 3 | 7 | 8 | 12 | 13) && (y as f32) >= h(l + 1, x / 5, 0) * 4.0;
+            if !cane {
+                CLEAR
+            } else if y % 5 == (x / 5) % 5 {
+                shade([86.0, 120.0, 52.0], 0.8)
+            } else {
+                shade([128.0, 176.0, 78.0], if x % 5 == 2 { 0.86 } else { 1.0 } + n * 0.08)
+            }
+        }
+        74 => {
+            // a blue flower
+            let (dx, dy) = (x as f32 - 7.5, y as f32 - 5.0);
+            let d = dx * dx + dy * dy;
+            if d < 1.6 {
+                [250, 226, 110, 255]
+            } else if d < 10.0 && !(dx.abs() > 2.0 && dy.abs() > 2.0) {
+                shade([70.0, 110.0, 226.0], 0.88 + n * 0.2)
+            } else if ((7..=8).contains(&x) && y >= 8) || matches!((x, y), (5, 12) | (6, 12) | (6, 13) | (9, 10) | (10, 10) | (9, 11)) {
+                shade([62.0, 132.0, 52.0], 0.9 + n * 0.15)
+            } else {
+                CLEAR
+            }
+        }
+        75 => {
+            // dry grass tuft
+            let top = 15 - (6.0 + h(l, x, 0) * 9.0) as i32;
+            if x % 3 != 2 && y >= top && h(l + 1, x, 1) > 0.2 {
+                shade([198.0, 178.0, 84.0], 0.8 + h(l, x, 2) * 0.28 + (15 - y) as f32 * 0.015)
+            } else {
+                CLEAR
+            }
+        }
+        _ => CLEAR,
+    }
+}
 
 /// Chest, ladder and trapdoor textures, and the icons of slabs and fences.
 fn extra_pixel(k: usize, x: i32, y: i32) -> [u8; 4] {
