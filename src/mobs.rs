@@ -28,7 +28,7 @@ impl Rng {
     }
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Kind {
     Deer,
     Boar,

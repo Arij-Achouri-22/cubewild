@@ -76,7 +76,8 @@ pub const LADDER: Item = 132;
 pub const TRAPDOOR: Item = 133;
 /// oak, birch, cobblestone, stone brick (the order of `SHAPE_FULL`)
 pub const STAIRS: Item = 134;
-pub const ITEM_END: Item = 138;
+pub const BOAT: Item = 138;
+pub const ITEM_END: Item = 139;
 /// slots in a chest
 pub const CHEST_SLOTS: usize = 27;
 /// first texture layer holding item icons
@@ -203,6 +204,7 @@ pub fn name(i: Item) -> &'static str {
         SHEARS => "Shears",
         BUCKET => "Bucket",
         WATER_BUCKET => "Water Bucket",
+        BOAT => "Boat",
         FISHING_ROD => "Fishing Rod",
         RAW_FISH => "Raw Fish",
         COOKED_FISH => "Cooked Fish",
@@ -397,7 +399,7 @@ pub fn armor(i: Item) -> Option<(usize, f32)> {
 }
 
 pub fn max_stack(i: Item) -> u32 {
-    if gear(i).is_some() || max_wear(i) > 0 || matches!(i, BED | BUCKET | WATER_BUCKET | COMPASS | CLOCK) {
+    if gear(i).is_some() || max_wear(i) > 0 || matches!(i, BED | BUCKET | WATER_BUCKET | COMPASS | CLOCK | BOAT) {
         1
     } else {
         99
@@ -412,7 +414,7 @@ pub fn kind(i: Item) -> &'static str {
         Some(_) => "Tool",
         None => match i {
             SPEAR | FLINT_KNIFE | BOW | ARROW => "Weapon",
-            SHEARS | BUCKET | WATER_BUCKET | FISHING_ROD | COMPASS | CLOCK => "Tool",
+            SHEARS | BUCKET | WATER_BUCKET | FISHING_ROD | COMPASS | CLOCK | BOAT => "Tool",
             WORKBENCH | FURNACE | BED | TORCH | LAMP | OAK_DOOR | BIRCH_DOOR | CHEST | LADDER | TRAPDOOR => "Utility block",
             i if i >= STAIRS => "Block",
             i if food(i) > 0.0 => "Food",
@@ -494,6 +496,7 @@ pub fn desc(i: Item) -> &'static str {
         SHEARS => "Snips leaves and grass in an instant, and keeps the grass.",
         BUCKET => "Right click water to scoop it up.",
         WATER_BUCKET => "Right click to pour the water out.",
+        BOAT => "Right click water to put it in. Right click it to get in, Shift to get out.",
         FISHING_ROD => "Hold right click on water and wait for a bite.",
         BOW => "Right click to shoot an arrow.",
         ARROW => "Ammunition for the bow.",
@@ -558,6 +561,8 @@ pub const RECIPES: &[Recipe] = &[
     r(Cat::Utility, (LADDER, 3), &[(STICK, 7)], WORKBENCH),
     r(Cat::Utility, (TRAPDOOR, 2), &[(PLANKS, 6)], WORKBENCH),
     r(Cat::Utility, (BUCKET, 1), &[(IRON_INGOT, 3)], WORKBENCH),
+    r(Cat::Utility, (BOAT, 1), &[(PLANKS, 5)], WORKBENCH),
+    r(Cat::Utility, (BOAT, 1), &[(BIRCH_PLANKS, 5)], WORKBENCH),
     r(Cat::Utility, (COMPASS, 1), &[(IRON_INGOT, 4), (CRYSTAL, 1)], WORKBENCH),
     r(Cat::Utility, (CLOCK, 1), &[(GOLD_INGOT, 4), (CRYSTAL, 1)], WORKBENCH),
     r(Cat::Tools, (WOOD_PICK, 1), &[(PLANKS, 3), (STICK, 2)], AIR),

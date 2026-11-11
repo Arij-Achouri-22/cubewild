@@ -226,6 +226,9 @@ pub struct Input {
 pub const PLAYER_HW: f32 = 0.3;
 pub const PLAYER_H: f32 = 1.8;
 const EYE: f32 = 1.62;
+/// lying flat while swimming fast (or crawling where there is no room to stand)
+pub const SWIM_H: f32 = 0.6;
+const SWIM_EYE: f32 = 0.42;
 
 #[derive(Clone)]
 pub struct Player {
@@ -244,6 +247,10 @@ pub struct Player {
     wall: bool,
     /// how far the eye still lags behind after stepping up a ledge
     lift: f32,
+    /// sprint-swimming: lying flat, moving where you look
+    pub swimming: bool,
+    /// eye height, eased between standing and lying
+    eye_h: f32,
 }
 
 impl Player {
@@ -260,11 +267,18 @@ impl Player {
             impact: 0.0,
             wall: false,
             lift: 0.0,
+            swimming: false,
+            eye_h: EYE,
         }
     }
 
     pub fn eye(&self) -> Vec3 {
-        self.pos + Vec3::new(0.0, EYE - self.lift, 0.0)
+        self.pos + Vec3::new(0.0, self.eye_h - self.lift, 0.0)
+    }
+
+    /// Height of the body: less while lying flat.
+    pub fn height(&self) -> f32 {
+        if self.swimming { SWIM_H } else { PLAYER_H }
     }
 
     pub fn look_dir(&self) -> Vec3 {
@@ -292,15 +306,33 @@ impl Player {
             wish = wish.normalize();
         }
         let b = self.pos.floor().as_ivec3();
-        let around = world.get_block(b.x, (self.pos.y + 0.4).floor() as i32, b.z);
+        let around = world.get_block(b.x, (self.pos.y + if self.swimming { 0.3 } else { 0.4 }).floor() as i32, b.z);
         self.in_lava = around == LAVA;
         self.in_water = around == WATER || self.in_lava;
+        // Ctrl + forward in water: lie flat and swim. Coming out of it needs room to stand.
+        let want = self.in_water && !self.in_lava && !self.flying && inp.sprint && inp.forward > 0.0;
+        if want {
+            self.swimming = true;
+        } else if self.swimming && !collides(world, self.pos, PLAYER_HW, PLAYER_H) {
+            self.swimming = false;
+        }
+        let eye_want = if self.swimming { SWIM_EYE } else { EYE };
+        self.eye_h += (eye_want - self.eye_h) * (1.0 - (-dt * 10.0).exp());
 
         if self.flying {
             let speed = if inp.sprint { 28.0 } else { 11.0 };
             let mut target = wish * speed;
             target.y = (inp.jump as i32 - inp.sneak as i32) as f32 * speed * 0.7;
             let k = 1.0 - (-dt * 10.0).exp();
+            self.vel += (target - self.vel) * k;
+        } else if self.swimming && self.in_water {
+            // swim the way you look: down to dive, up to rise
+            let look = self.look_dir();
+            let mut target = look * inp.forward.max(0.0) * 5.4 + right * inp.right * 2.0;
+            if inp.jump {
+                target.y = target.y.max(2.5);
+            }
+            let k = 1.0 - (-dt * 4.0).exp();
             self.vel += (target - self.vel) * k;
         } else if self.in_water {
             // (lava is thick: half the pace of water)
@@ -314,7 +346,10 @@ impl Player {
             }
             self.vel.y = self.vel.y.clamp(-3.5, 4.0);
         } else {
-            let speed = if inp.sneak {
+            let speed = if self.swimming {
+                // crawling through a gap too low to stand in
+                1.3
+            } else if inp.sneak {
                 1.7
             } else if inp.sprint {
                 6.6
@@ -353,7 +388,8 @@ impl Player {
         let fall = -self.vel.y;
         let y0 = self.pos.y;
         let walking = self.on_ground && !self.flying;
-        let (ground, wall) = move_step(world, &mut self.pos, &mut self.vel, PLAYER_HW, PLAYER_H, dt, walking);
+        let h = self.height();
+        let (ground, wall) = move_step(world, &mut self.pos, &mut self.vel, PLAYER_HW, h, dt, walking);
         // the eye follows a step up smoothly instead of jumping with the feet
         if walking && ground && self.pos.y > y0 + 0.05 {
             self.lift = (self.lift + self.pos.y - y0).min(1.0);
@@ -405,6 +441,26 @@ mod tests {
         // standing heights
         let w = terrace(Some(SLAB));
         assert!(collides(&w, Vec3::new(3.5, 10.49, 0.5), 0.3, 1.8) && !collides(&w, Vec3::new(3.5, 10.5, 0.5), 0.3, 1.8));
+    }
+
+    #[test]
+    fn sprint_swimming_lies_flat_and_dives_where_you_look() {
+        // deep water from y 2 to 20
+        let w = World::flat(|_, y, _| (2..=20).contains(&y).then_some(WATER));
+        let mut p = Player::new(Vec3::new(1.5, 15.0, 0.5));
+        (p.yaw, p.pitch) = (std::f32::consts::FRAC_PI_2, -0.6);
+        let inp = Input { forward: 1.0, sprint: true, ..Default::default() };
+        for _ in 0..120 {
+            p.update(&w, &inp, 1.0 / 120.0);
+        }
+        assert!(p.swimming && p.height() < 1.0);
+        assert!(p.pos.y < 13.5 && p.pos.x > 4.0, "dives ahead: {}", p.pos);
+        assert!((p.eye().y - p.pos.y) < 0.6, "the eye is low while lying flat");
+        // letting go of Ctrl stands back up in open water
+        for _ in 0..120 {
+            p.update(&w, &Input::default(), 1.0 / 120.0);
+        }
+        assert!(!p.swimming);
     }
 
     #[test]
