@@ -116,6 +116,35 @@ pub const COLOURS: [[u8; 3]; 16] = [
     [234, 236, 236], [240, 118, 20], [190, 68, 180], [58, 176, 218], [248, 198, 40], [112, 186, 26], [238, 142, 172], [62, 68, 72],
     [142, 142, 134], [22, 138, 146], [122, 42, 172], [52, 56, 158], [114, 72, 40], [84, 108, 28], [160, 38, 34], [22, 22, 26],
 ];
+/// The veil of an Ember Gate: + 0 across x, + 1 across z. You walk into it.
+pub const GATE: Block = 94;
+/// Blocks of the Emberdeep (world-only ids; their items are `items::DEEP_ITEM` + n).
+/// Cinderstone is also made above, where water meets lava: gates are built of it.
+pub const CINDERSTONE: Block = 96;
+pub const ASHSTONE: Block = 97;
+/// soft grey ash: slows whoever wades through it
+pub const ASH: Block = 98;
+pub const SCORIA: Block = 99;
+/// smouldering rock: burns feet
+pub const SMOULDER: Block = 100;
+pub const EMBER_MOSS: Block = 101;
+pub const CINDERWOOD: Block = 102;
+/// the glowing cap of the grove's giant fungi
+pub const GLOWCAP: Block = 103;
+pub const CINDER_PLANKS: Block = 104;
+/// glowing crystal that hangs from the roof of the deep
+pub const SUNSHARD: Block = 105;
+pub const EMBER_ORE: Block = 106;
+pub const ASHSTONE_BRICK: Block = 107;
+pub const DEEP_BLOCKS: Block = 12;
+#[inline]
+pub fn is_gate(b: Block) -> bool {
+    b == GATE || b == GATE + 1
+}
+#[inline]
+pub fn is_deep_block(b: Block) -> bool {
+    (CINDERSTONE..CINDERSTONE + DEEP_BLOCKS).contains(&b)
+}
 #[inline]
 pub fn is_wool(b: Block) -> bool {
     b == CLOTH || (WOOL..WOOL_END).contains(&b)
@@ -422,22 +451,22 @@ pub fn is_replaceable(b: Block) -> bool {
 
 #[inline]
 pub fn is_opaque(b: Block) -> bool {
-    b != AIR && b != WATER && b != GLASS && !is_torch(b) && !is_plant(b) && !is_shaped(b)
+    b != AIR && b != WATER && b != GLASS && !is_torch(b) && !is_plant(b) && !is_shaped(b) && !is_gate(b)
 }
 /// Blocks you collide with / can target.
 #[inline]
 pub fn is_solid(b: Block) -> bool {
-    b != AIR && b != WATER && b != LAVA && !is_torch(b) && !is_plant(b) && !is_ladder(b)
+    b != AIR && b != WATER && b != LAVA && !is_torch(b) && !is_plant(b) && !is_ladder(b) && !is_gate(b)
 }
 /// Blocks the crosshair can select (torches are walk-through but breakable).
 #[inline]
 pub fn is_target(b: Block) -> bool {
-    b != AIR && b != WATER && b != LAVA
+    b != AIR && b != WATER && b != LAVA && !is_gate(b)
 }
 /// Blocks that light their surroundings.
 #[inline]
 pub fn is_light(b: Block) -> bool {
-    is_torch(b) || b == LAMP
+    is_torch(b) || b == LAMP || is_gate(b) || b == SUNSHARD || b == GLOWCAP
 }
 
 /// Texture layer for a block face (face: 0 +X, 1 -X, 2 +Y, 3 -Y, 4 +Z, 5 -Z).
@@ -562,6 +591,28 @@ pub fn tex_for(b: Block, face: usize) -> u32 {
         FLOWER_BLUE => 74,
         DRY_TUFT => 75,
         b if (WOOL..WOOL_END).contains(&b) => WOOL_LAYER + (b - WOOL) as u32,
+        b if is_deep_block(b) => {
+            let t = crate::textures::DEEP_TEX as u32;
+            let top = face == 2 || face == 3;
+            t + match b {
+                CINDERSTONE => 0,
+                ASHSTONE => 1,
+                ASH => 2,
+                SCORIA if top => 4,
+                SCORIA => 3,
+                SMOULDER => 5,
+                EMBER_MOSS if face == 2 => 6,
+                EMBER_MOSS if face == 3 => 1,
+                EMBER_MOSS => 7,
+                CINDERWOOD if top => 9,
+                CINDERWOOD => 8,
+                GLOWCAP => 10,
+                CINDER_PLANKS => 11,
+                SUNSHARD => 12,
+                EMBER_ORE => 13,
+                _ => 14,
+            }
+        }
         b if is_slab(b) => tex_for(SHAPE_FULL[slab_mat(b) as usize], face),
         b if is_ladder(b) => LADDER_LAYER,
         b if is_trapdoor(b) => TRAP_LAYER,
@@ -866,6 +917,9 @@ pub fn spawn_for(ver: u8, seed: u32) -> (i32, i32, i32) {
     if ver >= 2 { crate::worldgen::spawn_point(seed) } else { spawn_point(seed) }
 }
 fn generate_for(ver: u8, seed: u32, cx: i32, cz: i32) -> ChunkData {
+    if ver == crate::deep::DEEP_VER {
+        return crate::deep::generate(seed, cx, cz);
+    }
     if ver >= 2 { crate::worldgen::generate(seed, cx, cz, ver >= 3) } else { generate(seed, cx, cz) }
 }
 
@@ -1227,7 +1281,7 @@ pub fn mesh(n: &[Arc<ChunkData>; 9]) -> MeshData {
                     let b = at(i);
                     let m = &mut mask[vv * nu + uu];
                     *m = 0;
-                    if b == AIR || is_torch(b) || is_plant(b) || is_shaped(b) {
+                    if b == AIR || is_torch(b) || is_plant(b) || is_shaped(b) || is_gate(b) {
                         continue;
                     }
                     let q = i + sa;
@@ -1584,6 +1638,11 @@ impl World {
         };
         w.set_radius(radius);
         w
+    }
+
+    /// This is the Emberdeep, not the world above.
+    pub fn is_deep(&self) -> bool {
+        self.ver == crate::deep::DEEP_VER
     }
 
     pub fn set_radius(&mut self, r: i32) {

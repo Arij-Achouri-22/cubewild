@@ -2,6 +2,7 @@
 
 mod audio;
 mod boat;
+mod deep;
 mod furnace;
 mod fx;
 mod gfx;
@@ -493,6 +494,25 @@ struct Game {
     trading: Option<((i32, i32), usize)>,
     /// offers used up today: (villager, offer) -> times made
     trade_uses: std::collections::HashMap<(((i32, i32), usize), usize), u32>,
+    /// the generator of the world above
+    over_ver: u8,
+    /// every Ember Gate there is, in both worlds
+    gates: Vec<Gate>,
+    /// seconds spent standing in a gate, and whether the player has to step out of it
+    /// first (just arrived)
+    gate_t: f32,
+    gate_lock: bool,
+    /// on the way through a gate: where to come out (a known gate, or a place to build
+    /// one), waiting for the land there to load
+    arrival: Option<(IVec3, Option<Gate>)>,
+    /// the Emberdeep region the player is in, and its haze (eased)
+    region: deep::Region,
+    haze: [f32; 3],
+    gate_hum_t: f32,
+    /// seconds since the game started, for animations
+    anim: f32,
+    /// seconds until smouldering rock burns the feet again
+    smoulder_t: f32,
 }
 
 fn data_dir(seed: u32) -> Option<PathBuf> {
@@ -502,6 +522,74 @@ fn data_dir(seed: u32) -> Option<PathBuf> {
         return None;
     }
     Some(dir)
+}
+
+/// View distance in the Emberdeep, whatever the setting: its fog is thick, and a world
+/// of caverns is all walls to draw.
+const DEEP_DIST: i32 = 8;
+
+/// Where a dimension keeps its things: the world's folder above, its `deep` folder below.
+fn dim_dir(save_dir: &Option<PathBuf>, deep: bool) -> Option<PathBuf> {
+    let d = save_dir.as_ref()?;
+    if !deep {
+        return Some(d.clone());
+    }
+    let d = d.join("deep");
+    std::fs::create_dir_all(&d).ok()?;
+    Some(d)
+}
+
+/// The open space of a frame of cinderstone, in the plane of `axis` (0 = the frame
+/// runs along x, 1 = along z), starting at the empty cell `q`. None unless it is
+/// a closed rectangle, 2 to 10 wide and 3 to 10 high.
+fn frame_opening(world: &World, q: IVec3, axis: u8) -> Option<(IVec3, IVec3)> {
+    let side = if axis == 0 { IVec3::X } else { IVec3::Z };
+    let mut seen = vec![q];
+    let mut todo = vec![q];
+    while let Some(c) = todo.pop() {
+        for d in [side, -side, IVec3::Y, IVec3::NEG_Y] {
+            let n = c + d;
+            if seen.contains(&n) {
+                continue;
+            }
+            match world.get_block(n.x, n.y, n.z) {
+                CINDERSTONE => {}
+                b if b == AIR || is_tuft(b) => {
+                    seen.push(n);
+                    if seen.len() > 100 {
+                        return None;
+                    }
+                    todo.push(n);
+                }
+                _ => return None,
+            }
+        }
+    }
+    let lo = seen.iter().fold(q, |a, &b| a.min(b));
+    let hi = seen.iter().fold(q, |a, &b| a.max(b));
+    let size = hi - lo + IVec3::ONE;
+    let (w, h) = (if axis == 0 { size.x } else { size.z }, size.y);
+    ((2..=10).contains(&w) && (3..=10).contains(&h) && seen.len() as i32 == w * h).then_some((lo, hi))
+}
+
+/// An Ember Gate: the lowest corner of its veil, which way it faces, in which world.
+#[derive(Clone, Copy, PartialEq)]
+struct Gate {
+    deep: bool,
+    at: IVec3,
+    axis: u8,
+}
+
+fn load_gates(save_dir: &Option<PathBuf>) -> Vec<Gate> {
+    let Some(d) = save_dir else { return Vec::new() };
+    std::fs::read_to_string(d.join("gates.txt"))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| {
+            let v: Vec<i32> = l.split_whitespace().filter_map(|t| t.parse().ok()).collect();
+            (v.len() >= 5).then(|| Gate { deep: v[0] != 0, at: IVec3::new(v[1], v[2], v[3]), axis: (v[4] & 1) as u8 })
+        })
+        .collect()
 }
 
 fn find_spawn(ver: u8, seed: u32) -> Vec3 {
@@ -576,6 +664,8 @@ struct Loaded {
     xp: u32,
     weather: Weather,
     boats: boat::Boats,
+    /// the generator of the world above (the Emberdeep has its own)
+    over_ver: u8,
 }
 
 /// Opens the world of a seed: from its save if there is one (which also decides the
@@ -589,7 +679,10 @@ fn load_world(seed: u32, view_dist: i32, save: bool, mode: Mode) -> Loaded {
         Some(text) => text.lines().find_map(|l| l.strip_prefix("gen ")).and_then(|v| v.trim().parse::<u8>().ok()).unwrap_or(1).clamp(1, GEN_LATEST),
         None => std::env::var("CUBEWILD_GEN").ok().and_then(|v| v.parse::<u8>().ok()).unwrap_or(GEN_LATEST).clamp(1, GEN_LATEST),
     };
-    let world = World::new(seed, ver, view_dist, save_dir.clone());
+    // a player who saved in the Emberdeep comes back there
+    let in_deep = saved.as_ref().is_some_and(|t| t.lines().any(|l| l.trim() == "dim deep"));
+    let dim_dir = dim_dir(&save_dir, in_deep);
+    let world = if in_deep { World::new(seed, deep::DEEP_VER, view_dist.min(DEEP_DIST), dim_dir.clone()) } else { World::new(seed, ver, view_dist, save_dir.clone()) };
     let mut spawn = find_spawn(ver, seed);
     let mut player = Player::new(spawn);
     let mut inv = Inventory::new();
@@ -686,11 +779,11 @@ fn load_world(seed: u32, view_dist: i32, save: bool, mode: Mode) -> Loaded {
             }
         }
     }
-    let pickups = save_dir.as_ref().map_or_else(Pickups::default, |d| Pickups::load(&d.join("drops.txt")));
-    let chests = save_dir.as_ref().map_or_else(Chests::default, |d| loot::load_chests(&d.join("chests.txt")));
-    let furnaces = save_dir.as_ref().map_or_else(Furnaces::default, |d| furnace::load(&d.join("furnaces.txt")));
-    let boats = save_dir.as_ref().map_or_else(boat::Boats::default, |d| boat::Boats::load(&d.join("boats.txt")));
-    Loaded { world, player, inv, sel, health, food, air, time, spawn, pickups, chests, furnaces, mode, save_dir, level, xp, weather, boats }
+    let pickups = dim_dir.as_ref().map_or_else(Pickups::default, |d| Pickups::load(&d.join("drops.txt")));
+    let chests = dim_dir.as_ref().map_or_else(Chests::default, |d| loot::load_chests(&d.join("chests.txt")));
+    let furnaces = dim_dir.as_ref().map_or_else(Furnaces::default, |d| furnace::load(&d.join("furnaces.txt")));
+    let boats = dim_dir.as_ref().map_or_else(boat::Boats::default, |d| boat::Boats::load(&d.join("boats.txt")));
+    Loaded { world, player, inv, sel, health, food, air, time, spawn, pickups, chests, furnaces, mode, save_dir, level, xp, weather, boats, over_ver: ver }
 }
 
 /// One face of a held item's model: corners in the model's own space, texture
@@ -900,7 +993,7 @@ impl Game {
         let (font, atlas) = Font::bake(ui_scale(gfx.size().1));
         gfx.upload_font(&atlas);
 
-        let Loaded { world, mut player, mut inv, sel, health, food, air, mut time, spawn, pickups, chests, furnaces, mut mode, save_dir, level, xp, mut weather, boats } = load_world(seed, settings.view_dist, save, Mode::Survival);
+        let Loaded { world, mut player, mut inv, sel, health, food, air, mut time, spawn, pickups, chests, furnaces, mut mode, save_dir, level, xp, mut weather, boats, over_ver } = load_world(seed, settings.view_dist, save, Mode::Survival);
         // CUBEWILD_RAIN=rain|storm|clear sets the weather (for testing)
         match env("CUBEWILD_RAIN").as_deref() {
             Some("clear") => (weather.want, weather.rain, weather.storm) = (0.0, 0.0, false),
@@ -947,7 +1040,7 @@ impl Game {
         };
         let mut mobs = Mobs::new(seed as u64 * 7919 + 17);
         mobs.ignore = mode == Mode::Creative;
-        if let Some(d) = &save_dir {
+        if let Some(d) = dim_dir(&save_dir, world.is_deep()) {
             mobs.load(&d.join("animals.txt"));
         }
         let mut game = Game {
@@ -985,7 +1078,7 @@ impl Game {
             fps_acc: (0.0, 0),
             worst_ms: 0.0,
             worst_acc: 0.0,
-            debug: false,
+            debug: env("CUBEWILD_DEBUG").is_some(),
             ready: false,
             drawn: (0, 0),
             save_dir,
@@ -1054,7 +1147,23 @@ impl Game {
             paddle_t: 0.0,
             trading: None,
             trade_uses: Default::default(),
+            over_ver,
+            gates: Vec::new(),
+            gate_t: 0.0,
+            gate_lock: false,
+            arrival: None,
+            region: deep::Region::Wastes,
+            haze: [0.3, 0.1, 0.06],
+            gate_hum_t: 0.0,
+            anim: 0.0,
+            smoulder_t: 0.0,
         };
+        game.gates = load_gates(&game.save_dir);
+        // developer hook: CUBEWILD_DIM=deep goes straight down into the Emberdeep (as if
+        // through a gate at the spawn point)
+        if env("CUBEWILD_DIM").as_deref() == Some("deep") && !game.world.is_deep() {
+            game.cross_gate();
+        }
         // developer hook: start a new world at once, as the title screen's buttons do
         if let Some(v) = env("CUBEWILD_NEW") {
             game.enter(fresh_seed(), if v == "creative" { Mode::Creative } else { Mode::Survival });
@@ -1087,10 +1196,17 @@ impl Game {
         self.save_dir = l.save_dir;
         self.mobs = Mobs::new(seed as u64 * 7919 + 17);
         self.mobs.ignore = self.mode == Mode::Creative;
-        if let Some(d) = &self.save_dir {
+        if let Some(d) = dim_dir(&self.save_dir, self.world.is_deep()) {
             self.mobs.load(&d.join("animals.txt"));
         }
         self.trading = None;
+        self.over_ver = l.over_ver;
+        self.gates = load_gates(&self.save_dir);
+        self.arrival = None;
+        (self.gate_t, self.gate_lock) = (0.0, false);
+        if self.world.is_deep() {
+            self.unstick = false;
+        }
         self.arrows.clear();
         self.mining = None;
         self.fishing = None;
@@ -1145,12 +1261,21 @@ impl Game {
         s += &format!("stats {} {} {} {}\n", self.health, self.food, self.air, self.time);
         s += &format!("spawn {} {} {}\n", self.spawn.x, self.spawn.y, self.spawn.z);
         s += if self.mode == Mode::Creative { "mode creative\n" } else { "mode survival\n" };
-        s += &format!("gen {}\n", self.world.ver);
+        s += &format!("gen {}\n", self.over_ver);
+        if self.world.is_deep() {
+            s += "dim deep\n";
+        }
         s += &format!("xp {} {}\n", self.level, self.xp);
         s += &format!("weather {} {} {}\n", self.weather.want, self.weather.timer, self.weather.storm as u8);
         if let Err(e) = std::fs::write(d.join("player.txt"), s) {
             eprintln!("cubewild: failed to save player: {e}");
         }
+        let gates: String = self.gates.iter().map(|g| format!("{} {} {} {} {}\n", g.deep as u8, g.at.x, g.at.y, g.at.z, g.axis)).collect();
+        if let Err(e) = std::fs::write(d.join("gates.txt"), gates) {
+            eprintln!("cubewild: failed to save gates: {e}");
+        }
+        // the rest belongs to the world the player is in
+        let Some(d) = dim_dir(&self.save_dir, self.world.is_deep()) else { return };
         self.pickups.save(&d.join("drops.txt"));
         loot::save_chests(&self.chests, &d.join("chests.txt"));
         furnace::save(&self.furnaces, &d.join("furnaces.txt"));
@@ -1298,6 +1423,7 @@ impl Game {
     /// View distance in use: the setting, or less while the frame rate needs help.
     fn apply_dist(&mut self) {
         let d = if self.settings.auto_scale { self.settings.view_dist.min(self.auto_cur) } else { self.settings.view_dist };
+        let d = if self.world.is_deep() { d.min(DEEP_DIST) } else { d };
         if d != self.world.radius {
             self.world.set_radius(d);
         }
@@ -1449,6 +1575,11 @@ impl Game {
 
     fn respawn(&mut self) {
         self.riding = None;
+        if self.world.is_deep() {
+            // whoever dies below wakes up at home
+            self.switch_world(false);
+            self.arrival = None;
+        }
         self.player.pos = self.spawn;
         self.player.vel = Vec3::ZERO;
         self.player.flying = false;
@@ -1458,6 +1589,194 @@ impl Game {
         self.ready = false;
         self.unstick = true;
         self.goto(Screen::Play);
+    }
+
+    /// Water meets lava: a hiss and a puff of steam.
+    fn hiss(&mut self, at: Vec3) {
+        self.audio.play_var(Snd::Fizz, at, 1.0);
+        for _ in 0..10 {
+            self.particles.smoke(&mut self.rng, at, false);
+        }
+    }
+
+    /// The fire striker on a block: lights an Ember Gate if it is a finished frame.
+    fn light_gate(&mut self, p: IVec3, n: IVec3) {
+        let at = (p + n).as_vec3() + 0.5;
+        self.particles.sparks(&mut self.rng, at, 8);
+        self.audio.play_var(Snd::Dig(audio::Surface::Stone), at, 0.6);
+        self.wear_held();
+        if self.world.get_block(p.x, p.y, p.z) != CINDERSTONE {
+            return;
+        }
+        let q = p + n;
+        let found = [0u8, 1].into_iter().find_map(|axis| frame_opening(&self.world, q, axis).map(|o| (axis, o)));
+        let Some((axis, (lo, hi))) = found else {
+            self.say("An Ember Gate needs a closed cinderstone frame (an opening 2 wide and 3 high, up to 10)".into());
+            return;
+        };
+        let mut edits = Vec::new();
+        for y in lo.y..=hi.y {
+            for z in lo.z..=hi.z {
+                for x in lo.x..=hi.x {
+                    edits.push((IVec3::new(x, y, z), GATE + axis));
+                }
+            }
+        }
+        self.world.set_many(&self.gfx, &edits);
+        self.gates.push(Gate { deep: self.world.is_deep(), at: lo, axis });
+        let mid = (lo.as_vec3() + hi.as_vec3()) * 0.5 + 0.5;
+        self.audio.play_at(Snd::GateOpen, mid, 1.2, 1.0);
+        for _ in 0..30 {
+            let o = Vec3::new(self.rng.range(-1.0, 1.0), self.rng.range(-1.5, 1.5), self.rng.range(-1.0, 1.0));
+            self.particles.ember(&mut self.rng, mid + o);
+        }
+        self.say("The Ember Gate opens. Stand in it to cross".into());
+    }
+
+    /// After blocks changed at `cells`: a gate whose frame was broken goes out.
+    fn check_gates(&mut self, cells: &[IVec3]) {
+        let mut out: Vec<IVec3> = Vec::new();
+        for &c in cells {
+            for d in [IVec3::X, IVec3::NEG_X, IVec3::Y, IVec3::NEG_Y, IVec3::Z, IVec3::NEG_Z, IVec3::ZERO] {
+                let s = c + d;
+                if !is_gate(self.world.get_block(s.x, s.y, s.z)) || out.contains(&s) {
+                    continue;
+                }
+                // every veil cell joined to this one goes
+                let mut todo = vec![s];
+                out.push(s);
+                while let Some(g) = todo.pop() {
+                    for d in [IVec3::X, IVec3::NEG_X, IVec3::Y, IVec3::NEG_Y, IVec3::Z, IVec3::NEG_Z] {
+                        let n = g + d;
+                        if out.len() < 200 && is_gate(self.world.get_block(n.x, n.y, n.z)) && !out.contains(&n) {
+                            out.push(n);
+                            todo.push(n);
+                        }
+                    }
+                }
+            }
+        }
+        if out.is_empty() {
+            return;
+        }
+        let deep = self.world.is_deep();
+        self.gates.retain(|g| g.deep != deep || !out.contains(&g.at));
+        let edits: Vec<(IVec3, Block)> = out.iter().map(|&c| (c, AIR)).collect();
+        self.world.set_many(&self.gfx, &edits);
+        let mid = out[0].as_vec3() + 0.5;
+        self.audio.play_at(Snd::Fizz, mid, 1.0, 0.6);
+    }
+
+    /// Puts the player in the other world: saves this one, opens that one with its own
+    /// dropped items, chests, furnaces, boats and animals.
+    fn switch_world(&mut self, deep: bool) {
+        self.save_player();
+        self.world.save_all();
+        let ver = if deep { deep::DEEP_VER } else { self.over_ver };
+        let dir = dim_dir(&self.save_dir, deep);
+        let seed = self.world.seed;
+        let radius = if deep { self.settings.view_dist.min(DEEP_DIST) } else { self.settings.view_dist };
+        self.world = World::new(seed, ver, radius, if deep { dir.clone() } else { self.save_dir.clone() });
+        self.pickups = dir.as_ref().map_or_else(Pickups::default, |d| Pickups::load(&d.join("drops.txt")));
+        self.chests = dir.as_ref().map_or_else(Chests::default, |d| loot::load_chests(&d.join("chests.txt")));
+        self.furnaces = dir.as_ref().map_or_else(Furnaces::default, |d| furnace::load(&d.join("furnaces.txt")));
+        self.boats = dir.as_ref().map_or_else(boat::Boats::default, |d| boat::Boats::load(&d.join("boats.txt")));
+        self.mobs = Mobs::new(seed as u64 * 7919 + if deep { 31 } else { 17 });
+        self.mobs.ignore = self.mode == Mode::Creative;
+        if let Some(d) = &dir {
+            self.mobs.load(&d.join("animals.txt"));
+        }
+        self.riding = None;
+        self.trading = None;
+        self.fishing = None;
+        self.mining = None;
+        self.arrows.clear();
+        self.orbs = Orbs::default();
+        self.particles = Particles::default();
+        self.weather.dirty();
+        self.ready = false;
+        self.unstick = false;
+        self.auto_cur = 20;
+        self.apply_dist();
+    }
+
+    /// Steps through a gate into the other world: to the nearest gate on the other side,
+    /// or to where a new one will be built.
+    fn cross_gate(&mut self) {
+        let deep = !self.world.is_deep();
+        let p = self.player.pos.floor().as_ivec3();
+        let target = if deep {
+            IVec3::new(p.x.div_euclid(deep::SCALE), p.y.clamp(deep::LAVA_SEA + 6, 96), p.z.div_euclid(deep::SCALE))
+        } else {
+            IVec3::new(p.x * deep::SCALE, p.y, p.z * deep::SCALE)
+        };
+        let reach = if deep { 16 } else { 128 };
+        let known = self
+            .gates
+            .iter()
+            .filter(|g| g.deep == deep && (g.at.x - target.x).abs() <= reach && (g.at.z - target.z).abs() <= reach)
+            .min_by_key(|g| (g.at - target).length_squared())
+            .copied();
+        self.audio.play(Snd::Travel, 1.0, 1.0);
+        self.switch_world(deep);
+        self.player.pos = target.as_vec3() + Vec3::new(0.5, 0.0, 0.5);
+        self.player.vel = Vec3::ZERO;
+        self.arrival = Some((target, known));
+        self.gate_lock = true;
+        self.gate_t = 0.0;
+        self.say(if deep { "The Emberdeep".into() } else { "Back in the world above".into() });
+    }
+
+    /// Once the land at the far side has loaded: stand in the gate there, building one
+    /// first if there is none.
+    fn arrive(&mut self) {
+        let Some((target, known)) = self.arrival else { return };
+        let r = 2 * CW;
+        if [(-r, -r), (r, -r), (-r, r), (r, r), (0, 0)].iter().any(|d| !self.world.is_loaded(target.x + d.0, target.z + d.1)) {
+            return;
+        }
+        self.arrival = None;
+        if let Some(g) = known.filter(|g| is_gate(self.world.get_block(g.at.x, g.at.y, g.at.z))) {
+            let side = if g.axis == 0 { Vec3::X } else { Vec3::Z };
+            self.player.pos = g.at.as_vec3() + Vec3::new(0.5, 0.0, 0.5) + side * 0.5;
+            self.ready = true;
+            return;
+        }
+        // build a gate: on a floor near the target, with room in front and behind
+        let (fx, fy, fz) = if self.world.is_deep() {
+            deep::find_floor(self.world.seed, target.x, target.z).unwrap_or((target.x, target.y - 1, target.z))
+        } else {
+            let y = self.world.surface_y(target.x, target.z).unwrap_or(SEA);
+            (target.x, y.clamp(4, CH - 8), target.z)
+        };
+        let axis = 0u8;
+        let mut edits = Vec::new();
+        for dz in -1..=1i32 {
+            for dx in -1..=2i32 {
+                for dy in 0..=4i32 {
+                    let c = IVec3::new(fx + dx, fy + dy, fz + dz);
+                    let frame = dz == 0 && (dy == 0 || dy == 4 || dx == -1 || dx == 2);
+                    let veil = dz == 0 && !frame;
+                    let b = if frame {
+                        CINDERSTONE
+                    } else if veil {
+                        GATE + axis
+                    } else if dy == 0 {
+                        // a ledge to step out onto, if there is no floor
+                        let cur = self.world.get_block(c.x, c.y, c.z);
+                        if is_solid(cur) { continue } else { CINDERSTONE }
+                    } else {
+                        AIR
+                    };
+                    edits.push((c, b));
+                }
+            }
+        }
+        self.world.set_many(&self.gfx, &edits);
+        let at = IVec3::new(fx, fy + 1, fz);
+        self.gates.push(Gate { deep: self.world.is_deep(), at, axis });
+        self.player.pos = at.as_vec3() + Vec3::new(1.0, 0.0, 0.5);
+        self.ready = true;
     }
 
     /// Uses the held item on creature `i`. False if that did nothing (so a block can
@@ -1573,6 +1892,8 @@ impl Game {
             }
         }
         let broken = self.world.set_many(&self.gfx, &edits);
+        let cells: Vec<IVec3> = broken.iter().map(|b| b.0).collect();
+        self.check_gates(&cells);
         self.weather.dirty();
         for (p, b) in broken {
             // a third of what breaks is left to pick up
@@ -1755,10 +2076,25 @@ impl Game {
         // backgrounds: rain (muffled under a roof), wind in caves, the hush under water
         let eye_cell = eye.floor().as_ivec3();
         let sky = self.world.sky_level(eye_cell.x, eye_cell.y, eye_cell.z);
-        let wet = if self.weather.dry || self.weather.snowy { 0.0 } else { self.weather.rain };
+        let deep = self.world.is_deep();
+        let wet = if self.weather.dry || self.weather.snowy || deep { 0.0 } else { self.weather.rain };
         let outside = self.weather.open_sky(eye);
         let rain = wet * if outside { 1.0 } else if sky > 0 { 0.45 } else { 0.0 };
-        let cave = if sky == 0 { smooth(56.0, 20.0, eye.y) * 0.8 } else { 0.0 };
+        let cave = if deep { 0.9 } else if sky == 0 { smooth(56.0, 20.0, eye.y) * 0.8 } else { 0.0 };
+        if deep {
+            // ash and embers drifting in the warm air
+            for _ in 0..2 {
+                if self.rng.f() < dt * 6.0 {
+                    let o = Vec3::new(self.rng.range(-10.0, 10.0), self.rng.range(-3.0, 6.0), self.rng.range(-10.0, 10.0));
+                    if self.rng.f() < 0.3 {
+                        self.particles.ember(&mut self.rng, eye + o);
+                    } else {
+                        let dark = self.rng.f() < 0.5;
+                        self.particles.smoke(&mut self.rng, eye + o, dark);
+                    }
+                }
+            }
+        }
         let under = if self.player.eye_in_water(&self.world) { 1.0 } else { 0.0 };
         self.audio.beds(rain, cave, under);
     }
@@ -1768,6 +2104,13 @@ impl Game {
         if self.player.impact > 13.5 {
             let d = (self.player.impact - 13.5) * 0.95;
             self.strike(d);
+        }
+        // smouldering rock burns the feet, unless you step carefully
+        let under = (self.player.pos - Vec3::Y * 0.1).floor().as_ivec3();
+        self.smoulder_t -= dt;
+        if self.player.on_ground && !input.sneak && self.world.get_block(under.x, under.y, under.z) == SMOULDER && self.smoulder_t <= 0.0 {
+            self.smoulder_t = 0.8;
+            self.hurt(1.0);
         }
         // lava: two hearts every half second, whatever is worn
         self.lava_t -= dt;
@@ -1890,6 +2233,7 @@ impl Game {
             self.mining = None;
             self.primary_cd = if creative { 0.22 } else { 0.0 };
             if self.world.set_block(&self.gfx, p.x, p.y, p.z, AIR) {
+                self.check_gates(&[p]);
                 self.quiet = creative;
                 self.dig_acc = 0.0;
                 self.weather.dirty();
@@ -2076,6 +2420,14 @@ impl Game {
                     }
                     return;
                 }
+                BED if self.world.is_deep() => {
+                    // no sleeping down here
+                    self.place_cd = 0.6;
+                    self.world.set_block(&self.gfx, p.x, p.y, p.z, AIR);
+                    self.explode(p.as_vec3() + 0.5, 3.0);
+                    self.say("Beds don't work in the Emberdeep".into());
+                    return;
+                }
                 BED => {
                     self.place_cd = 0.6;
                     self.spawn = p.as_vec3() + Vec3::new(0.5, 1.01, 0.5);
@@ -2160,10 +2512,46 @@ impl Game {
             items::WATER_BUCKET => {
                 if let Some((p, n, _)) = target {
                     let q = p + n;
-                    if is_replaceable(self.world.get_block(q.x, q.y, q.z)) && self.world.set_block(&self.gfx, q.x, q.y, q.z, WATER) {
-                        self.audio.play_var(Snd::Splash, q.as_vec3() + 0.5, 0.5);
+                    let here = q.as_vec3() + 0.5;
+                    if self.world.is_deep() {
+                        // the heat down here boils it away at once
                         self.inv.slots[self.sel] = Stack::new(items::BUCKET, 1);
+                        self.audio.play_var(Snd::Fizz, here, 1.0);
+                        for _ in 0..12 {
+                            self.particles.smoke(&mut self.rng, here, false);
+                        }
+                        self.say("The water boils away".into());
+                        return;
                     }
+                    let was = self.world.get_block(q.x, q.y, q.z);
+                    if was == LAVA {
+                        // water poured on lava: it hardens into cinderstone
+                        if self.world.set_block(&self.gfx, q.x, q.y, q.z, CINDERSTONE) {
+                            self.inv.slots[self.sel] = Stack::new(items::BUCKET, 1);
+                            self.hiss(here);
+                        }
+                    } else if is_replaceable(was) && self.world.set_block(&self.gfx, q.x, q.y, q.z, WATER) {
+                        self.audio.play_var(Snd::Splash, here, 0.5);
+                        self.inv.slots[self.sel] = Stack::new(items::BUCKET, 1);
+                        // and the lava it touches hardens
+                        let mut hard = Vec::new();
+                        for d in [IVec3::X, IVec3::NEG_X, IVec3::Z, IVec3::NEG_Z, IVec3::NEG_Y, IVec3::Y] {
+                            let c = q + d;
+                            if self.world.get_block(c.x, c.y, c.z) == LAVA {
+                                hard.push((c, CINDERSTONE));
+                            }
+                        }
+                        if !hard.is_empty() {
+                            self.world.set_many(&self.gfx, &hard);
+                            self.hiss(here);
+                        }
+                    }
+                }
+                return;
+            }
+            items::STRIKER => {
+                if let Some((p, n, _)) = target {
+                    self.light_gate(p, n);
                 }
                 return;
             }
@@ -2652,6 +3040,7 @@ impl Game {
         let real_dt = (now - self.last).as_secs_f32();
         self.last = now;
         let dt = real_dt.min(0.05);
+        self.anim = (self.anim + real_dt) % 3600.0;
         self.fps_acc.0 += real_dt;
         self.fps_acc.1 += 1;
         self.worst_acc = self.worst_acc.max(real_dt * 1000.0);
@@ -2671,8 +3060,11 @@ impl Game {
         self.last_jump += real_dt;
         self.swing -= dt;
         let t_world = t0.elapsed().as_secs_f32() * 1000.0;
-        self.ready = self.ready
-            || self.world.is_loaded(self.player.pos.x.floor() as i32, self.player.pos.z.floor() as i32);
+        if self.arrival.is_some() {
+            self.arrive();
+        }
+        self.ready = self.arrival.is_none()
+            && (self.ready || self.world.is_loaded(self.player.pos.x.floor() as i32, self.player.pos.z.floor() as i32));
         if self.ready && self.unstick {
             self.unstick = false;
             if collides(&self.world, self.player.pos, PLAYER_HW, PLAYER_H) {
@@ -2820,24 +3212,48 @@ impl Game {
                     self.die();
                 }
             }
+            // standing in an Ember Gate: a few seconds of shimmer, then across
+            let pc = self.player.pos.floor().as_ivec3();
+            let in_gate = (0..2).any(|k| is_gate(self.world.get_block(pc.x, pc.y + k, pc.z)));
+            if in_gate && self.riding.is_none() {
+                if !self.gate_lock {
+                    self.gate_t += dt;
+                    self.gate_hum_t -= dt;
+                    if self.gate_hum_t <= 0.0 {
+                        self.gate_hum_t = 1.0;
+                        self.audio.play(Snd::GateHum, 0.5 + self.gate_t * 0.15, 0.8 + self.gate_t * 0.15);
+                    }
+                    let need = if self.mode == Mode::Creative { 0.8 } else { 3.0 };
+                    if self.gate_t >= need {
+                        self.cross_gate();
+                    }
+                }
+            } else {
+                self.gate_lock = false;
+                self.gate_t = (self.gate_t - dt * 2.0).max(0.0);
+                self.gate_hum_t = 0.0;
+            }
             // furnaces burn on wherever they are
             for f in self.furnaces.values_mut() {
                 if f.lit() || f.cook > 0.0 || (!f.slots[furnace::INPUT].is_empty() && !f.slots[furnace::FUEL].is_empty()) {
                     f.tick(dt);
                 }
             }
-            // weather
+            // weather (none in the Emberdeep: there the region sets the haze)
             self.biome_t -= dt;
+            let deep = self.world.is_deep();
             if self.biome_t <= 0.0 {
                 self.biome_t = 1.0;
-                if self.world.ver >= 2 {
+                if deep {
+                    self.region = deep::region(self.world.seed, self.player.pos.x.floor() as i32, self.player.pos.z.floor() as i32);
+                } else if self.world.ver >= 2 {
                     use worldgen::Biome as B;
                     let b = worldgen::column(self.world.seed, self.player.pos.x.floor() as i32, self.player.pos.z.floor() as i32).biome;
                     self.weather.snowy = matches!(b, B::SnowyTaiga | B::SnowyPlains | B::FrozenOcean | B::FrozenRiver | B::Peaks);
                     self.weather.dry = matches!(b, B::Desert | B::Badlands | B::Savanna);
                 }
             }
-            if self.weather.update(&mut self.rng, dt) {
+            if !deep && self.weather.update(&mut self.rng, dt) {
                 self.say("Lightning!".into());
             }
             if self.weather.thunder_now() {
@@ -2879,8 +3295,9 @@ impl Game {
         let playing = self.screen == Screen::Play;
         let (sun_dir, daylight) = self.sun();
         // clouds dim the day, and lightning lights it up for a moment
-        let overcast = self.weather.rain;
-        let daylight = (daylight * (1.0 - 0.45 * overcast) + self.weather.flash * 0.7).min(1.0);
+        let deep = self.world.is_deep();
+        let overcast = if deep { 0.0 } else { self.weather.rain };
+        let daylight = if deep { 0.0 } else { (daylight * (1.0 - 0.45 * overcast) + self.weather.flash * 0.7).min(1.0) };
         if simulate {
             // arrows fly in an arc and stick the first animal or block they meet
             let mut arrows = std::mem::take(&mut self.arrows);
@@ -3055,9 +3472,31 @@ impl Game {
         if held == TORCH || held == LAMP {
             lights.push([0.0, -0.35, 0.0, 10.0]);
         }
+        let mut gate_lights: Vec<Vec3> = Vec::new();
+        // (every pixel weighs every light: below, the warm glow lights the caverns and lava
+        // shines by itself, so only a few lights are needed)
+        let max_lights = if deep { 6 } else { gfx::MAX_LIGHTS };
+        let clock = self.anim;
         for (q, b, _) in self.world.lights_near(eye, 46.0) {
             let rel = q.as_vec3() - eye;
-            if lights.len() < gfx::MAX_LIGHTS {
+            if is_gate(b) {
+                // the veil: a shimmering sheet across the cell, drawn from both sides
+                let (u, v) = if b == GATE { (Vec3::X * 0.5, Vec3::Y * 0.5) } else { (Vec3::Z * 0.5, Vec3::Y * 0.5) };
+                let c = rel + Vec3::splat(0.5);
+                for k in 0..3 {
+                    let ph = clock * (1.3 + k as f32 * 0.4) + (q.x + q.y * 3 + q.z * 5) as f32 * 0.7;
+                    let w = 0.5 + 0.5 * ph.sin();
+                    let col = [(200.0 + 55.0 * w) as u8, (60.0 + 90.0 * (1.0 - w)) as u8, (40.0 + 80.0 * w * (k as f32 * 0.5)) as u8];
+                    let off = if b == GATE { Vec3::Z } else { Vec3::X } * ((k as f32 - 1.0) * 0.04);
+                    fx::quad(&mut ents, c + off, u, v, col, if k == 1 { gfx::EMISSIVE } else { 120 });
+                }
+                if lights.len() < max_lights && !gate_lights.iter().any(|g| g.distance(c) < 2.6) {
+                    gate_lights.push(c);
+                    lights.push([c.x, c.y, c.z, 9.0]);
+                }
+                continue;
+            }
+            if lights.len() < max_lights && !(deep && b == LAVA) {
                 let c = match b {
                     b if (WALL_TORCH..WALL_TORCH_END).contains(&b) => {
                         let (dx, dz) = SIDE_DIR[(b - WALL_TORCH) as usize];
@@ -3067,6 +3506,7 @@ impl Game {
                 };
                 lights.push([c.x, c.y, c.z, match b {
                     LAMP => 15.0,
+                    SUNSHARD | GLOWCAP => 8.0,
                     LAVA => 10.0,
                     _ => 11.0,
                 }]);
@@ -3098,10 +3538,12 @@ impl Game {
         self.boats.draw(&mut ents, eye);
         self.particles.draw(&mut ents, eye, right, up);
         self.orbs.draw(&mut ents, eye, right, up);
-        self.weather.track(&self.world, eye);
         let mut landings = std::mem::take(&mut self.landings);
         landings.clear();
-        self.weather.draw(&mut ents, eye, &mut landings);
+        if !deep {
+            self.weather.track(&self.world, eye);
+            self.weather.draw(&mut ents, eye, &mut landings);
+        }
         if simulate {
             for &l in &landings {
                 if self.rng.f() < 0.12 {
@@ -3129,7 +3571,7 @@ impl Game {
         }
         let mut sky = std::mem::take(&mut self.sky);
         sky.clear();
-        if !underwater {
+        if !underwater && !deep {
             let night = (1.0 - smooth(0.15, 0.6, daylight)) * (1.0 - overcast);
             if night > 0.02 {
                 let rot = Mat3::from_rotation_z(self.time * std::f32::consts::TAU);
@@ -3178,6 +3620,15 @@ impl Game {
         }
         if self.hurt_flash > 0.0 {
             ui.rect(0.0, 0.0, wf, hf, [200, 20, 20, (self.hurt_flash / 0.35 * 80.0) as u8]);
+        }
+        if self.gate_t > 0.0 || self.arrival.is_some() {
+            // the gate's glow fills the view as it takes you
+            let k = if self.arrival.is_some() { 1.0 } else { (self.gate_t / 3.0).min(1.0) };
+            let w = (self.anim * 3.0).sin() * 0.5 + 0.5;
+            ui.rect(0.0, 0.0, wf, hf, [(220.0 + 30.0 * w) as u8, (80.0 + 40.0 * w) as u8, 40, (k * 200.0) as u8]);
+            if self.arrival.is_some() {
+                ui.label_centered(cx, cy, BODY, "Crossing...", TEXT);
+            }
         }
         if playing {
             let t = (2.0 * s).round().max(1.0);
@@ -3255,11 +3706,14 @@ impl Game {
             }
             // instruments work from anywhere in the pack
             let mut info: Vec<String> = Vec::new();
-            if self.inv.has(items::CLOCK) {
+            if deep && (self.inv.has(items::CLOCK) || self.inv.has(items::COMPASS)) {
+                // no sun, no north: the needles spin
+                info.push("The needles spin wildly".into());
+            } else if self.inv.has(items::CLOCK) {
                 let hours = (self.time * 24.0 + 6.0).rem_euclid(24.0);
                 info.push(format!("{:02}:{:02}", hours as u32, (hours.fract() * 60.0) as u32));
             }
-            if self.inv.has(items::COMPASS) {
+            if self.inv.has(items::COMPASS) && !deep {
                 let (sy, cy) = self.player.yaw.sin_cos();
                 let bearing = sy.atan2(-cy).to_degrees().rem_euclid(360.0);
                 let names = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"];
@@ -3287,7 +3741,9 @@ impl Game {
             let p = self.player.pos;
             let lines = [
                 format!("Position  {:.1}, {:.1}, {:.1}", p.x, p.y, p.z),
-                if self.world.ver >= 2 {
+                if deep {
+                    format!("Emberdeep  {}", self.region.name())
+                } else if self.world.ver >= 2 {
                     format!("Biome  {}", worldgen::column(self.world.seed, p.x.floor() as i32, p.z.floor() as i32).biome.name())
                 } else {
                     "Biome  - (a world from before there were biomes)".to_string()
@@ -4109,7 +4565,15 @@ impl Game {
             }
         }
 
-        let (fog_color, fog_start, fog_end) = if underwater {
+        // the Emberdeep's haze takes the colour of the region
+        let want = srgb(self.region.fog());
+        let k = 1.0 - (-dt * 1.5).exp();
+        for i in 0..3 {
+            self.haze[i] += (want[i] - self.haze[i]) * k;
+        }
+        let (fog_color, fog_start, fog_end) = if deep && !underwater {
+            (self.haze, 10.0, (view_dist - 6.0).min(84.0))
+        } else if underwater {
             (mix3(srgb([3, 8, 20]), srgb([24, 70, 140]), daylight), 0.0, 26.0)
         } else {
             let base = mix3(srgb([6, 9, 20]), srgb([142, 196, 238]), daylight);
@@ -4133,7 +4597,8 @@ impl Game {
             // a little moonlight so nights stay playable
             daylight: 0.13 + 0.87 * daylight,
             // (under a roof of rock, animals and monsters are as dim as their surroundings)
-            ent_light: (0.3 + 0.7 * (0.13 + 0.87 * daylight)) * if eye_sky == 0 { 0.22 + 0.78 * smooth(12.0, 44.0, eye.y) } else { 1.0 },
+            ent_light: if deep { 0.62 } else { (0.3 + 0.7 * (0.13 + 0.87 * daylight)) * if eye_sky == 0 { 0.22 + 0.78 * smooth(12.0, 44.0, eye.y) } else { 1.0 } },
+            ambient: if deep { 0.42 } else { 0.0 },
             eye_y: eye.y,
             lights: &lights,
             sky: &sky,
@@ -4298,4 +4763,41 @@ fn main() {
     event_loop.set_control_flow(ControlFlow::Poll);
     let mut app = App::default();
     event_loop.run_app(&mut app).expect("run");
+}
+
+#[cfg(test)]
+mod gate_tests {
+    use super::*;
+
+    /// A cinderstone frame in the x-y plane at z = 0, its opening `w` wide and `h` high
+    /// from (0, 10); `gap` leaves one block of a side out.
+    fn framed(w: i32, h: i32, gap: bool) -> World {
+        World::flat(move |x, y, z| {
+            let side = x == -1 || x == w;
+            let edge = y == 9 || y == 10 + h;
+            let inside_x = (-1..=w).contains(&x);
+            let inside_y = (9..=10 + h).contains(&y);
+            if z == 0 && inside_x && inside_y && (side || edge) && !(gap && x == w && y == 11) {
+                Some(CINDERSTONE)
+            } else if y >= 10 {
+                Some(AIR)
+            } else {
+                None
+            }
+        })
+    }
+
+    #[test]
+    fn a_closed_frame_has_an_opening_and_a_broken_one_does_not() {
+        let w = framed(2, 3, false);
+        let (lo, hi) = frame_opening(&w, IVec3::new(0, 10, 0), 0).expect("a 2x3 opening");
+        assert_eq!((lo, hi), (IVec3::new(0, 10, 0), IVec3::new(1, 12, 0)));
+        // the same frame seen the other way round is no frame
+        assert!(frame_opening(&w, IVec3::new(0, 10, 0), 1).is_none());
+        // a gap in the side lets the opening leak out
+        assert!(frame_opening(&framed(2, 3, true), IVec3::new(0, 10, 0), 0).is_none());
+        // bigger frames work, too small ones do not
+        assert!(frame_opening(&framed(5, 7, false), IVec3::new(2, 12, 0), 0).is_some());
+        assert!(frame_opening(&framed(1, 3, false), IVec3::new(0, 10, 0), 0).is_none());
+    }
 }

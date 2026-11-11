@@ -75,6 +75,8 @@ pub struct Frame<'a> {
     pub fog_color: [f32; 3],
     pub fog_start: f32,
     pub fog_end: f32,
+    /// light everywhere regardless of the sky (the Emberdeep), 0..1
+    pub ambient: f32,
     /// visible chunks sorted near -> far, with camera-relative origin
     /// (mesh, origin, draw its plants, draw its buried cave walls)
     pub chunks: &'a [(&'a ChunkMesh, [f32; 3], bool, bool)],
@@ -203,8 +205,13 @@ fn chunk_color(i: COut, c: vec4<f32>) -> vec4<f32> {
   let dim = mix(0.1, 1.0, smoothstep(12.0, 44.0, i.p.y + g.misc.w));
   var sky = i.sky;
   if (sky < 0.6) { sky = sky * dim; }
-  var lit = min(vec3<f32>(max(sky * g.misc.x, 0.035 * mix(0.3, 1.0, dim))) + vec3<f32>(1.0, 0.8, 0.52) * glow, vec3<f32>(1.15)) * i.light;
+  // (the Emberdeep has no daylight: a warm glow fills it instead, fog.z strong)
+  let ambient = vec3<f32>(1.0, 0.78, 0.62) * g.fog.z;
+  var lit = min(max(vec3<f32>(max(sky * g.misc.x, 0.035 * mix(0.3, 1.0, dim))), ambient) + vec3<f32>(1.0, 0.8, 0.52) * glow, vec3<f32>(1.15)) * i.light;
   if (i.layer == 27u) { lit = vec3<f32>(1.0, 0.97, 0.9); }
+  // sunshard and glowcap shine; smouldering rock glows dimly
+  if (i.layer == 106u || i.layer == 108u) { lit = vec3<f32>(1.05, 0.98, 0.9); }
+  if (i.layer == 101u) { lit = max(lit, vec3<f32>(0.75, 0.6, 0.5)); }
   if (i.layer == 56u) { lit = vec3<f32>(1.0, 0.92, 0.85); }
   return vec4<f32>(mix(c.rgb * lit, g.fog_color.rgb, fogf(length(i.p))), c.a);
 }
@@ -867,7 +874,7 @@ impl Gfx {
         let g = Globals {
             view_proj: f.view_proj.to_cols_array_2d(),
             fog_color: [f.fog_color[0], f.fog_color[1], f.fog_color[2], 1.0],
-            fog: [f.fog_start, f.fog_end, 0.0, 0.0],
+            fog: [f.fog_start, f.fog_end, f.ambient, 0.0],
             misc: [f.daylight, f.lights.len().min(MAX_LIGHTS) as f32, f.ent_light, f.eye_y],
             lights: std::array::from_fn(|i| f.lights.get(i).copied().unwrap_or([0.0, 0.0, 0.0, 1.0])),
         };

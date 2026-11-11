@@ -57,6 +57,8 @@ pub fn smelt_xp(i: Item) -> f32 {
 pub fn fuel(i: Item) -> f32 {
     match i {
         items::COAL => 80.0,
+        items::EMBER => 200.0,
+        i if i == items::DEEP_ITEM + 6 || i == items::DEEP_ITEM + 8 => 15.0,
         LOG | BIRCH_LOG | PLANKS | BIRCH_PLANKS | WORKBENCH | CHEST | FENCE | BIRCH_FENCE => 15.0,
         items::LADDER | items::TRAPDOOR | items::OAK_DOOR | items::BIRCH_DOOR => 12.0,
         i if (SLAB..SLAB + 2).contains(&i) => 7.5,
