@@ -91,12 +91,19 @@ pub fn is_block(i: Item) -> bool {
 
 pub fn valid(i: Item) -> bool {
     (i >= GRASS && i <= LAST_BLOCK && i != WATER && i != BEDROCK && !(WHEAT_0..=WHEAT_3).contains(&i))
+        || (ICE..=FLOWER_BLUE).contains(&i)
         || (64..ITEM_END).contains(&i)
 }
 
 pub fn name(i: Item) -> &'static str {
     match i {
         GRASS => "Grass",
+        ICE => "Ice",
+        RED_SAND => "Red Sand",
+        TERRACOTTA => "Terracotta",
+        TERRACOTTA_PALE => "Pale Terracotta",
+        TERRACOTTA_DARK => "Dark Terracotta",
+        FLOWER_BLUE => "Blue Flower",
         DIRT => "Dirt",
         STONE => "Stone",
         SAND => "Sand",
@@ -429,6 +436,9 @@ pub fn desc(i: Item) -> &'static str {
     }
     match i {
         GRASS | DIRT => "Soft ground. A shovel digs it fastest.",
+        ICE => "Frozen water from the cold seas and rivers.",
+        RED_SAND => "The rust-coloured sand of the badlands.",
+        TERRACOTTA | TERRACOTTA_PALE | TERRACOTTA_DARK => "Hard baked clay from the banded cliffs of the badlands.",
         STONE => "Smooth stone, smelted from cobblestone.",
         SAND => "Smelt it into glass or pack it into sandstone.",
         LOG | BIRCH_LOG => "Craft into planks, or burn into coal in a furnace.",
@@ -452,7 +462,7 @@ pub fn desc(i: Item) -> &'static str {
         GRAVEL => "Loose stones from the sea bed. May hide flint.",
         CLAY => "Found under water. Fire it into bricks.",
         TALL_GRASS => "Gives plant fibre and sometimes seeds when cut.",
-        FLOWER_RED | FLOWER_YELLOW => "Brightens up a home.",
+        FLOWER_RED | FLOWER_YELLOW | FLOWER_BLUE => "Brightens up a home.",
         MUSHROOM => "Grows in the woods. Good in a stew.",
         BERRY_BUSH => "Break it to gather berries.",
         DEAD_BUSH => "Dry twigs. Breaks into sticks.",
@@ -965,6 +975,11 @@ pub fn item_of(b: Block) -> Item {
         b if is_ladder(b) => LADDER,
         b if is_trapdoor(b) => TRAPDOOR,
         LOOT_CHEST => CHEST,
+        b if is_grassy(b) => GRASS,
+        JUNGLE_LEAVES | ACACIA_LEAVES => LEAVES,
+        SNOWY_LEAVES => PINE_LEAVES,
+        FERN | DRY_TUFT => TALL_GRASS,
+        REEDS => FIBER,
         b => b,
     }
 }
@@ -985,12 +1000,14 @@ pub fn drop_for(b: Block, tool: Item) -> Item {
     }
     match b {
         STONE => COBBLE,
-        GRASS | FARMLAND => DIRT,
+        FARMLAND => DIRT,
+        b if is_grassy(b) => DIRT,
+        REEDS => FIBER,
         COAL_ORE => COAL,
         CRYSTAL_ORE => CRYSTAL,
         BERRY_BUSH => BERRIES,
         DEAD_BUSH => STICK,
-        TALL_GRASS => {
+        b if is_tuft(b) => {
             if tool == SHEARS {
                 TALL_GRASS
             } else {
@@ -1029,8 +1046,11 @@ pub fn break_time(b: Block, tool: Item) -> f32 {
         }
         FENCE | BIRCH_FENCE => with(Kind::Axe, 1.1, 2.0),
         b if is_ladder(b) => 0.3,
-        GRASS | DIRT | SAND | GRAVEL | CLAY | SNOW | FARMLAND => with(Kind::Shovel, 0.5, 2.0),
-        LEAVES | BIRCH_LEAVES | PINE_LEAVES | CLOTH | THATCH => {
+        DIRT | SAND | GRAVEL | CLAY | SNOW | FARMLAND | RED_SAND => with(Kind::Shovel, 0.5, 2.0),
+        b if is_grassy(b) => with(Kind::Shovel, 0.5, 2.0),
+        TERRACOTTA | TERRACOTTA_PALE | TERRACOTTA_DARK => with(Kind::Pick, 1.6, 1.0),
+        ICE => with(Kind::Pick, 0.6, 1.0),
+        b if is_leaves(b) || b == CLOTH || b == THATCH => {
             if tool == SHEARS {
                 0.04
             } else {

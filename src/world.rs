@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 pub const CW: i32 = 16; // chunk width (x and z)
 pub const CH: i32 = 128; // chunk height
 pub const SEA: i32 = 40;
-const VOL: usize = (CW * CW * CH) as usize;
+pub(crate) const VOL: usize = (CW * CW * CH) as usize;
 
 pub type Block = u8;
 pub const AIR: Block = 0;
@@ -79,6 +79,31 @@ pub const LAST_BLOCK: Block = CHEST;
 pub const LAVA: Block = 57;
 /// lava fills the caves up to this height
 pub const LAVA_LEVEL: i32 = 6;
+/// Blocks of the biomes. These five are items too; the ones from `SNOWY_GRASS` on live
+/// only in the world (see `items::item_of` for what they give).
+pub const ICE: Block = 58;
+pub const RED_SAND: Block = 59;
+pub const TERRACOTTA: Block = 60;
+pub const TERRACOTTA_PALE: Block = 61;
+pub const TERRACOTTA_DARK: Block = 62;
+pub const FLOWER_BLUE: Block = 63;
+/// grass under snow, and the grass of the savanna, the jungle and the swamp
+pub const SNOWY_GRASS: Block = 64;
+pub const DRY_GRASS: Block = 65;
+pub const LUSH_GRASS: Block = 66;
+pub const SWAMP_GRASS: Block = 67;
+pub const JUNGLE_LEAVES: Block = 68;
+pub const ACACIA_LEAVES: Block = 69;
+/// pine needles under snow
+pub const SNOWY_LEAVES: Block = 70;
+pub const FERN: Block = 71;
+pub const REEDS: Block = 72;
+/// the tall yellow grass of the savanna
+pub const DRY_TUFT: Block = 73;
+
+/// The terrain generator a world was made with: 1 the first one, 2 the one with biomes
+/// (`worldgen`). A world keeps its generator for good, or old and new chunks would not fit.
+pub const GEN_LATEST: u8 = 2;
 
 /// Shapes that live only in the world, one id per state (their items are in `items`).
 /// Upper half slabs, same order as `SLAB`.
@@ -336,16 +361,26 @@ fn draw_boxes(b: Block, at: impl Fn(i32, i32) -> Block) -> Boxes {
 /// Small plants drawn as two crossed planes; you walk through them.
 #[inline]
 pub fn is_plant(b: Block) -> bool {
-    (TALL_GRASS..=DEAD_BUSH).contains(&b) || (WHEAT_0..=WHEAT_3).contains(&b)
+    (TALL_GRASS..=DEAD_BUSH).contains(&b) || (WHEAT_0..=WHEAT_3).contains(&b) || b == FLOWER_BLUE || (FERN..=DRY_TUFT).contains(&b)
+}
+/// Grass tufts and their kin: cut for fibre and seeds.
+#[inline]
+pub fn is_tuft(b: Block) -> bool {
+    b == TALL_GRASS || b == FERN || b == DRY_TUFT
+}
+/// Soil with grass on it, whatever the biome.
+#[inline]
+pub fn is_grassy(b: Block) -> bool {
+    b == GRASS || (SNOWY_GRASS..=SWAMP_GRASS).contains(&b)
 }
 #[inline]
 pub fn is_leaves(b: Block) -> bool {
-    b == LEAVES || b == BIRCH_LEAVES || b == PINE_LEAVES
+    b == LEAVES || b == BIRCH_LEAVES || b == PINE_LEAVES || (JUNGLE_LEAVES..=SNOWY_LEAVES).contains(&b)
 }
 /// Blocks a new block may be placed into.
 #[inline]
 pub fn is_replaceable(b: Block) -> bool {
-    b == AIR || b == WATER || b == LAVA || b == TALL_GRASS || b == DEAD_BUSH
+    b == AIR || b == WATER || b == LAVA || is_tuft(b) || b == DEAD_BUSH
 }
 
 #[inline]
@@ -467,6 +502,28 @@ pub fn tex_for(b: Block, face: usize) -> u32 {
                 CHEST_LAYER
             }
         }
+        ICE => 57,
+        RED_SAND => 58,
+        TERRACOTTA => 59,
+        TERRACOTTA_PALE => 60,
+        TERRACOTTA_DARK => 61,
+        SNOWY_GRASS => match face {
+            2 => 11,
+            3 => 2,
+            _ => 62,
+        },
+        DRY_GRASS | LUSH_GRASS | SWAMP_GRASS => match face {
+            2 => 63 + (b - DRY_GRASS) as u32 * 2,
+            3 => 2,
+            _ => 64 + (b - DRY_GRASS) as u32 * 2,
+        },
+        JUNGLE_LEAVES => 69,
+        ACACIA_LEAVES => 70,
+        SNOWY_LEAVES => 71,
+        FERN => 72,
+        REEDS => 73,
+        FLOWER_BLUE => 74,
+        DRY_TUFT => 75,
         b if is_slab(b) => tex_for(SHAPE_FULL[slab_mat(b) as usize], face),
         b if is_ladder(b) => LADDER_LAYER,
         b if is_trapdoor(b) => TRAP_LAYER,
@@ -510,7 +567,7 @@ pub type Key = (i32, i32);
 // ---------------------------------------------------------------- noise
 
 #[inline]
-fn hash2(seed: u32, x: i32, z: i32) -> u32 {
+pub(crate) fn hash2(seed: u32, x: i32, z: i32) -> u32 {
     let mut h = seed
         ^ (x as u32).wrapping_mul(0x85eb_ca6b)
         ^ (z as u32).wrapping_mul(0xc2b2_ae35).rotate_left(13);
@@ -553,7 +610,7 @@ fn perlin(seed: u32, x: f32, z: f32) -> f32 {
     (ab + (cd - ab) * v) * 1.5
 }
 
-fn fbm(seed: u32, mut x: f32, mut z: f32, oct: u32) -> f32 {
+pub(crate) fn fbm(seed: u32, mut x: f32, mut z: f32, oct: u32) -> f32 {
     let (mut amp, mut sum, mut norm) = (1.0, 0.0, 0.0);
     // (shifted off the lattice, where the noise is zero whatever the seed: otherwise the
     // middle of every world would be the same low plain)
@@ -569,7 +626,7 @@ fn fbm(seed: u32, mut x: f32, mut z: f32, oct: u32) -> f32 {
     sum / norm
 }
 
-fn smoothstep(a: f32, b: f32, x: f32) -> f32 {
+pub(crate) fn smoothstep(a: f32, b: f32, x: f32) -> f32 {
     let t = ((x - a) / (b - a)).clamp(0.0, 1.0);
     t * t * (3.0 - 2.0 * t)
 }
@@ -659,7 +716,7 @@ fn perlin3(seed: u32, x: f32, y: f32, z: f32) -> f32 {
 
 /// The two fields whose zero surfaces the tunnel networks follow. They change slowly, so
 /// `generate` samples them on every other level of a column and fills in between.
-fn tunnel_fields(seed: u32, x: i32, y: i32, z: i32) -> (f32, f32) {
+pub(crate) fn tunnel_fields(seed: u32, x: i32, y: i32, z: i32) -> (f32, f32) {
     // (off the lattice, like the terrain)
     let (xf, yf, zf) = (x as f32 + 16.3, y as f32 + 9.7, z as f32 + 26.9);
     (perlin3(seed.wrapping_add(8000), xf / 44.0, yf / 26.0, zf / 44.0), perlin3(seed.wrapping_add(8500), xf / 30.0, yf / 34.0, zf / 30.0))
@@ -669,7 +726,7 @@ fn tunnel_fields(seed: u32, x: i32, y: i32, z: i32) -> (f32, f32) {
 /// of them cross each other; the first widens into rooms here and there, the second is
 /// finer and steeper, so it links the levels of the first. `a` and `c` are the values
 /// of `tunnel_fields` at the cell.
-fn in_tunnel(seed: u32, x: i32, y: i32, z: i32, a: f32, c: f32) -> bool {
+pub(crate) fn in_tunnel(seed: u32, x: i32, y: i32, z: i32, a: f32, c: f32) -> bool {
     if y < 2 {
         return false;
     }
@@ -699,12 +756,12 @@ pub fn is_cave(seed: u32, x: i32, y: i32, z: i32) -> bool {
 /// the further down. Their floors lie under lava below `LAVA_LEVEL`. This is the slow,
 /// broad field that places them; `generate` samples it every fourth block of a column
 /// and fills in between.
-fn cavern_field(seed: u32, x: i32, y: i32, z: i32) -> f32 {
+pub(crate) fn cavern_field(seed: u32, x: i32, y: i32, z: i32) -> f32 {
     perlin3(seed.wrapping_add(8300), (x as f32 + 5.9) / 58.0, (y as f32 + 3.1) / 22.0, (z as f32 + 12.7) / 58.0)
 }
 
 /// True if the cell lies in a cavern, given the cavern field's value there.
-fn in_cavern(seed: u32, x: i32, y: i32, z: i32, hall: f32) -> bool {
+pub(crate) fn in_cavern(seed: u32, x: i32, y: i32, z: i32, hall: f32) -> bool {
     if hall < 0.12 || y < 2 || y > CAVERN_TOP {
         return false;
     }
@@ -714,11 +771,11 @@ fn in_cavern(seed: u32, x: i32, y: i32, z: i32, hall: f32) -> bool {
     hall + rough * 0.22 > 0.47 - 0.16 * deep
 }
 /// no cavern reaches higher than this
-const CAVERN_TOP: i32 = 44;
+pub(crate) const CAVERN_TOP: i32 = 44;
 
 /// Where a chunk's cave chest stands, if it has one: on a cave floor of a column picked
 /// by the seed, the deepest that is clear of the lava.
-fn cave_chest(seed: u32, cx: i32, cz: i32, blocks: &[u8], h: impl Fn(i32, i32) -> i32) -> Option<(i32, i32, i32)> {
+pub(crate) fn cave_chest(seed: u32, cx: i32, cz: i32, blocks: &[u8], h: impl Fn(i32, i32) -> i32) -> Option<(i32, i32, i32)> {
     let r = hash2(seed ^ 0x7c3a_91d5, cx, cz);
     if r % 5 >= 2 {
         return None;
@@ -735,7 +792,7 @@ fn cave_chest(seed: u32, cx: i32, cz: i32, blocks: &[u8], h: impl Fn(i32, i32) -
 }
 
 /// Ore pockets inside stone, rarer and deeper for the better ones.
-fn ore_at(seed: u32, x: i32, y: i32, z: i32) -> Block {
+pub(crate) fn ore_at(seed: u32, x: i32, y: i32, z: i32) -> Block {
     let (xf, yf, zf) = (x as f32, y as f32, z as f32);
     // (pockets grow towards the bottom of the world)
     let n = perlin3(seed.wrapping_add(9000), xf / 5.5, yf / 5.5, zf / 5.5) + ((44 - y) as f32 / 44.0).clamp(0.0, 1.0) * 0.07;
@@ -762,6 +819,18 @@ pub fn is_desert(seed: u32, x: i32, z: i32) -> bool {
     fbm(seed.wrapping_add(7000), x as f32 / 420.0, z as f32 / 420.0, 3) > 0.2
 }
 
+/// Surface height of a column in a world made by generator `ver`.
+pub fn ground_height(ver: u8, seed: u32, x: i32, z: i32) -> i32 {
+    if ver >= 2 { crate::worldgen::height_at(seed, x, z) } else { height_at(seed, x, z) }
+}
+/// Where a new player starts in a world made by generator `ver`.
+pub fn spawn_for(ver: u8, seed: u32) -> (i32, i32, i32) {
+    if ver >= 2 { crate::worldgen::spawn_point(seed) } else { spawn_point(seed) }
+}
+fn generate_for(ver: u8, seed: u32, cx: i32, cz: i32) -> ChunkData {
+    if ver >= 2 { crate::worldgen::generate(seed, cx, cz) } else { generate(seed, cx, cz) }
+}
+
 // ---------------------------------------------------------------- chunk data
 
 #[derive(Clone)]
@@ -770,7 +839,7 @@ pub struct ChunkData {
 }
 
 #[inline]
-fn bidx(x: i32, y: i32, z: i32) -> usize {
+pub(crate) fn bidx(x: i32, y: i32, z: i32) -> usize {
     ((y * CW + z) * CW + x) as usize
 }
 
@@ -1384,6 +1453,8 @@ pub struct Slot {
 
 pub struct World {
     pub seed: u32,
+    /// the generator this world's terrain comes from (see `GEN_LATEST`)
+    pub ver: u8,
     pub chunks: HashMap<Key, Slot, Fx>,
     gen_pending: HashSet<Key, Fx>,
     job_tx: Sender<Job>,
@@ -1404,7 +1475,7 @@ fn chunk_path(dir: &PathBuf, k: Key) -> PathBuf {
 }
 
 impl World {
-    pub fn new(seed: u32, radius: i32, save_dir: Option<PathBuf>) -> World {
+    pub fn new(seed: u32, ver: u8, radius: i32, save_dir: Option<PathBuf>) -> World {
         let (job_tx, job_rx) = channel::<Job>();
         let (res_tx, res_rx) = channel::<JobResult>();
         let job_rx = Arc::new(Mutex::new(job_rx));
@@ -1439,7 +1510,7 @@ impl World {
                             Some(b) => {
                                 JobResult::Gen(k, ChunkData { blocks: b.into_boxed_slice() }, true)
                             }
-                            None => JobResult::Gen(k, generate(seed, k.0, k.1), false),
+                            None => JobResult::Gen(k, generate_for(ver, seed, k.0, k.1), false),
                         }
                     }
                     Job::Mesh(k, ver, n) => JobResult::Mesh(k, ver, mesh(&n)),
@@ -1459,6 +1530,7 @@ impl World {
         }
         let mut w = World {
             seed,
+            ver,
             chunks: HashMap::default(),
             gen_pending: HashSet::default(),
             job_tx,
@@ -1629,6 +1701,11 @@ impl World {
         }
     }
 
+    /// Surface height the generator gave a column (the world may have been dug since).
+    pub fn ground_height(&self, x: i32, z: i32) -> i32 {
+        ground_height(self.ver, self.seed, x, z)
+    }
+
     pub fn is_loaded(&self, x: i32, z: i32) -> bool {
         self.chunks.contains_key(&(x >> 4, z >> 4))
     }
@@ -1774,7 +1851,7 @@ impl World {
     /// A small loaded world for tests: flat stone up to y = 9, plus what `extra` puts in.
     #[cfg(test)]
     pub fn flat(extra: impl Fn(i32, i32, i32) -> Option<Block>) -> World {
-        let mut w = World::new(1, 2, None);
+        let mut w = World::new(1, 1, 2, None);
         for cz in -1..=1 {
             for cx in -1..=1 {
                 let mut blocks = vec![AIR; VOL].into_boxed_slice();

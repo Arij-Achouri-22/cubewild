@@ -9,6 +9,7 @@ mod player;
 mod textures;
 mod ui;
 mod world;
+mod worldgen;
 
 use gfx::{ChunkMesh, EntVert, Frame, Gfx, ItemVert};
 use glam::{IVec3, Mat3, Mat4, Quat, Vec3, Vec4};
@@ -437,8 +438,8 @@ fn data_dir(seed: u32) -> Option<PathBuf> {
     Some(dir)
 }
 
-fn find_spawn(seed: u32) -> Vec3 {
-    let (x, h, z) = spawn_point(seed);
+fn find_spawn(ver: u8, seed: u32) -> Vec3 {
+    let (x, h, z) = spawn_for(ver, seed);
     Vec3::new(x as f32 + 0.5, h as f32 + 2.0, z as f32 + 0.5)
 }
 
@@ -510,14 +511,21 @@ struct Loaded {
 /// mode), otherwise new in `mode`. With `save` off nothing is read or written.
 fn load_world(seed: u32, view_dist: i32, save: bool, mode: Mode) -> Loaded {
     let save_dir = if save { data_dir(seed) } else { None };
-    let world = World::new(seed, view_dist, save_dir.clone());
-    let mut spawn = find_spawn(seed);
+    let saved = save_dir.as_ref().and_then(|d| std::fs::read_to_string(d.join("player.txt")).ok());
+    // a world keeps the terrain generator it was made with: saves from before there
+    // were two do not name one, and are of the first
+    let ver = match &saved {
+        Some(text) => text.lines().find_map(|l| l.strip_prefix("gen ")).and_then(|v| v.trim().parse::<u8>().ok()).unwrap_or(1).clamp(1, GEN_LATEST),
+        None => std::env::var("CUBEWILD_GEN").ok().and_then(|v| v.parse::<u8>().ok()).unwrap_or(GEN_LATEST).clamp(1, GEN_LATEST),
+    };
+    let world = World::new(seed, ver, view_dist, save_dir.clone());
+    let mut spawn = find_spawn(ver, seed);
     let mut player = Player::new(spawn);
     let mut inv = Inventory::new();
     let mut mode = mode;
     let mut sel = 0;
     let (mut health, mut food, mut air, mut time) = (MAX_HEALTH, MAX_FOOD, MAX_AIR, 0.04f32);
-    if let Some(text) = save_dir.as_ref().and_then(|d| std::fs::read_to_string(d.join("player.txt")).ok()) {
+    if let Some(text) = saved {
         for (n, line) in text.lines().enumerate() {
             let mut parts = line.split_whitespace();
             if n == 0 {
@@ -962,6 +970,7 @@ impl Game {
         s += &format!("stats {} {} {} {}\n", self.health, self.food, self.air, self.time);
         s += &format!("spawn {} {} {}\n", self.spawn.x, self.spawn.y, self.spawn.z);
         s += if self.mode == Mode::Creative { "mode creative\n" } else { "mode survival\n" };
+        s += &format!("gen {}\n", self.world.ver);
         if let Err(e) = std::fs::write(d.join("player.txt"), s) {
             eprintln!("cubewild: failed to save player: {e}");
         }
@@ -1279,7 +1288,7 @@ impl Game {
                 let at = p.as_vec3() + 0.5;
                 match b {
                     GRAVEL if self.rng.f() < 0.25 => self.spill(at, items::FLINT, 1),
-                    TALL_GRASS if tool != items::SHEARS => {
+                    b if is_tuft(b) && tool != items::SHEARS => {
                         if self.rng.f() < 0.6 {
                             self.spill(at, items::FIBER, 1);
                         }
@@ -1328,6 +1337,12 @@ impl Game {
                     }
                 } else if (above == TORCH || is_plant(above)) && self.world.set_block(&self.gfx, p.x, p.y + 1, p.z, AIR) {
                     self.spill(up, items::drop_for(above, tool), 1);
+                    // (a stand of reeds falls whole)
+                    let mut y = p.y + 2;
+                    while above == REEDS && self.world.get_block(p.x, y, p.z) == REEDS && self.world.set_block(&self.gfx, p.x, y, p.z, AIR) {
+                        self.spill(up, items::FIBER, 1);
+                        y += 1;
+                    }
                 }
                 // and so do ladders hanging on it
                 for (s, (dx, dz)) in SIDE_DIR.into_iter().enumerate() {
@@ -1415,8 +1430,8 @@ impl Game {
                 // till the ground
                 if let Some((p, _, _)) = target {
                     let above = self.world.get_block(p.x, p.y + 1, p.z);
-                    let soil = matches!(self.world.get_block(p.x, p.y, p.z), GRASS | DIRT);
-                    if soil && (above == AIR || above == TALL_GRASS) {
+                    let soil = { let b = self.world.get_block(p.x, p.y, p.z); b == DIRT || is_grassy(b) };
+                    if soil && (above == AIR || is_tuft(above)) {
                         if above != AIR {
                             self.world.set_block(&self.gfx, p.x, p.y + 1, p.z, AIR);
                         }
@@ -1875,7 +1890,7 @@ impl Game {
                 let (px, pz) = (self.player.pos.x.floor() as i32, self.player.pos.z.floor() as i32);
                 let rings = (1..=8i32).flat_map(|r| (-r..=r).flat_map(move |i| [(i, -r), (i, r), (-r, i), (r, i)]));
                 let open = rings.map(|(dx, dz)| (px + dx, pz + dz)).find_map(|(x, z)| {
-                    let h = height_at(self.world.seed, x, z);
+                    let h = self.world.ground_height(x, z);
                     let p = Vec3::new(x as f32 + 0.5, h as f32 + 1.0, z as f32 + 0.5);
                     let ok = h > SEA && self.world.is_loaded(x, z) && is_solid(self.world.get_block(x, h, z)) && !collides(&self.world, p, PLAYER_HW, PLAYER_H);
                     ok.then_some(p)
@@ -1906,7 +1921,7 @@ impl Game {
             self.player.flying = true;
             self.player.yaw +=
                 std::env::var("CUBEWILD_BENCH_TURN").ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(0.12) * dt;
-            let floor = height_at(self.world.seed, self.player.pos.x as i32, self.player.pos.z as i32) as f32 + 14.0;
+            let floor = self.world.ground_height(self.player.pos.x as i32, self.player.pos.z as i32) as f32 + 14.0;
             self.player.pos.y = self.player.pos.y.max(floor);
             if b.t > 6.0 {
                 b.frames.push(real_dt);
@@ -2301,6 +2316,11 @@ impl Game {
             let p = self.player.pos;
             let lines = [
                 format!("Position  {:.1}, {:.1}, {:.1}", p.x, p.y, p.z),
+                if self.world.ver >= 2 {
+                    format!("Biome  {}", worldgen::column(self.world.seed, p.x.floor() as i32, p.z.floor() as i32).biome.name())
+                } else {
+                    "Biome  - (a world from before there were biomes)".to_string()
+                },
                 format!("Worst frame  {:.1} ms", self.worst_ms),
                 format!("View {} chunks   drawn {}   quads {}", self.world.radius, self.drawn.0, self.drawn.1),
                 {
