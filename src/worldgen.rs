@@ -276,6 +276,12 @@ pub fn height_at(seed: u32, x: i32, z: i32) -> i32 {
     column(seed, x, z).h
 }
 
+/// The columns of a square from (x0, z0), `w` on a side, row by row.
+pub(crate) fn columns(seed: u32, x0: i32, z0: i32, w: i32) -> Vec<Col> {
+    let grid = FieldGrid::new(seed, x0, z0, w);
+    (0..w * w).map(|i| column_in(seed, x0 + i % w, z0 + i / w, &grid)).collect()
+}
+
 /// Where a new world's player starts: the nearest spot to the origin on fairly level
 /// green land of a mild biome. Returns the column and its height.
 pub fn spawn_point(seed: u32) -> (i32, i32, i32) {
@@ -328,7 +334,8 @@ enum Tree {
     Swamp,
 }
 
-pub fn generate(seed: u32, cx: i32, cz: i32) -> ChunkData {
+/// Makes a chunk; `villages` adds those of generator 3 (see `GEN_LATEST`).
+pub fn generate(seed: u32, cx: i32, cz: i32, villages: bool) -> ChunkData {
     let mut blocks = vec![AIR; VOL].into_boxed_slice();
     // columns of the chunk plus an apron: 3 for the trees that reach across the border,
     // and one more for the slope under them
@@ -743,6 +750,9 @@ pub fn generate(seed: u32, cx: i32, cz: i32) -> ChunkData {
             }
         }
     }
+    if villages {
+        crate::village::stamp(seed, cx, cz, &mut blocks, &hget);
+    }
     ChunkData { blocks }
 }
 
@@ -801,9 +811,11 @@ mod tests {
             for k in 0..40 {
                 let r = hash2(seed, k, 3);
                 let (cx, cz) = ((r % 256) as i32 - 128, ((r >> 8) % 256) as i32 - 128);
-                let ch = generate(seed, cx, cz);
+                let ch = generate(seed, cx, cz, true);
+                // (a village may hold water above the sea: its well, the ditches of its fields)
+                let village = !crate::village::near(seed, cx * CW, cz * CW, cx * CW + 15, cz * CW + 15, crate::village::REACH).is_empty();
                 if k == 0 {
-                    assert!(ch.blocks == generate(seed, cx, cz).blocks);
+                    assert!(ch.blocks == generate(seed, cx, cz, true).blocks);
                 }
                 for z in 0..CW {
                     for x in 0..CW {
@@ -815,7 +827,7 @@ mod tests {
                                 assert!(is_opaque(under) || under == CACTUS || (b == REEDS && under == REEDS), "seed {seed}: block {b} on {under} at {x} {y} {z} in {cx} {cz}");
                             }
                             if b == WATER || b == ICE {
-                                assert!(under != AIR && (y <= SEA || b == ICE), "seed {seed}: water at {x} {y} {z}");
+                                assert!(under != AIR && (y <= SEA || b == ICE || village), "seed {seed}: water at {x} {y} {z}");
                             }
                             if (b == LOG || b == BIRCH_LOG) && y == h + 1 {
                                 assert!(under != AIR && under != WATER, "seed {seed}: tree in the air at {x} {y} {z}");
@@ -875,7 +887,7 @@ mod tests {
         let mut air = 0usize;
         for cz in 0..8 {
             for cx in 0..8 {
-                air += generate(2026, cx * 9, cz * 9).blocks.iter().filter(|b| **b == AIR).count();
+                air += generate(2026, cx * 9, cz * 9, true).blocks.iter().filter(|b| **b == AIR).count();
             }
         }
         println!("generate v2: {:.2} ms a chunk ({air})", t.elapsed().as_secs_f64() * 1000.0 / 64.0);

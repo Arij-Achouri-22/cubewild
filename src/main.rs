@@ -8,6 +8,7 @@ mod path;
 mod player;
 mod textures;
 mod ui;
+mod village;
 mod world;
 mod worldgen;
 
@@ -2325,7 +2326,8 @@ impl Game {
                 format!("View {} chunks   drawn {}   quads {}", self.world.radius, self.drawn.0, self.drawn.1),
                 {
                     let monsters = self.mobs.list.iter().filter(|m| m.kind.is_monster()).count();
-                    format!("Animals {}   Monsters {}   {}", self.mobs.list.len() - monsters, monsters, self.gfx.adapter_name)
+                    let villagers = self.mobs.list.iter().filter(|m| m.kind == mobs::Kind::Villager).count();
+                    format!("Animals {}   Monsters {}   Villagers {}   {}", self.mobs.list.len() - monsters - villagers, monsters, villagers, self.gfx.adapter_name)
                 },
                 {
                     let hours = (self.time * 24.0 + 6.0).rem_euclid(24.0);
