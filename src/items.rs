@@ -91,7 +91,22 @@ pub const DEEP_ITEM: Item = 172;
 pub const STRIKER: Item = 184;
 /// from ember ore: a fuel that burns a long time
 pub const EMBER: Item = 185;
-pub const ITEM_END: Item = 186;
+/// slate, fortress bricks (whole, cracked), pyre ore (+ n of `world::SLATE` + n)
+pub const EXTRA_ITEM: Item = 186;
+/// the rare metal of the Emberdeep, and the best gear there is
+pub const PYRE_INGOT: Item = 190;
+pub const PYRE_PICK: Item = 191;
+pub const PYRE_AXE: Item = 192;
+pub const PYRE_SHOVEL: Item = 193;
+pub const PYRE_SWORD: Item = 194;
+pub const PYRE_HELMET: Item = 195;
+pub const PYRE_CHEST: Item = 196;
+pub const PYRE_LEGS: Item = 197;
+pub const PYRE_BOOTS: Item = 198;
+/// oak, birch, pine, jungle, acacia saplings (+ n of `world::SAPLING` + n)
+pub const SAPLING_ITEM: Item = 199;
+pub const LAVA_BUCKET: Item = 204;
+pub const ITEM_END: Item = 205;
 /// slots in a chest
 pub const CHEST_SLOTS: usize = 27;
 /// first texture layer holding item icons
@@ -101,7 +116,15 @@ pub const ICON_FOOD: u32 = ICON_BASE + 101;
 pub const ICON_AIR: u32 = ICON_BASE + 102;
 
 pub fn is_block(i: Item) -> bool {
-    (i != AIR && i < 64) || is_wool_item(i) || (DEEP_ITEM..DEEP_ITEM + DEEP_BLOCKS).contains(&i)
+    (i != AIR && i < 64) || is_wool_item(i) || (DEEP_ITEM..DEEP_ITEM + DEEP_BLOCKS).contains(&i) || is_extra_item(i) || is_sapling_item(i)
+}
+
+pub fn is_sapling_item(i: Item) -> bool {
+    (SAPLING_ITEM..SAPLING_ITEM + 5).contains(&i)
+}
+
+pub fn is_extra_item(i: Item) -> bool {
+    (EXTRA_ITEM..EXTRA_ITEM + EXTRA_BLOCKS).contains(&i)
 }
 
 pub fn is_wool_item(i: Item) -> bool {
@@ -114,6 +137,10 @@ pub fn block_of(i: Item) -> Block {
         WOOL + (i - WOOL_ITEM)
     } else if (DEEP_ITEM..DEEP_ITEM + DEEP_BLOCKS).contains(&i) {
         CINDERSTONE + (i - DEEP_ITEM)
+    } else if is_extra_item(i) {
+        SLATE + (i - EXTRA_ITEM)
+    } else if is_sapling_item(i) {
+        SAPLING + (i - SAPLING_ITEM)
     } else {
         i
     }
@@ -255,6 +282,25 @@ pub fn name(i: Item) -> &'static str {
         i if i == DEEP_ITEM + 10 => "Ember Ore",
         i if i == DEEP_ITEM + 11 => "Ashstone Bricks",
         GEM => "Gem",
+        i if i == EXTRA_ITEM => "Deep Slate",
+        i if i == EXTRA_ITEM + 1 => "Fortress Bricks",
+        i if i == EXTRA_ITEM + 2 => "Cracked Fortress Bricks",
+        i if i == EXTRA_ITEM + 3 => "Pyre Ore",
+        PYRE_INGOT => "Pyre Ingot",
+        i if i == SAPLING_ITEM => "Oak Sapling",
+        i if i == SAPLING_ITEM + 1 => "Birch Sapling",
+        i if i == SAPLING_ITEM + 2 => "Pine Sapling",
+        i if i == SAPLING_ITEM + 3 => "Jungle Sapling",
+        i if i == SAPLING_ITEM + 4 => "Acacia Sapling",
+        LAVA_BUCKET => "Lava Bucket",
+        PYRE_PICK => "Pyre Pickaxe",
+        PYRE_AXE => "Pyre Axe",
+        PYRE_SHOVEL => "Pyre Shovel",
+        PYRE_SWORD => "Pyre Sword",
+        PYRE_HELMET => "Pyre Helmet",
+        PYRE_CHEST => "Pyre Chestplate",
+        PYRE_LEGS => "Pyre Leggings",
+        PYRE_BOOTS => "Pyre Boots",
         i if i == DYE + 0 => "White Dye",
         i if i == DYE + 1 => "Orange Dye",
         i if i == DYE + 2 => "Magenta Dye",
@@ -327,7 +373,11 @@ pub fn icon(i: Item) -> u32 {
         ICON_BASE + 93
     } else if i == EMBER {
         ICON_BASE + 94
-    } else if is_wool_item(i) || (DEEP_ITEM..DEEP_ITEM + DEEP_BLOCKS).contains(&i) {
+    } else if (PYRE_INGOT..SAPLING_ITEM).contains(&i) {
+        crate::textures::PYRE_ICONS as u32 + (i - PYRE_INGOT) as u32
+    } else if i == LAVA_BUCKET {
+        crate::textures::LAVA_BUCKET_ICON as u32
+    } else if is_wool_item(i) || is_extra_item(i) || is_sapling_item(i) || (DEEP_ITEM..DEEP_ITEM + DEEP_BLOCKS).contains(&i) {
         tex_for(block_of(i), if block_of(i) == EMBER_MOSS { 2 } else { 0 })
     } else if is_block(i) {
         tex_for(i, if i == FURNACE { 4 } else { 0 })
@@ -344,6 +394,7 @@ pub enum Mat {
     Gold,
     Crystal,
     Leather,
+    Pyre,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -401,6 +452,14 @@ pub fn gear(i: Item) -> Option<(Kind, Mat)> {
         CRYSTAL_CHEST => (Kind::Chest, Mat::Crystal),
         CRYSTAL_LEGS => (Kind::Legs, Mat::Crystal),
         CRYSTAL_BOOTS => (Kind::Boots, Mat::Crystal),
+        PYRE_PICK => (Kind::Pick, Mat::Pyre),
+        PYRE_AXE => (Kind::Axe, Mat::Pyre),
+        PYRE_SHOVEL => (Kind::Shovel, Mat::Pyre),
+        PYRE_SWORD => (Kind::Sword, Mat::Pyre),
+        PYRE_HELMET => (Kind::Helmet, Mat::Pyre),
+        PYRE_CHEST => (Kind::Chest, Mat::Pyre),
+        PYRE_LEGS => (Kind::Legs, Mat::Pyre),
+        PYRE_BOOTS => (Kind::Boots, Mat::Pyre),
         _ => return None,
     })
 }
@@ -417,6 +476,7 @@ fn speed(m: Mat) -> f32 {
         Mat::Iron => 0.085,
         Mat::Gold => 0.06,
         Mat::Crystal => 0.054,
+        Mat::Pyre => 0.038,
     }
 }
 
@@ -427,6 +487,7 @@ fn pick_tier(i: Item) -> u8 {
         Some(Mat::Stone) => 2,
         Some(Mat::Iron) => 3,
         Some(Mat::Crystal) => 4,
+        Some(Mat::Pyre) => 5,
         _ => 0,
     }
 }
@@ -443,6 +504,7 @@ pub fn max_wear(i: Item) -> u16 {
             Mat::Iron => 250,
             Mat::Gold => 40,
             Mat::Crystal => 900,
+            Mat::Pyre => 2000,
         },
         Some(_) => 0,
         None => match i {
@@ -483,13 +545,14 @@ pub fn armor(i: Item) -> Option<(usize, f32)> {
         Mat::Leather => 0.25,
         Mat::Gold => 0.38,
         Mat::Iron => 0.5,
+        Mat::Pyre => 0.8,
         _ => 0.64,
     };
     Some((slot, share * set))
 }
 
 pub fn max_stack(i: Item) -> u32 {
-    if gear(i).is_some() || max_wear(i) > 0 || matches!(i, BED | BUCKET | WATER_BUCKET | COMPASS | CLOCK | BOAT) {
+    if gear(i).is_some() || max_wear(i) > 0 || matches!(i, BED | BUCKET | WATER_BUCKET | LAVA_BUCKET | COMPASS | CLOCK | BOAT) {
         1
     } else {
         99
@@ -504,9 +567,10 @@ pub fn kind(i: Item) -> &'static str {
         Some(_) => "Tool",
         None => match i {
             SPEAR | FLINT_KNIFE | BOW | ARROW => "Weapon",
-            SHEARS | BUCKET | WATER_BUCKET | FISHING_ROD | COMPASS | CLOCK | BOAT => "Tool",
+            SHEARS | BUCKET | WATER_BUCKET | LAVA_BUCKET | FISHING_ROD | COMPASS | CLOCK | BOAT => "Tool",
+            i if is_sapling_item(i) => "Plant",
             WORKBENCH | FURNACE | BED | TORCH | LAMP | OAK_DOOR | BIRCH_DOOR | CHEST | LADDER | TRAPDOOR => "Utility block",
-            i if i >= STAIRS => "Block",
+            STAIRS..=137 => "Block",
             i if food(i) > 0.0 => "Food",
             i if is_plant(i) => "Plant",
             i if is_block(i) => "Block",
@@ -584,7 +648,7 @@ pub fn desc(i: Item) -> &'static str {
         FLINT => "A sharp stone for knives and arrowheads.",
         FIBER => "For cloth, thatch, bowstrings and fishing line.",
         SHEARS => "Snips leaves and grass in an instant, and keeps the grass.",
-        BUCKET => "Right click water to scoop it up.",
+        BUCKET => "Right click water or lava to scoop it up.",
         WATER_BUCKET => "Right click to pour the water out.",
         BOAT => "Right click water to put it in. Right click it to get in, Shift to get out.",
         BONE => "Wolves love them. Also grinds into white dye.",
@@ -595,6 +659,12 @@ pub fn desc(i: Item) -> &'static str {
         i if i == DEEP_ITEM + 2 => "Soft ash. It slows you down.",
         i if i == DEEP_ITEM + 4 => "Hot to stand on.",
         GEM => "Villagers trade in these.",
+        i if i == EXTRA_ITEM => "The dark rock far below the old bedrock. Rich in ore.",
+        i if i == EXTRA_ITEM + 1 || i == EXTRA_ITEM + 2 => "From the ruined fortresses of the Emberdeep.",
+        i if i == EXTRA_ITEM + 3 => "Rare, deep in the Emberdeep by the lava. Needs a crystal pickaxe. Smelt it.",
+        PYRE_INGOT => "The rarest metal. Forge it into the best gear there is.",
+        i if is_sapling_item(i) => "Plant it on grass or dirt and in time a tree grows.",
+        LAVA_BUCKET => "Right click to pour it out. Burns in a furnace for a very long time.",
         i if dye_colour(i).is_some() => "Dyes wool and sheep. Mix two to get a new colour.",
         i if is_wool_item(i) => "Soft, coloured building block. Shear sheep or dye white wool.",
         FISHING_ROD => "Hold right click on water and wait for a bite.",
@@ -746,6 +816,16 @@ pub const RECIPES: &[Recipe] = &[
     r(Cat::Armour, (CRYSTAL_CHEST, 1), &[(CRYSTAL, 8)], WORKBENCH),
     r(Cat::Armour, (CRYSTAL_LEGS, 1), &[(CRYSTAL, 7)], WORKBENCH),
     r(Cat::Armour, (CRYSTAL_BOOTS, 1), &[(CRYSTAL, 4)], WORKBENCH),
+    // pyre gear is crystal gear forged over with the rare metal
+    r(Cat::Armour, (PYRE_HELMET, 1), &[(CRYSTAL_HELMET, 1), (PYRE_INGOT, 3)], WORKBENCH),
+    r(Cat::Armour, (PYRE_CHEST, 1), &[(CRYSTAL_CHEST, 1), (PYRE_INGOT, 5)], WORKBENCH),
+    r(Cat::Armour, (PYRE_LEGS, 1), &[(CRYSTAL_LEGS, 1), (PYRE_INGOT, 4)], WORKBENCH),
+    r(Cat::Armour, (PYRE_BOOTS, 1), &[(CRYSTAL_BOOTS, 1), (PYRE_INGOT, 2)], WORKBENCH),
+    r(Cat::Tools, (PYRE_PICK, 1), &[(CRYSTAL_PICK, 1), (PYRE_INGOT, 3)], WORKBENCH),
+    r(Cat::Tools, (PYRE_AXE, 1), &[(CRYSTAL_AXE, 1), (PYRE_INGOT, 3)], WORKBENCH),
+    r(Cat::Tools, (PYRE_SHOVEL, 1), &[(CRYSTAL_SHOVEL, 1), (PYRE_INGOT, 1)], WORKBENCH),
+    r(Cat::Combat, (PYRE_SWORD, 1), &[(CRYSTAL_SWORD, 1), (PYRE_INGOT, 2)], WORKBENCH),
+    r(Cat::Building, (EXTRA_ITEM + 1, 4), &[(EXTRA_ITEM + 2, 4)], WORKBENCH),
     r(Cat::Food, (BREAD, 1), &[(WHEAT, 3)], AIR),
     r(Cat::Food, (STEW, 1), &[(MUSHROOM, 2), (BERRIES, 2)], AIR),
     r(Cat::Building, (STONE_BRICK, 4), &[(COBBLE, 4)], AIR),
@@ -1109,6 +1189,8 @@ pub fn item_of(b: Block) -> Item {
         b if is_torch(b) => TORCH,
         b if (WOOL..WOOL_END).contains(&b) => WOOL_ITEM + (b - WOOL),
         b if is_deep_block(b) => DEEP_ITEM + (b - CINDERSTONE),
+        b if is_extra_block(b) => EXTRA_ITEM + (b - SLATE),
+        b if is_sapling(b) => SAPLING_ITEM + (b - SAPLING),
         b if is_gate(b) => AIR,
         LOOT_CHEST => CHEST,
         b if is_grassy(b) => GRASS,
@@ -1126,7 +1208,7 @@ pub fn tier_needed(b: Block) -> u8 {
         IRON_ORE => 2,
         CRYSTAL_ORE | GOLD_ORE => 3,
         // (gates are built of something only the best pick cuts)
-        CINDERSTONE => 4,
+        CINDERSTONE | PYRE_ORE => 4,
         _ => 0,
     }
 }
@@ -1155,7 +1237,8 @@ pub fn drop_for(b: Block, tool: Item) -> Item {
         }
         WHEAT_0 | WHEAT_1 | WHEAT_2 => SEEDS,
         WHEAT_3 => WHEAT,
-        WATER | BEDROCK | AIR => AIR,
+        b if is_fluid(b) => AIR,
+        BEDROCK | AIR => AIR,
         b => item_of(b),
     }
 }
@@ -1168,6 +1251,9 @@ pub fn break_time(b: Block, tool: Item) -> f32 {
     };
     match b {
         CINDERSTONE => with(Kind::Pick, 26.0, 1.0),
+        SLATE => with(Kind::Pick, 3.6, 1.0),
+        FORT_BRICK | FORT_CRACKED => with(Kind::Pick, 3.2, 1.0),
+        PYRE_ORE => with(Kind::Pick, 9.0, 1.0),
         ASHSTONE | EMBER_MOSS | SMOULDER => with(Kind::Pick, 1.3, 1.0),
         SCORIA | EMBER_ORE | ASHSTONE_BRICK => with(Kind::Pick, 2.6, 1.0),
         ASH => with(Kind::Shovel, 0.5, 2.0),
@@ -1218,6 +1304,7 @@ pub fn weapon(tool: Item) -> (i32, f32) {
                 Mat::Stone => 4,
                 Mat::Iron => 5,
                 Mat::Crystal => 7,
+                Mat::Pyre => 9,
                 _ => 3,
             },
             4.6,
@@ -1226,6 +1313,7 @@ pub fn weapon(tool: Item) -> (i32, f32) {
             match m {
                 Mat::Iron => 3,
                 Mat::Crystal => 4,
+                Mat::Pyre => 6,
                 _ => 2,
             },
             4.3,

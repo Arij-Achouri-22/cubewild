@@ -180,7 +180,7 @@ fn column_in(seed: u32, x: i32, z: i32, grid: &FieldGrid) -> Col {
     let sw = smoothstep(0.25, 0.75, hu) * smoothstep(0.0, 0.6, e) * smoothstep(-0.5, -0.2, t) * smoothstep(1.1, 0.8, t) * smoothstep(-0.5, -0.42, c) * smoothstep(0.7, 0.3, c);
     if sw > 0.0 {
         let pool = fbm(seed.wrapping_add(28_000), xf / 13.0, zf / 13.0, 2) / SIG2;
-        h = lerp(h, SEA as f32 + 0.45 + pool * 0.9, sw);
+        h = lerp(h, GSEA as f32 + 0.45 + pool * 0.9, sw);
     }
 
     // badlands: hot, dry, rugged country stands in terraces
@@ -201,7 +201,7 @@ fn column_in(seed: u32, x: i32, z: i32, grid: &FieldGrid) -> Col {
         if tr < 1.0 {
             // (the high ranges are left whole)
             let k = smoothstep(0.24, 1.0, tr).max(smoothstep(0.45, 0.75, m));
-            let bed = SEA as f32 - 3.4 + detail * 0.5;
+            let bed = GSEA as f32 - 3.4 + detail * 0.5;
             if h > bed {
                 h = bed + (h - bed) * k;
             }
@@ -213,21 +213,21 @@ fn column_in(seed: u32, x: i32, z: i32, grid: &FieldGrid) -> Col {
     if h > 96.0 {
         h = 96.0 + 20.0 * (1.0 - (-(h - 96.0) / 20.0).exp());
     }
-    let hi = (h as i32).clamp(3, CH - 12);
+    let hi = (h as i32).clamp(3, GH - 12);
 
     let temp = t - (hi as f32 - LAPSE_FROM).max(0.0) * LAPSE;
     // (borders are frayed a little, block by block)
     let r = hash2(seed ^ 0x3b1e_55a7, x, z);
     let jt = temp + ((r & 255) as f32 / 255.0 - 0.5) * 0.14;
     let jh = hu + (((r >> 8) & 255) as f32 / 255.0 - 0.5) * 0.14;
-    let biome = if hi < SEA {
+    let biome = if hi < GSEA {
         if sw > 0.5 {
             Biome::Swamp
         } else if river < 0.6 && c > -0.4 {
             if jt < FROZEN { Biome::FrozenRiver } else { Biome::River }
         } else if jt < FROZEN - 0.1 {
             Biome::FrozenOcean
-        } else if hi < SEA - 15 {
+        } else if hi < GSEA - 15 {
             Biome::DeepOcean
         } else if jt > 0.6 {
             Biome::WarmOcean
@@ -236,7 +236,7 @@ fn column_in(seed: u32, x: i32, z: i32, grid: &FieldGrid) -> Col {
         }
     } else if sw > 0.5 {
         Biome::Swamp
-    } else if hi <= SEA + 2 && c < -0.3 {
+    } else if hi <= GSEA + 2 && c < -0.3 {
         Biome::Beach
     } else if hi as f32 > 86.0 + t * 9.0 + ((r >> 16) & 3) as f32 {
         Biome::Peaks
@@ -287,7 +287,7 @@ pub(crate) fn columns(seed: u32, x0: i32, z0: i32, w: i32) -> Vec<Col> {
 pub fn spawn_point(seed: u32) -> (i32, i32, i32) {
     let ok = |x: i32, z: i32, strict: bool| -> Option<i32> {
         let c = column(seed, x, z);
-        if c.h <= SEA + 2 || c.h >= 78 {
+        if c.h <= GSEA + 2 || c.h >= 78 {
             return None;
         }
         if strict {
@@ -310,7 +310,7 @@ pub fn spawn_point(seed: u32) -> (i32, i32, i32) {
             }
         }
     }
-    (0, height_at(seed, 0, 0).max(SEA), 0)
+    (0, height_at(seed, 0, 0).max(GSEA), 0)
 }
 
 /// Layers of the badlands, by height.
@@ -356,11 +356,11 @@ pub fn generate(seed: u32, cx: i32, cz: i32, villages: bool) -> ChunkData {
         let c = col(x, z);
         let h = c.h;
         let (wx, wz) = (cx * CW + x, cz * CW + z);
-        if h <= SEA + 1 {
+        if h <= GSEA + 1 {
             // beds and shores
             let g = fbm(seed.wrapping_add(11000), wx as f32 / 38.0, wz as f32 / 38.0, 2);
             return match c.biome {
-                Biome::Swamp if h >= SEA => (SWAMP_GRASS, DIRT, 3),
+                Biome::Swamp if h >= GSEA => (SWAMP_GRASS, DIRT, 3),
                 Biome::Swamp => {
                     if g < -0.2 {
                         (CLAY, DIRT, 3)
@@ -368,14 +368,14 @@ pub fn generate(seed: u32, cx: i32, cz: i32, villages: bool) -> ChunkData {
                         (DIRT, DIRT, 3)
                     }
                 }
-                Biome::Jungle if h >= SEA => (LUSH_GRASS, DIRT, 3),
+                Biome::Jungle if h >= GSEA => (LUSH_GRASS, DIRT, 3),
                 Biome::Badlands => (RED_SAND, RED_SAND, 3),
                 Biome::WarmOcean | Biome::Desert | Biome::Beach => (SAND, SAND, 3),
                 Biome::FrozenOcean | Biome::FrozenRiver if g > -0.1 => (GRAVEL, GRAVEL, 3),
                 _ => {
                     let b = if g > 0.3 {
                         GRAVEL
-                    } else if g < -0.36 && h < SEA {
+                    } else if g < -0.36 && h < GSEA {
                         CLAY
                     } else {
                         SAND
@@ -435,7 +435,7 @@ pub fn generate(seed: u32, cx: i32, cz: i32, villages: bool) -> ChunkData {
                 *v = cavern_field(seed, wx, k as i32 * 4, wz);
             }
             // and the tunnel fields at y = 0, 2, 4, ...
-            let mut fields = [(0.0f32, 0.0f32); (CH / 2 + 1) as usize];
+            let mut fields = [(0.0f32, 0.0f32); (GH / 2 + 1) as usize];
             for (k, v) in fields.iter_mut().enumerate().take((h / 2 + 2) as usize) {
                 *v = tunnel_fields(seed, wx, k as i32 * 2, wz);
             }
@@ -459,11 +459,11 @@ pub fn generate(seed: u32, cx: i32, cz: i32, villages: bool) -> ChunkData {
                 } else {
                     STONE
                 };
-                if c.biome == Biome::Badlands && b == STONE && y > h - 18 && h > SEA + 1 {
+                if c.biome == Biome::Badlands && b == STONE && y > h - 18 && h > GSEA + 1 {
                     b = strata(y + band);
                 }
                 // caves; the caverns keep a roof of rock under the land and the sea bed
-                if b != BEDROCK && !(y <= SEA + 1 && y >= low - 4) && (tunnel(y) || cavern(y)) {
+                if b != BEDROCK && !(y <= GSEA + 1 && y >= low - 4) && (tunnel(y) || cavern(y)) {
                     if y <= LAVA_LEVEL {
                         blocks[bidx(x, y, z)] = LAVA;
                     }
@@ -474,24 +474,24 @@ pub fn generate(seed: u32, cx: i32, cz: i32, villages: bool) -> ChunkData {
                 }
                 blocks[bidx(x, y, z)] = b;
             }
-            for y in (h + 1)..=SEA {
+            for y in (h + 1)..=GSEA {
                 blocks[bidx(x, y, z)] = WATER;
             }
-            if h < SEA && frozen(x, z) {
+            if h < GSEA && frozen(x, z) {
                 if c.biome == Biome::FrozenOcean || c.biome == Biome::DeepOcean || c.biome == Biome::Ocean {
                     // pack ice with open leads, and here and there an iceberg
                     let f = fbm(seed.wrapping_add(14000), wx as f32 / 34.0, wz as f32 / 34.0, 3) / SIG3;
                     if f > -0.5 {
-                        blocks[bidx(x, SEA, z)] = ICE;
+                        blocks[bidx(x, GSEA, z)] = ICE;
                     }
-                    if f > 1.35 && h < SEA - 4 {
+                    if f > 1.35 && h < GSEA - 4 {
                         let up = ((f - 1.35) * 14.0) as i32;
-                        for y in SEA - 2 - up / 2..=SEA + up {
-                            blocks[bidx(x, y.max(h + 1), z)] = if y == SEA + up && up > 0 { SNOW } else { ICE };
+                        for y in GSEA - 2 - up / 2..=GSEA + up {
+                            blocks[bidx(x, y.max(h + 1), z)] = if y == GSEA + up && up > 0 { SNOW } else { ICE };
                         }
                     }
                 } else {
-                    blocks[bidx(x, SEA, z)] = ICE;
+                    blocks[bidx(x, GSEA, z)] = ICE;
                 }
             }
         }
@@ -526,7 +526,7 @@ pub fn generate(seed: u32, cx: i32, cz: i32, villages: bool) -> ChunkData {
             if roll >= base + (forest + 0.1).clamp(0.0, 0.6) * min {
                 continue;
             }
-            let wading = c.biome == Biome::Swamp && h >= SEA - 1;
+            let wading = c.biome == Biome::Swamp && h >= GSEA - 1;
             if !(wading || is_grassy(surface(tx, tz).0)) || is_cave(seed, wx, h, wz) {
                 continue;
             }
@@ -549,7 +549,7 @@ pub fn generate(seed: u32, cx: i32, cz: i32, villages: bool) -> ChunkData {
                 }
             };
             let mut put = |x: i32, y: i32, z: i32, b: Block, force: bool| {
-                if x >= 0 && x < CW && z >= 0 && z < CW && y > 0 && y < CH {
+                if x >= 0 && x < CW && z >= 0 && z < CW && y > 0 && y < GH {
                     let i = bidx(x, y, z);
                     if force || blocks[i] == AIR {
                         blocks[i] = b;
@@ -653,7 +653,7 @@ pub fn generate(seed: u32, cx: i32, cz: i32, villages: bool) -> ChunkData {
                 }
                 Tree::Swamp => {
                     // a squat oak with a wide drooping crown, often standing in the water
-                    let base = h.max(SEA);
+                    let base = h.max(GSEA);
                     let th = 4 + pick % 2;
                     for (dy, lim) in [(-1, 10), (0, 10), (1, 4), (2, 1)] {
                         for dz in -3i32..=3 {
@@ -677,7 +677,7 @@ pub fn generate(seed: u32, cx: i32, cz: i32, villages: bool) -> ChunkData {
         for x in 0..CW {
             let c = col(x, z);
             let h = c.h;
-            if h < SEA || blocks[bidx(x, h + 1, z)] != AIR {
+            if h < GSEA || blocks[bidx(x, h + 1, z)] != AIR {
                 continue;
             }
             let (wx, wz) = (cx * CW + x, cz * CW + z);
@@ -685,8 +685,8 @@ pub fn generate(seed: u32, cx: i32, cz: i32, villages: bool) -> ChunkData {
             let roll = (r % 1000) as i32;
             let ground = blocks[bidx(x, h, z)];
             // reeds line the water's edge
-            if h <= SEA + 1 && (is_grassy(ground) || ground == SAND || ground == DIRT) && !frozen(x, z) {
-                let wet = [(1, 0), (-1, 0), (0, 1), (0, -1)].iter().any(|&(dx, dz)| hget(x + dx, z + dz) < SEA);
+            if h <= GSEA + 1 && (is_grassy(ground) || ground == SAND || ground == DIRT) && !frozen(x, z) {
+                let wet = [(1, 0), (-1, 0), (0, 1), (0, -1)].iter().any(|&(dx, dz)| hget(x + dx, z + dz) < GSEA);
                 let share = if c.biome == Biome::Swamp { 300 } else { 110 };
                 if wet && ((r >> 12) % 1000) < share {
                     for dy in 1..=1 + ((r >> 24) % 3) as i32 {
@@ -695,7 +695,7 @@ pub fn generate(seed: u32, cx: i32, cz: i32, villages: bool) -> ChunkData {
                     continue;
                 }
             }
-            if h <= SEA + 1 && c.biome != Biome::Swamp {
+            if h <= GSEA + 1 && c.biome != Biome::Swamp {
                 continue;
             }
             let mut plant = AIR;
@@ -732,7 +732,7 @@ pub fn generate(seed: u32, cx: i32, cz: i32, villages: bool) -> ChunkData {
             } else if ground == SAND && c.biome == Biome::Desert {
                 if roll < 9 {
                     plant = DEAD_BUSH;
-                } else if roll < 14 && h + 4 < CH {
+                } else if roll < 14 && h + 4 < GH {
                     for dy in 1..=(2 + (r >> 9) % 2) as i32 {
                         blocks[bidx(x, h + dy, z)] = CACTUS;
                     }
@@ -794,10 +794,10 @@ mod tests {
             for z in (-2048..2048).step_by(32) {
                 for x in (-2048..2048).step_by(32) {
                     let c = column(seed, x, z);
-                    assert!((3..=CH - 12).contains(&c.h));
+                    assert!((3..=GH - 12).contains(&c.h));
                     seen[c.biome as usize] += 1;
                     total += 1;
-                    land += (c.h >= SEA) as u32;
+                    land += (c.h >= GSEA) as u32;
                 }
             }
             let share = land as f32 / total as f32;
@@ -805,7 +805,7 @@ mod tests {
             // the start is on level green land
             let (x, h, z) = spawn_point(seed);
             let c = column(seed, x, z);
-            assert!(c.h == h && h > SEA + 2 && h < 78 && c.biome.mild(), "seed {seed}: spawn {x} {h} {z} {:?}", c.biome);
+            assert!(c.h == h && h > GSEA + 2 && h < 78 && c.biome.mild(), "seed {seed}: spawn {x} {h} {z} {:?}", c.biome);
             assert!(x.abs().max(z.abs()) <= 1200, "seed {seed}: spawn {x} {z}");
             // chunks are the same every time, and nothing in them hangs in the air
             for k in 0..40 {
@@ -821,13 +821,13 @@ mod tests {
                     for x in 0..CW {
                         let h = height_at(seed, cx * CW + x, cz * CW + z);
                         assert_eq!(ch.get(x, 0, z), BEDROCK);
-                        for y in 1..CH - 1 {
+                        for y in 1..GH - 1 {
                             let (b, under) = (ch.get(x, y, z), ch.get(x, y - 1, z));
                             if is_plant(b) || b == CACTUS {
                                 assert!(is_opaque(under) || under == CACTUS || (b == REEDS && under == REEDS), "seed {seed}: block {b} on {under} at {x} {y} {z} in {cx} {cz}");
                             }
                             if b == WATER || b == ICE {
-                                assert!(under != AIR && (y <= SEA || b == ICE || village), "seed {seed}: water at {x} {y} {z}");
+                                assert!(under != AIR && (y <= GSEA || b == ICE || village), "seed {seed}: water at {x} {y} {z}");
                             }
                             if (b == LOG || b == BIRCH_LOG) && y == h + 1 {
                                 assert!(under != AIR && under != WATER, "seed {seed}: tree in the air at {x} {y} {z}");
@@ -930,7 +930,7 @@ mod tests {
             let n = (2 * R / STEP) as usize;
             let mut img = vec![0u8; n * n * 3];
             let mut share = [0u32; BIOMES];
-            let (mut lo, mut hi) = (CH, 0);
+            let (mut lo, mut hi) = (GH, 0);
             for (j, z) in (-R..R).step_by(STEP as usize).enumerate() {
                 for (i, x) in (-R..R).step_by(STEP as usize).enumerate() {
                     let c = column(seed, x, z);
@@ -938,7 +938,7 @@ mod tests {
                     lo = lo.min(c.h);
                     hi = hi.max(c.h);
                     // shaded by height
-                    let k = if c.h < SEA { 0.75 + (c.h - 10).max(0) as f32 / 120.0 } else { 0.8 + (c.h - SEA) as f32 / 150.0 };
+                    let k = if c.h < GSEA { 0.75 + (c.h - 10).max(0) as f32 / 120.0 } else { 0.8 + (c.h - GSEA) as f32 / 150.0 };
                     let rgb = colour(c.biome).map(|v| (v as f32 * k).min(255.0) as u8);
                     img[(j * n + i) * 3..][..3].copy_from_slice(&rgb);
                 }

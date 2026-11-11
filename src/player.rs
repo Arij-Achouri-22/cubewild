@@ -1,6 +1,6 @@
 //! Player movement, AABB-vs-voxel physics (shared with animals), and ray casting.
 
-use crate::world::{is_fence, is_ladder, is_shaped, is_solid, is_target, is_torch, World, LAVA, WATER};
+use crate::world::{fluid_height, is_fence, is_lava, is_ladder, is_shaped, is_solid, is_target, is_torch, is_water, Block, World};
 use glam::{IVec3, Vec3};
 
 pub fn collides(world: &World, pos: Vec3, hw: f32, h: f32) -> bool {
@@ -288,13 +288,20 @@ impl Player {
     }
 
     pub fn eye_in_lava(&self, world: &World) -> bool {
-        let e = self.eye().floor().as_ivec3();
-        world.get_block(e.x, e.y, e.z) == LAVA
+        self.eye_under(world, is_lava)
     }
 
     pub fn eye_in_water(&self, world: &World) -> bool {
-        let e = self.eye().floor().as_ivec3();
-        world.get_block(e.x, e.y, e.z) == WATER
+        self.eye_under(world, is_water)
+    }
+
+    /// The eyes are under the surface of a fluid (running water is shallow: its surface
+    /// stands lower in the cell).
+    fn eye_under(&self, world: &World, fluid: fn(Block) -> bool) -> bool {
+        let eye = self.eye();
+        let e = eye.floor().as_ivec3();
+        let b = world.get_block(e.x, e.y, e.z);
+        fluid(b) && (fluid(world.get_block(e.x, e.y + 1, e.z)) || eye.y - e.y as f32 <= fluid_height(b) - 0.06)
     }
 
     pub fn update(&mut self, world: &World, inp: &Input, dt: f32) {
@@ -307,8 +314,14 @@ impl Player {
         }
         let b = self.pos.floor().as_ivec3();
         let around = world.get_block(b.x, (self.pos.y + if self.swimming { 0.3 } else { 0.4 }).floor() as i32, b.z);
-        self.in_lava = around == LAVA;
-        self.in_water = around == WATER || self.in_lava;
+        self.in_lava = is_lava(around);
+        self.in_water = is_water(around) || self.in_lava;
+        // running water carries you along
+        let flow = if self.in_water && !self.flying {
+            crate::fluid::current(world, IVec3::new(b.x, (self.pos.y + 0.4).floor() as i32, b.z)) * if self.in_lava { 0.8 } else { 2.4 }
+        } else {
+            Vec3::ZERO
+        };
         // Ctrl + forward in water: lie flat and swim. Coming out of it needs room to stand.
         let want = self.in_water && !self.in_lava && !self.flying && inp.sprint && inp.forward > 0.0;
         if want {
@@ -328,7 +341,7 @@ impl Player {
         } else if self.swimming && self.in_water {
             // swim the way you look: down to dive, up to rise
             let look = self.look_dir();
-            let mut target = look * inp.forward.max(0.0) * 5.4 + right * inp.right * 2.0;
+            let mut target = look * inp.forward.max(0.0) * 5.4 + right * inp.right * 2.0 + flow;
             if inp.jump {
                 target.y = target.y.max(2.5);
             }
@@ -336,7 +349,7 @@ impl Player {
             self.vel += (target - self.vel) * k;
         } else if self.in_water {
             // (lava is thick: half the pace of water)
-            let target = wish * if inp.sprint { 3.6 } else { 2.6 } * if self.in_lava { 0.5 } else { 1.0 };
+            let target = wish * if inp.sprint { 3.6 } else { 2.6 } * if self.in_lava { 0.5 } else { 1.0 } + flow;
             let k = 1.0 - (-dt * 6.0).exp();
             self.vel.x += (target.x - self.vel.x) * k;
             self.vel.z += (target.z - self.vel.z) * k;
@@ -449,7 +462,7 @@ mod tests {
     #[test]
     fn sprint_swimming_lies_flat_and_dives_where_you_look() {
         // deep water from y 2 to 20
-        let w = World::flat(|_, y, _| (2..=20).contains(&y).then_some(WATER));
+        let w = World::flat(|_, y, _| (2..=20).contains(&y).then_some(crate::world::WATER));
         let mut p = Player::new(Vec3::new(1.5, 15.0, 0.5));
         (p.yaw, p.pitch) = (std::f32::consts::FRAC_PI_2, -0.6);
         let inp = Input { forward: 1.0, sprint: true, ..Default::default() };

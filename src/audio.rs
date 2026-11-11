@@ -1193,6 +1193,39 @@ fn creature(s: &mut Synth, k: Kind, c: Call, take: usize) -> Vec<f32> {
             }
             v
         }
+        (Kind::Hound, c) => {
+            // a crackling snarl: a rough growl with embers popping in it
+            let (len, f) = match c {
+                Call::Idle => (s.between(0.6, 0.9), 120.0),
+                Call::Hurt => (0.3, 420.0),
+                Call::Death => (0.9, 300.0),
+            };
+            let mut v = s.call(len, &|t| f * j * (1.0 - 0.35 * t) * (1.0 + 0.06 * (t * 31.0).sin()), up(AA, 0.85), up(UH, 0.85), 0.7, 1.0, 0.03, len * 0.4);
+            let g = s.grains(6 + take * 2, len, 0.02, 1800.0, 4200.0, 3.0, 1.0);
+            mix(&mut v, &g, 0.35, 0);
+            v
+        }
+        (Kind::Wisp, c) => {
+            // a fluttering hiss of flame
+            let len = match c {
+                Call::Idle => s.between(0.7, 1.0),
+                Call::Hurt => 0.35,
+                Call::Death => 1.1,
+            };
+            let mut v = s.call(len, &|t| (520.0 + 140.0 * (t * 17.0).sin()) * j * if c == Call::Death { 1.0 - 0.5 * t } else { 1.0 }, EE, EH, 3.0, 0.3, 0.08, len * 0.5);
+            let g = s.grains(10 + take * 3, len, 0.015, 2200.0, 6000.0, 2.0, 1.0);
+            mix(&mut v, &g, 0.6, 0);
+            v
+        }
+        (Kind::Brute, c) => {
+            // a huge hollow groan
+            let (len, f) = match c {
+                Call::Idle => (s.between(1.1, 1.6), 62.0),
+                Call::Hurt => (0.5, 110.0),
+                Call::Death => (2.0, 80.0),
+            };
+            s.call(len, &|t| f * j * (1.0 - 0.25 * t), up(OH, 0.7), up(UH, 0.7), 0.4, 0.9, 0.08, len * 0.45)
+        }
         (Kind::Puffcap, c) => {
             // wheezing puffs from somewhere under the cap
             let puffs = match c {
@@ -1230,6 +1263,6 @@ mod tests {
             let peak = s.iter().fold(0.0f32, |m, v| m.max(v.abs()));
             assert!(peak.is_finite() && peak > 0.05 && peak <= 1.0, "sound {i} peak {peak}");
         }
-        assert_eq!(b.sounds.len(), 8 * 4 + 11 * 3 + 23);
+        assert_eq!(b.sounds.len(), 8 * 4 + 14 * 3 + 23);
     }
 }

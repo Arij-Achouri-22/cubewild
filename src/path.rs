@@ -56,7 +56,7 @@ fn passable(get: &mut impl FnMut(i32, i32, i32) -> Block, x: i32, y: i32, z: i32
 fn floor(get: &mut impl FnMut(i32, i32, i32) -> Block, x: i32, y: i32, z: i32) -> bool {
     let below = get(x, y - 1, z);
     // (not on a door's edge, an open trapdoor, or a fence: that is too high to step onto)
-    (is_solid(below) && !is_door(below) && !is_fence(below) && !(is_trapdoor(below) && trap_open(below))) || below == WATER || get(x, y, z) == WATER
+    (is_solid(below) && !is_door(below) && !is_fence(below) && !(is_trapdoor(below) && trap_open(below))) || is_water(below) || is_water(get(x, y, z))
 }
 
 /// The cell a body at `p` stands in: `p` itself, or the ground up to four cells below it.

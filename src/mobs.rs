@@ -9,9 +9,9 @@ use crate::items::{self, Item, ARROW, BERRIES, BONE, COOKED_MEAT, FIBER, HIDE, I
 use crate::path::{settle, walk_line, Body, Finder, Probe};
 use crate::player::{collides, move_step, ray_aabb, raycast_with};
 use crate::village::{self, Village};
-use crate::world::{hash2, is_grassy, is_ladder, is_leaves, is_solid, World, AIR, CLAY, CLOTH, COLOURS, LAVA, MUSHROOM, SEA, SNOW, WATER};
+use crate::world::{is_fluid, is_lava, hash2, is_grassy, is_ladder, is_leaves, is_solid, World, AIR, CLAY, CLOTH, COLOURS, MUSHROOM, SEA, SNOW};
 use glam::{IVec3, Mat4, Vec3};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 pub struct Rng(pub u64);
@@ -43,10 +43,16 @@ pub enum Kind {
     Villager,
     Sheep,
     Puffcap,
+    /// the Emberdeep: scorchhounds hunt in packs across the floors
+    Hound,
+    /// emberwisps float in the air and throw fire
+    Wisp,
+    /// cinder brutes guard the ruined fortresses
+    Brute,
 }
 
 /// Every kind, in the order they are saved by.
-pub const KINDS: [Kind; 11] = [Kind::Deer, Kind::Boar, Kind::Hare, Kind::Wolf, Kind::Zombie, Kind::Skeleton, Kind::Spider, Kind::Slime, Kind::Villager, Kind::Sheep, Kind::Puffcap];
+pub const KINDS: [Kind; 14] = [Kind::Deer, Kind::Boar, Kind::Hare, Kind::Wolf, Kind::Zombie, Kind::Skeleton, Kind::Spider, Kind::Slime, Kind::Villager, Kind::Sheep, Kind::Puffcap, Kind::Hound, Kind::Wisp, Kind::Brute];
 
 /// seconds a puffcap's fuse burns before it bursts
 pub const FUSE: f32 = 1.5;
@@ -55,7 +61,11 @@ const GROW: f32 = 600.0;
 
 impl Kind {
     pub fn is_monster(self) -> bool {
-        matches!(self, Kind::Zombie | Kind::Skeleton | Kind::Spider | Kind::Slime | Kind::Puffcap)
+        matches!(self, Kind::Zombie | Kind::Skeleton | Kind::Spider | Kind::Slime | Kind::Puffcap | Kind::Hound | Kind::Wisp | Kind::Brute)
+    }
+    /// creatures of the Emberdeep: lava does not burn them
+    pub fn fireproof(self) -> bool {
+        matches!(self, Kind::Hound | Kind::Wisp | Kind::Brute)
     }
     /// What it eats: held, it lures the animal; fed, it breeds (or heals a dog).
     pub fn food(self) -> &'static [Item] {
@@ -108,6 +118,11 @@ fn spec(k: Kind) -> Spec {
         Kind::Sheep => sp(0.32, 1.25, 4, 1.1, 4.8, 0.0, 2, 0, 0.0, 0.0),
         // it does no biting: it bursts
         Kind::Puffcap => sp(0.3, 1.3, 8, 1.2, 3.4, 0.0, 0, 0, 18.0, 0.0),
+        // a hound runs about as fast as you walk, and bites hard
+        Kind::Hound => sp(0.3, 0.9, 8, 1.8, 4.6, 0.0, 1, 0, 26.0, 3.0),
+        // (it throws fire instead of biting)
+        Kind::Wisp => sp(0.3, 0.8, 6, 1.6, 3.4, 0.0, 0, 0, 28.0, 0.0),
+        Kind::Brute => sp(0.48, 2.5, 34, 1.0, 2.7, 0.0, 0, 0, 18.0, 7.0),
     }
 }
 
@@ -130,6 +145,10 @@ fn drops(m: &Mob, rng: &mut Rng) -> Drops {
         Kind::Spider => [(FIBER, 1 + rng.next() % 2), (0, 0)],
         Kind::Slime => [(CLAY as Item, 1 + rng.next() % 2), (0, 0)],
         Kind::Villager => [(0, 0), (0, 0)],
+        Kind::Hound => [(MEAT, 1 + rng.next() % 2), (BONE, rng.next() % 2)],
+        Kind::Wisp => [(items::EMBER, 1 + rng.next() % 2), (0, 0)],
+        // a brute now and then carries a bar of pyre metal
+        Kind::Brute => [(items::GOLD_INGOT, 1 + rng.next() % 3), (items::PYRE_INGOT, (rng.next() % 4 == 0) as u32)],
         _ => [(MEAT, s.meat), (HIDE, s.hide)],
     }
 }
@@ -282,6 +301,8 @@ pub struct Mobs {
     pub list: Vec<Mob>,
     /// arrows loosed by skeletons this frame: (position, velocity)
     pub shots: Vec<(Vec3, Vec3)>,
+    /// fireballs thrown by emberwisps this frame: (position, velocity)
+    pub fireballs: Vec<(Vec3, Vec3)>,
     rng: Rng,
     spawn_timer: f32,
     finder: Finder,
@@ -289,6 +310,9 @@ pub struct Mobs {
     pub ignore: bool,
     /// villagers that were killed: (the square of their village, their home in it)
     gone: HashSet<((i32, i32), usize)>,
+    /// each fortress's garrison: guards sent out so far, and seconds until it sends
+    /// another once its first three are down (so a fortress can be cleared)
+    guards: HashMap<(i32, i32), (u32, f32)>,
     /// what happened this frame (see `MobEvent`): the game takes them
     pub events: Vec<MobEvent>,
 }
@@ -321,14 +345,81 @@ const SAFE_LIGHT: f32 = 9.0;
 
 impl Mobs {
     pub fn new(seed: u64) -> Mobs {
-        Mobs { list: Vec::new(), shots: Vec::new(), rng: Rng(seed | 1), spawn_timer: 0.0, finder: Finder::default(), ignore: false, gone: HashSet::new(), events: Vec::new() }
+        Mobs { list: Vec::new(), shots: Vec::new(), fireballs: Vec::new(), rng: Rng(seed | 1), spawn_timer: 0.0, finder: Finder::default(), ignore: false, gone: HashSet::new(), guards: HashMap::new(), events: Vec::new() }
+    }
+
+    /// The Emberdeep's creatures: hound packs on the floors, wisps in the air (more in
+    /// the grove), and brutes in the fortresses. Light does not keep them away.
+    fn spawn_deep(&mut self, world: &World, player: Vec3) {
+        use crate::deep;
+        let count = |me: &Mobs, k: Kind| me.list.iter().filter(|m| m.kind == k && m.dead < 0.0).count();
+        // a fortress near the player keeps a few guards in its courtyard
+        let (px, pz) = (player.x.floor() as i32, player.z.floor() as i32);
+        for f in deep::forts_near(world.seed, px - 48, pz - 48, px + 48, pz + 48) {
+            let guards = self.list.iter().filter(|m| m.kind == Kind::Brute && m.dead < 0.0 && f.inside(m.pos)).count();
+            let (sent, wait) = self.guards.entry((f.x, f.z)).or_insert((0, 0.0));
+            *wait -= 0.6;
+            // three to begin with; after that one now and then
+            let may = *sent < 3 || *wait <= 0.0;
+            if guards < 3 && may && self.rng.f() < 0.3 {
+                let p = f.yard() + Vec3::new(self.rng.range(-8.0, 8.0), 0.01, self.rng.range(-2.0, 2.0));
+                if world.is_loaded(p.x.floor() as i32, p.z.floor() as i32) && (p - player).length() > 10.0 && !collides(world, p, 0.48, 2.5) {
+                    let (sent, wait) = self.guards.get_mut(&(f.x, f.z)).unwrap();
+                    *sent += 1;
+                    *wait = 120.0;
+                    self.add(Kind::Brute, p);
+                }
+            }
+        }
+        let monsters = self.list.iter().filter(|m| m.kind.is_monster() && m.kind != Kind::Brute && m.dead < 0.0).count();
+        if monsters >= 9 || self.rng.f() > 0.35 {
+            return;
+        }
+        let region = deep::region(world.seed, px, pz);
+        let wisp = self.rng.f() < if region == deep::Region::Grove { 0.6 } else { 0.35 };
+        let kind = if wisp && count(self, Kind::Wisp) < 4 { Kind::Wisp } else { Kind::Hound };
+        for _ in 0..8 {
+            let (dx, dz) = (self.rng.range(-26.0, 26.0), self.rng.range(-26.0, 26.0));
+            if dx * dx + dz * dz < 14.0 * 14.0 {
+                continue;
+            }
+            let (x, z) = ((player.x + dx).floor() as i32, (player.z + dz).floor() as i32);
+            if !world.is_loaded(x, z) {
+                continue;
+            }
+            let y0 = player.y.floor() as i32 + (self.rng.next() % 17) as i32 - 8;
+            let floor = (0..10).map(|k| y0 - k).find(|&y| {
+                y > deep::LAVA_SEA && world.get_block(x, y, z) == AIR && world.get_block(x, y + 1, z) == AIR && is_solid(world.get_block(x, y - 1, z))
+            });
+            let Some(y) = floor else { continue };
+            let pos = Vec3::new(x as f32 + 0.5, y as f32 + 0.01, z as f32 + 0.5);
+            if deep::forts_near(world.seed, x, z, x, z).iter().any(|f| f.covers(x, z)) {
+                continue;
+            }
+            if kind == Kind::Hound {
+                // hounds come in twos and threes
+                let n = 2 + (self.rng.next() % 2) as usize;
+                for k in 0..n {
+                    let q = pos + Vec3::new((k as f32 - 1.0) * 0.9, 0.0, (k % 2) as f32 * 0.9);
+                    if !collides(world, q, 0.3, 0.9) {
+                        self.add(Kind::Hound, q);
+                    }
+                }
+            } else {
+                self.add(Kind::Wisp, pos + Vec3::Y * 2.0);
+                if let Some(m) = self.list.last_mut() {
+                    m.slot = (self.rng.next() % 2) as usize;
+                }
+            }
+            break;
+        }
     }
 
     /// Puts the people of the villages round the player into their houses: everyone who
     /// is not about already, and was not killed.
     fn populate(&mut self, world: &World, player: Vec3) {
         let (px, pz) = (player.x.floor() as i32, player.z.floor() as i32);
-        for v in village::near(world.seed, px, pz, px, pz, 96 + village::REACH) {
+        for v in village::near_world(world.seed, px, pz, px, pz, 96 + village::REACH) {
             for (slot, &home) in v.homes.iter().enumerate() {
                 let pos = home + Vec3::new(0.0, 0.01, 0.0);
                 if (home - player).length_squared() > 96.0 * 96.0 || !world.is_loaded(home.x.floor() as i32, home.z.floor() as i32) {
@@ -349,7 +440,7 @@ impl Mobs {
 
     fn try_spawn(&mut self, world: &World, player: Vec3, night: bool) {
         if world.is_deep() {
-            // (the creatures of the Emberdeep come later)
+            self.spawn_deep(world, player);
             return;
         }
         if world.ver >= 3 {
@@ -657,6 +748,8 @@ impl Mobs {
     /// `lure` is the item in the player's hand: animals follow their food.
     pub fn update(&mut self, world: &World, player: Vec3, sneaking: bool, night: bool, lure: Item, dt: f32) -> f32 {
         let mut damage = 0.0;
+        // (in the Emberdeep it is always night: its creatures never slink off)
+        let night = night || world.is_deep();
         self.spawn_timer -= dt;
         if self.spawn_timer <= 0.0 {
             self.spawn_timer = 0.6;
@@ -709,6 +802,7 @@ impl Mobs {
         let ignore = self.ignore;
         let rng = &mut self.rng;
         let shots = &mut self.shots;
+        let fireballs = &mut self.fireballs;
         let finder = &mut self.finder;
         let mut probe = Probe::new(world);
         // route searches allowed this frame; the others wait their turn
@@ -873,8 +967,15 @@ impl Mobs {
                     m.repath -= dt;
                     m.distrust -= dt;
                     if m.repath <= 0.0 {
-                        plan(m, &s, player, 4, &mut probe, finder, &mut searches, rng);
-                        if m.kind == Kind::Skeleton {
+                        if m.kind == Kind::Wisp {
+                            // it flies: no route on foot, only whether it can see you
+                            m.repath = rng.range(0.3, 0.5);
+                            m.direct = true;
+                            m.path.clear();
+                        } else {
+                            plan(m, &s, player, 4, &mut probe, finder, &mut searches, rng);
+                        }
+                        if matches!(m.kind, Kind::Skeleton | Kind::Wisp) {
                             m.los = clear_path(world, m.pos + Vec3::new(0.0, 1.35, 0.0), player + Vec3::new(0.0, 1.2, 0.0));
                         }
                     }
@@ -928,6 +1029,42 @@ impl Mobs {
                                 speed = s.run;
                             }
                         }
+                        Kind::Wisp => {
+                            // drifts at a distance and throws fire; closes in when it
+                            // cannot see you
+                            face = Some(toward);
+                            if flat > 12.0 || (!m.los && chase) {
+                                speed = s.run;
+                            } else if flat < 5.0 {
+                                m.heading = toward + std::f32::consts::PI;
+                                speed = s.walk;
+                            } else {
+                                // circles slowly round
+                                m.heading = toward + std::f32::consts::FRAC_PI_2 * if m.slot % 2 == 0 { 1.0 } else { -1.0 };
+                                speed = s.walk * 0.6;
+                            }
+                            if m.bite <= 0.0 {
+                                m.bite = rng.range(2.6, 3.8);
+                                let from = m.pos + Vec3::new(toward.sin() * 0.4, 0.45, toward.cos() * 0.4);
+                                let aim = player + Vec3::new(0.0, 1.0, 0.0);
+                                if clear_path(world, from, aim) {
+                                    let jitter = Vec3::new(rng.range(-0.6, 0.6), rng.range(-0.3, 0.3), rng.range(-0.6, 0.6));
+                                    fireballs.push((from, (aim - from).normalize_or(Vec3::Z) * 15.0 + jitter));
+                                }
+                            }
+                        }
+                        Kind::Hound => {
+                            if chase {
+                                speed = s.run;
+                            }
+                            // leaps the last few blocks
+                            if m.on_ground && m.hop <= 0.0 && flat > 2.0 && flat < 5.0 {
+                                m.hop = rng.range(1.8, 2.6);
+                                m.vel.y = 6.0;
+                                m.vel.x += toward.sin() * 6.5;
+                                m.vel.z += toward.cos() * 6.5;
+                            }
+                        }
                         Kind::Spider => {
                             if chase {
                                 speed = s.run;
@@ -946,8 +1083,10 @@ impl Mobs {
                             }
                         }
                     }
-                    if s.dmg > 0.0 && flat < 1.5 && to_player.y.abs() < 1.9 && m.bite <= 0.0 {
-                        m.bite = 1.2;
+                    // (a brute's club reaches further, and higher)
+                    let (reach, up) = if m.kind == Kind::Brute { (2.3, 2.6) } else { (1.5, 1.9) };
+                    if s.dmg > 0.0 && flat < reach && to_player.y.abs() < up && m.bite <= 0.0 {
+                        m.bite = if m.kind == Kind::Brute { 1.8 } else { 1.2 };
                         damage += s.dmg;
                     }
                 } else if m.flee > 0.0 {
@@ -997,8 +1136,8 @@ impl Mobs {
 
             let b = m.pos.floor().as_ivec3();
             let around = world.get_block(b.x, (m.pos.y + s.h * 0.5).floor() as i32, b.z);
-            let in_water = around == WATER || around == LAVA;
-            if around == LAVA && m.dead < 0.0 {
+            let in_water = is_fluid(around);
+            if is_lava(around) && m.dead < 0.0 && !m.kind.fireproof() {
                 // lava burns whatever blunders into it
                 m.burn -= dt;
                 if m.burn <= 0.0 {
@@ -1010,7 +1149,19 @@ impl Mobs {
                     }
                 }
             }
-            if in_water {
+            if in_water && m.kind != Kind::Wisp {
+                // carried along by running water
+                let flow = crate::fluid::current(world, IVec3::new(b.x, (m.pos.y + s.h * 0.5).floor() as i32, b.z));
+                m.vel.x += flow.x * 14.0 * dt;
+                m.vel.z += flow.z * 14.0 * dt;
+            }
+            if m.kind == Kind::Wisp && m.dead < 0.0 {
+                // it flies: hovers a little above the player's head, or above the floor
+                // when idle, bobbing
+                let floor = (0..10).map(|k| m.pos.y.floor() as i32 - k).find(|&y| is_solid(world.get_block(b.x, y, b.z))).map_or(m.pos.y - 3.0, |y| y as f32 + 1.0);
+                let want = if hunting { player.y + 2.4 } else { floor + 2.6 } + (m.age * 1.3).sin() * 0.4;
+                m.vel.y += ((want - m.pos.y).clamp(-2.0, 2.0) * 1.6 - m.vel.y) * (1.0 - (-dt * 3.0).exp());
+            } else if in_water {
                 m.vel.y = (m.vel.y + 14.0 * dt).min(1.6);
             } else {
                 m.vel.y = (m.vel.y - 29.0 * dt).max(-50.0);
@@ -1027,6 +1178,8 @@ impl Mobs {
                     m.vel.y = 2.6;
                 } else if m.kind == Kind::Spider && (m.direct || !hunting) {
                     m.vel.y = 4.0; // spiders climb straight up walls (unless a path leads round)
+                } else if m.kind == Kind::Wisp {
+                    m.vel.y = 3.0; // floats up over it
                 } else if ground || in_water {
                     m.vel.y = 8.2; // hop up one block
                     m.stuck = m.stuck.saturating_add(1);
@@ -1435,6 +1588,87 @@ fn draw_monster(out: &mut Vec<EntVert>, m: &Mob, base: &Mat4, swing: f32, tint: 
                 part(&limb([sx * 0.11, 0.2, 0.0], sx * swing * 0.6), [-0.08, -0.2, -0.09], [0.08, 0.0, 0.11], w(stalk), O);
             }
             part(&body, [-0.05, 0.5, 0.2], [0.05, 0.53, 0.21], [90, 50, 40], O);
+        }
+        Kind::Hound => {
+            // a lean black hound, cracked through with fire, a flame for a tail
+            let (hide, dark, fire, hot) = ([46, 36, 36], [28, 22, 24], [255, 110, 30], [255, 214, 120]);
+            let pant = if alive { (m.age * 6.0).sin() * 0.015 } else { 0.0 };
+            let body = *base * Mat4::from_translation(Vec3::new(0.0, pant, 0.0));
+            part(&body, [-0.2, 0.44, -0.5], [0.2, 0.78, 0.4], hide, O);
+            part(&body, [-0.22, 0.46, 0.1], [0.22, 0.84, 0.42], dark, O); // shoulders
+            // embers along the spine, flickering
+            for i in 0..4 {
+                let z = -0.42 + i as f32 * 0.2;
+                let f = if alive { ((m.age * 7.0 + i as f32 * 1.7).sin() * 0.5 + 0.5) * 0.06 } else { 0.0 };
+                part(&body, [-0.05, 0.78, z], [0.05, 0.84 + f, z + 0.12], fire, EMISSIVE);
+            }
+            part(&body, [-0.21, 0.55, -0.2], [-0.2, 0.62, 0.2], fire, EMISSIVE); // cracks in the flank
+            part(&body, [0.2, 0.6, -0.35], [0.21, 0.66, 0.0], fire, EMISSIVE);
+            let head = body * Mat4::from_translation(Vec3::new(0.0, 0.66, 0.4)) * Mat4::from_rotation_x(sway * 0.5) * Mat4::from_translation(Vec3::new(0.0, -0.66, -0.4));
+            part(&head, [-0.16, 0.54, 0.38], [0.16, 0.86, 0.7], hide, O);
+            part(&head, [-0.09, 0.54, 0.7], [0.09, 0.7, 0.9], dark, O); // snout
+            part(&head, [-0.08, 0.5, 0.72], [0.08, 0.54, 0.86], fire, EMISSIVE); // a glowing jaw
+            for sx in [-1.0f32, 1.0] {
+                part(&head, [sx * 0.09 - 0.035, 0.74, 0.7], [sx * 0.09 + 0.035, 0.79, 0.71], hot, EMISSIVE);
+                part(&head, [sx * 0.11 - 0.04, 0.86, 0.44], [sx * 0.11 + 0.04, 1.0, 0.52], dark, O); // ears
+            }
+            // the tail: a lick of flame that waves
+            let wave = if alive { (m.age * 5.0).sin() * 0.25 } else { 0.0 };
+            let tail = body * Mat4::from_translation(Vec3::new(0.0, 0.72, -0.5)) * Mat4::from_rotation_y(wave) * Mat4::from_rotation_x(-0.6);
+            part(&tail, [-0.05, -0.05, -0.36], [0.05, 0.05, 0.0], fire, EMISSIVE);
+            part(&tail, [-0.03, -0.03, -0.46], [0.03, 0.03, -0.3], hot, EMISSIVE);
+            for (i, (sx, sz)) in [(1.0f32, 1.0f32), (-1.0, 1.0), (1.0, -1.0), (-1.0, -1.0)].into_iter().enumerate() {
+                let ang = if i == 0 || i == 3 { swing } else { -swing };
+                part(&limb([sx * 0.13, 0.46, sz * 0.32], ang), [-0.06, -0.46, -0.06], [0.06, 0.0, 0.06], dark, O);
+            }
+        }
+        Kind::Wisp => {
+            // a knot of fire: a white-hot heart in a shell of flame, sparks circling it
+            let t = m.age;
+            let core = *base * Mat4::from_translation(Vec3::new(0.0, 0.42, 0.0));
+            let spin = core * Mat4::from_rotation_y(t * 2.3) * Mat4::from_rotation_x(t * 1.7);
+            part(&core, [-0.15, -0.15, -0.15], [0.15, 0.15, 0.15], [255, 236, 170], EMISSIVE);
+            part(&spin, [-0.26, -0.2, -0.2], [0.26, 0.2, 0.2], [240, 90, 30], EMISSIVE);
+            part(&spin, [-0.2, -0.26, -0.2], [0.2, 0.26, 0.2], [200, 50, 30], 190);
+            // two dark eyes on the heart
+            for sx in [-1.0f32, 1.0] {
+                part(&core, [sx * 0.06 - 0.025, 0.0, 0.15], [sx * 0.06 + 0.025, 0.07, 0.16], [40, 10, 10], O);
+            }
+            if alive {
+                for i in 0..4 {
+                    let a = t * 3.2 + i as f32 * std::f32::consts::FRAC_PI_2;
+                    let p = Vec3::new(a.cos() * 0.42, (t * 2.0 + i as f32).sin() * 0.15, a.sin() * 0.42);
+                    let e = core * Mat4::from_translation(p);
+                    part(&e, [-0.05, -0.05, -0.05], [0.05, 0.05, 0.05], [255, 160, 60], EMISSIVE);
+                }
+                // flames licking up from the top
+                let lick = (t * 9.0).sin() * 0.06;
+                part(&core, [-0.08, 0.18, -0.08], [0.08, 0.38 + lick, 0.08], [255, 130, 40], EMISSIVE);
+            }
+        }
+        Kind::Brute => {
+            // a hulk of cinder and brick with a fire burning in its chest, dragging a club
+            let (rock, plate, fire, wood) = ([60, 50, 52], [74, 40, 38], [255, 110, 40], [96, 66, 44]);
+            let breathe = if alive { (m.age * 1.4).sin() * 0.02 } else { 0.0 };
+            let body = *base * Mat4::from_translation(Vec3::new(0.0, breathe, 0.0));
+            part(&body, [-0.44, 0.95, -0.3], [0.44, 1.95, 0.3], rock, O); // torso
+            part(&body, [-0.48, 1.6, -0.34], [0.48, 2.05, 0.3], plate, O); // shoulders
+            part(&body, [-0.16, 1.25, 0.3], [0.16, 1.6, 0.33], fire, EMISSIVE); // the fire in its chest
+            part(&body, [-0.3, 0.95, 0.3], [0.3, 1.1, 0.32], plate, O);
+            let head = body * Mat4::from_translation(Vec3::new(0.0, 1.95, 0.05)) * Mat4::from_rotation_x(0.25 + sway);
+            part(&head, [-0.2, 0.0, -0.12], [0.2, 0.36, 0.26], rock, O);
+            for sx in [-1.0f32, 1.0] {
+                part(&head, [sx * 0.08 - 0.04, 0.16, 0.26], [sx * 0.08 + 0.04, 0.22, 0.27], [255, 180, 60], EMISSIVE);
+                part(&head, [sx * 0.2 - 0.04, 0.26, 0.0], [sx * 0.2 + 0.04, 0.5, 0.08], [200, 190, 170], O); // horns
+                part(&limb([sx * 0.22, 0.95, 0.0], sx * swing * 0.6), [-0.15, -0.95, -0.16], [0.15, 0.0, 0.16], rock, O);
+            }
+            // arms: the right drags a club; both swing up when it strikes
+            let strike = if alive && m.bite > 1.3 { (m.bite - 1.3) * 3.0 } else { 0.0 };
+            part(&limb([-0.58, 1.9, 0.0], -swing * 0.4 - strike), [-0.13, -1.25, -0.13], [0.13, 0.0, 0.13], plate, O);
+            let arm = limb([0.58, 1.9, 0.0], swing * 0.4 - strike * 1.2);
+            part(&arm, [-0.13, -1.25, -0.13], [0.13, 0.0, 0.13], plate, O);
+            part(&arm, [-0.06, -1.95, -0.06], [0.06, -1.1, 0.06], wood, O);
+            part(&arm, [-0.17, -2.3, -0.17], [0.17, -1.85, 0.17], [70, 66, 74], O);
         }
         Kind::Villager => {
             // dressed each in their own colours, some in a straw hat, some in a cap

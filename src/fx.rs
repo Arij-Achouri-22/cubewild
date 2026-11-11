@@ -3,7 +3,7 @@
 
 use crate::gfx::{self, EntVert};
 use crate::mobs::Rng;
-use crate::world::{is_solid, World, WATER};
+use crate::world::{is_solid, is_water, World};
 use glam::{IVec3, Vec3};
 
 /// Hard cap: past this new particles push out the oldest.
@@ -394,7 +394,7 @@ impl Orbs {
                 o.vel = Vec3::ZERO;
             } else {
                 o.pos = next;
-                if b == WATER {
+                if is_water(b) {
                     o.vel.y = o.vel.y.max(0.8);
                 }
             }
