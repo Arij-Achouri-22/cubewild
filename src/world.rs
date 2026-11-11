@@ -65,7 +65,273 @@ pub const WHEAT_0: Block = 45;
 pub const WHEAT_1: Block = 46;
 pub const WHEAT_2: Block = 47;
 pub const WHEAT_3: Block = 48;
-pub const LAST_BLOCK: Block = WHEAT_3;
+/// a thin window: glass in a wooden frame, joining up with whatever stands beside it
+pub const PANE: Block = 49;
+/// lower half slabs: oak, birch, cobblestone, stone brick (see `SHAPE_FULL`)
+pub const SLAB: Block = 50;
+pub const SLAB_END: Block = 54;
+pub const FENCE: Block = 54;
+pub const BIRCH_FENCE: Block = 55;
+pub const CHEST: Block = 56;
+pub const LAST_BLOCK: Block = CHEST;
+/// Molten rock in the deepest caves: it glows, burns whoever wades into it and destroys
+/// items. Like water it is not an item.
+pub const LAVA: Block = 57;
+/// lava fills the caves up to this height
+pub const LAVA_LEVEL: i32 = 6;
+
+/// Shapes that live only in the world, one id per state (their items are in `items`).
+/// Upper half slabs, same order as `SLAB`.
+pub const SLAB_TOP: Block = 133;
+/// + the side of the cell whose wall the ladder hangs on
+pub const LADDER_BASE: Block = 137;
+/// bits 0-1 the side it swings up against, 2 open, 3 in the upper half of the cell
+pub const TRAP_BASE: Block = 141;
+pub const TRAP_END: Block = 157;
+/// A chest that world generation left in a cave, not opened yet: it becomes an ordinary
+/// chest, filled by `loot::roll_chest`, the first time it is opened or broken.
+pub const LOOT_CHEST: Block = 158;
+pub const TRAP_OPEN: Block = 4;
+pub const TRAP_TOP: Block = 8;
+/// bits 0-1 the side the high step is on, 2 upside down, 3-4 material (see `SHAPE_FULL`)
+pub const STAIR_BASE: Block = 224;
+pub const STAIR_FLIP: Block = 4;
+/// the full block each slab / stair material is cut from
+pub const SHAPE_FULL: [Block; 4] = [PLANKS, BIRCH_PLANKS, COBBLE, STONE_BRICK];
+
+/// Doors live only in the world (the item is `items::OAK_DOOR` / `BIRCH_DOOR`): one id per
+/// state. Bits above `DOOR_BASE`: 0-1 the cell side the closed door stands on (see
+/// `SIDE_DIR`), 2 open, 3 upper half, 4 hinge on the right, 5 wood (0 oak, 1 birch).
+pub const DOOR_BASE: Block = 160;
+pub const DOOR_END: Block = 224;
+pub const DOOR_OPEN: Block = 4;
+pub const DOOR_UPPER: Block = 8;
+pub const DOOR_HINGE_RIGHT: Block = 16;
+/// thickness of a door, and of the box a window pane collides with
+pub const DOOR_THICK: f32 = 3.0 / 16.0;
+const PANE_HALF: f32 = 1.0 / 16.0;
+/// cell sides: 0 = -X, 1 = +X, 2 = -Z, 3 = +Z, as (dx, dz)
+pub const SIDE_DIR: [(i32, i32); 4] = [(-1, 0), (1, 0), (0, -1), (0, 1)];
+/// the side to the left / right of someone who faces a door standing on side `s` from outside
+pub const SIDE_LEFT: [u8; 4] = [2, 3, 1, 0];
+pub const SIDE_RIGHT: [u8; 4] = [3, 2, 0, 1];
+
+#[inline]
+pub fn is_door(b: Block) -> bool {
+    (DOOR_BASE..DOOR_END).contains(&b)
+}
+/// Blocks that do not fill their cell: collision, aiming and drawing use `shape_boxes`.
+#[inline]
+pub fn is_shaped(b: Block) -> bool {
+    (PANE..=CHEST).contains(&b) || b >= SLAB_TOP
+}
+#[inline]
+pub fn is_slab(b: Block) -> bool {
+    (SLAB..SLAB_END).contains(&b) || (SLAB_TOP..LADDER_BASE).contains(&b)
+}
+#[inline]
+pub fn slab_top(b: Block) -> bool {
+    b >= SLAB_TOP
+}
+/// index into `SHAPE_FULL`
+#[inline]
+pub fn slab_mat(b: Block) -> u8 {
+    if b >= SLAB_TOP { b - SLAB_TOP } else { b - SLAB }
+}
+#[inline]
+pub fn is_fence(b: Block) -> bool {
+    b == FENCE || b == BIRCH_FENCE
+}
+#[inline]
+pub fn is_ladder(b: Block) -> bool {
+    (LADDER_BASE..TRAP_BASE).contains(&b)
+}
+#[inline]
+pub fn is_trapdoor(b: Block) -> bool {
+    (TRAP_BASE..TRAP_END).contains(&b)
+}
+#[inline]
+pub fn trap_open(b: Block) -> bool {
+    (b - TRAP_BASE) & TRAP_OPEN != 0
+}
+#[inline]
+pub fn is_stairs(b: Block) -> bool {
+    b >= STAIR_BASE
+}
+#[inline]
+pub fn stair_mat(b: Block) -> u8 {
+    (b - STAIR_BASE) >> 3
+}
+/// Blocks that keep the daylight out of what lies under them, like a full block does.
+#[inline]
+fn roofs(b: Block) -> bool {
+    (is_opaque(b) && !is_leaves(b)) || is_slab(b) || is_stairs(b) || (is_trapdoor(b) && !trap_open(b))
+}
+#[inline]
+pub fn door_open(b: Block) -> bool {
+    (b - DOOR_BASE) & DOOR_OPEN != 0
+}
+#[inline]
+pub fn door_upper(b: Block) -> bool {
+    (b - DOOR_BASE) & DOOR_UPPER != 0
+}
+/// 0 oak, 1 birch
+#[inline]
+pub fn door_wood(b: Block) -> u8 {
+    (b - DOOR_BASE) >> 5
+}
+/// (side of the cell the door leaf stands on right now, side its hinge is at)
+pub fn door_sides(b: Block) -> (u8, u8) {
+    let d = b - DOOR_BASE;
+    let closed = d & 3;
+    let swing = if d & DOOR_HINGE_RIGHT != 0 { SIDE_RIGHT } else { SIDE_LEFT }[closed as usize];
+    if d & DOOR_OPEN != 0 { (swing, closed) } else { (closed, swing) }
+}
+/// Texture layer of a door half; the mirrored set keeps the knob away from the hinge.
+fn door_layer(b: Block) -> u32 {
+    let (_, hinge) = door_sides(b);
+    crate::textures::DOOR_TEX as u32 + door_wood(b) as u32 * 2 + !door_upper(b) as u32 + if hinge & 1 == 1 { 4 } else { 0 }
+}
+/// What a window pane joins up with.
+#[inline]
+fn pane_joins(b: Block) -> bool {
+    b == PANE || b == GLASS || is_door(b) || (is_opaque(b) && !is_leaves(b))
+}
+/// (runs along x, runs along z) for a pane, from whether it has a neighbour on each axis.
+#[inline]
+fn pane_axes(join_x: bool, join_z: bool) -> (bool, bool) {
+    if join_x || join_z { (join_x, join_z) } else { (true, true) }
+}
+/// What a fence joins up with.
+#[inline]
+fn fence_joins(b: Block) -> bool {
+    is_fence(b) || (is_opaque(b) && !is_leaves(b))
+}
+/// A slab of thickness `t` standing against side `s` of the cell.
+fn side_box(s: u8, from: f32, t: f32) -> [f32; 6] {
+    match s {
+        0 => [from, 0.0, 0.0, t, 1.0, 1.0],
+        1 => [1.0 - t, 0.0, 0.0, 1.0 - from, 1.0, 1.0],
+        2 => [0.0, 0.0, from, 1.0, 1.0, t],
+        _ => [0.0, 0.0, 1.0 - t, 1.0, 1.0, 1.0 - from],
+    }
+}
+
+/// up to five boxes, and how many are used
+pub type Boxes = ([[f32; 6]; 5], usize);
+
+/// Boxes a shaped block fills inside its cell, as [x0, y0, z0, x1, y1, z1]; `at` reads
+/// the neighbouring blocks on its level by offset. A fence stands taller than its cell.
+pub fn shape_boxes(b: Block, at: impl Fn(i32, i32) -> Block) -> Boxes {
+    let mut v = [[0.0f32; 6]; 5];
+    let n = if is_door(b) {
+        v[0] = side_box(door_sides(b).0, 0.0, DOOR_THICK);
+        1
+    } else if b == PANE {
+        let (ax, az) = pane_axes(pane_joins(at(-1, 0)) || pane_joins(at(1, 0)), pane_joins(at(0, -1)) || pane_joins(at(0, 1)));
+        let (lo, hi) = (0.5 - PANE_HALF, 0.5 + PANE_HALF);
+        let mut n = 0;
+        if ax {
+            v[n] = [0.0, 0.0, lo, 1.0, 1.0, hi];
+            n += 1;
+        }
+        if az {
+            v[n] = [lo, 0.0, 0.0, hi, 1.0, 1.0];
+            n += 1;
+        }
+        n
+    } else if is_slab(b) {
+        v[0] = if slab_top(b) { [0.0, 0.5, 0.0, 1.0, 1.0, 1.0] } else { [0.0, 0.0, 0.0, 1.0, 0.5, 1.0] };
+        1
+    } else if is_stairs(b) {
+        let d = b - STAIR_BASE;
+        let flip = d & STAIR_FLIP != 0;
+        v[0] = if flip { [0.0, 0.5, 0.0, 1.0, 1.0, 1.0] } else { [0.0, 0.0, 0.0, 1.0, 0.5, 1.0] };
+        // the high part is a half, a quarter (outer corner) or three quarters (inner
+        // corner), turning to meet stairs set crosswise in front of or behind this one
+        let s = d & 3;
+        let like = |o: Block| is_stairs(o) && (o - STAIR_BASE) & STAIR_FLIP == d & STAIR_FLIP;
+        let side = |o: Block| (o - STAIR_BASE) & 3;
+        let nb = |t: u8| at(SIDE_DIR[t as usize].0, SIDE_DIR[t as usize].1);
+        // no stairs in line with this one on side `t`
+        let free = |t: u8| !(like(nb(t)) && side(nb(t)) == s);
+        let quarter = |a: u8, t: u8| {
+            let (p, q) = (side_box(a, 0.0, 0.5), side_box(t, 0.0, 0.5));
+            [p[0].max(q[0]), 0.0, p[2].max(q[2]), p[3].min(q[3]), 1.0, p[5].min(q[5])]
+        };
+        let (front, back) = (nb(s), nb(s ^ 1));
+        let n = if like(front) && side(front) >> 1 != s >> 1 && free(side(front) ^ 1) {
+            v[1] = quarter(s, side(front));
+            2
+        } else if like(back) && side(back) >> 1 != s >> 1 && free(side(back)) {
+            v[1] = side_box(s, 0.0, 0.5);
+            v[2] = quarter(s ^ 1, side(back));
+            3
+        } else {
+            v[1] = side_box(s, 0.0, 0.5);
+            2
+        };
+        for bx in &mut v[1..n] {
+            (bx[1], bx[4]) = if flip { (0.0, 0.5) } else { (0.5, 1.0) };
+        }
+        n
+    } else if is_fence(b) {
+        let (p0, p1, r0, r1) = (0.375, 0.625, 0.4375, 0.5625);
+        v[0] = [p0, 0.0, p0, p1, 1.5, p1];
+        let mut n = 1;
+        for (s, arm) in [[0.0, 0.0, r0, p0, 1.5, r1], [p1, 0.0, r0, 1.0, 1.5, r1], [r0, 0.0, 0.0, r1, 1.5, p0], [r0, 0.0, p1, r1, 1.5, 1.0]].into_iter().enumerate() {
+            if fence_joins(at(SIDE_DIR[s].0, SIDE_DIR[s].1)) {
+                v[n] = arm;
+                n += 1;
+            }
+        }
+        n
+    } else if b == CHEST || b == LOOT_CHEST {
+        v[0] = [0.0625, 0.0, 0.0625, 0.9375, 0.875, 0.9375];
+        1
+    } else if is_ladder(b) {
+        v[0] = side_box(b - LADDER_BASE, 0.0, DOOR_THICK);
+        1
+    } else if is_trapdoor(b) {
+        let d = b - TRAP_BASE;
+        v[0] = if d & TRAP_OPEN != 0 {
+            side_box(d & 3, 0.0, DOOR_THICK)
+        } else if d & TRAP_TOP != 0 {
+            [0.0, 1.0 - DOOR_THICK, 0.0, 1.0, 1.0, 1.0]
+        } else {
+            [0.0, 0.0, 0.0, 1.0, DOOR_THICK, 1.0]
+        };
+        1
+    } else {
+        v[0] = [0.0, 0.0, 0.0, 1.0, 1.0, 1.0];
+        1
+    };
+    (v, n)
+}
+
+/// The boxes of a shaped block as they are drawn, each with the block whose textures it
+/// wears: finer than `shape_boxes` (fence rails, a ladder standing off its wall).
+fn draw_boxes(b: Block, at: impl Fn(i32, i32) -> Block) -> Boxes {
+    if is_fence(b) {
+        let mut v = [[0.0f32; 6]; 5];
+        v[0] = [0.375, 0.0, 0.375, 0.625, 1.0, 0.625];
+        let mut n = 1;
+        // one box per joined side, cut into two rails by the caller
+        for (s, arm) in [[0.0, 0.0, 0.4375, 0.375, 1.0, 0.5625], [0.625, 0.0, 0.4375, 1.0, 1.0, 0.5625], [0.4375, 0.0, 0.0, 0.5625, 1.0, 0.375], [0.4375, 0.0, 0.625, 0.5625, 1.0, 1.0]].into_iter().enumerate() {
+            if fence_joins(at(SIDE_DIR[s].0, SIDE_DIR[s].1)) {
+                v[n] = arm;
+                n += 1;
+            }
+        }
+        (v, n)
+    } else if is_ladder(b) {
+        let mut v = [[0.0f32; 6]; 5];
+        v[0] = side_box(b - LADDER_BASE, 0.0625, 0.125);
+        (v, 1)
+    } else {
+        shape_boxes(b, at)
+    }
+}
 
 /// Small plants drawn as two crossed planes; you walk through them.
 #[inline]
@@ -79,22 +345,22 @@ pub fn is_leaves(b: Block) -> bool {
 /// Blocks a new block may be placed into.
 #[inline]
 pub fn is_replaceable(b: Block) -> bool {
-    b == AIR || b == WATER || b == TALL_GRASS || b == DEAD_BUSH
+    b == AIR || b == WATER || b == LAVA || b == TALL_GRASS || b == DEAD_BUSH
 }
 
 #[inline]
 pub fn is_opaque(b: Block) -> bool {
-    b != AIR && b != WATER && b != GLASS && b != TORCH && !is_plant(b)
+    b != AIR && b != WATER && b != GLASS && b != TORCH && !is_plant(b) && !is_shaped(b)
 }
 /// Blocks you collide with / can target.
 #[inline]
 pub fn is_solid(b: Block) -> bool {
-    b != AIR && b != WATER && b != TORCH && !is_plant(b)
+    b != AIR && b != WATER && b != LAVA && b != TORCH && !is_plant(b) && !is_ladder(b)
 }
 /// Blocks the crosshair can select (torches are walk-through but breakable).
 #[inline]
 pub fn is_target(b: Block) -> bool {
-    b != AIR && b != WATER
+    b != AIR && b != WATER && b != LAVA
 }
 /// Blocks that light their surroundings.
 #[inline]
@@ -190,12 +456,36 @@ pub fn tex_for(b: Block, face: usize) -> u32 {
             }
         }
         WHEAT_0..=WHEAT_3 => 51 + (b - WHEAT_0) as u32,
+        PANE => PANE_LAYER,
+        FENCE => 8,
+        BIRCH_FENCE => 44,
+        LAVA => LAVA_LAYER,
+        CHEST | LOOT_CHEST => {
+            if face == 2 || face == 3 {
+                CHEST_TOP_LAYER
+            } else {
+                CHEST_LAYER
+            }
+        }
+        b if is_slab(b) => tex_for(SHAPE_FULL[slab_mat(b) as usize], face),
+        b if is_ladder(b) => LADDER_LAYER,
+        b if is_trapdoor(b) => TRAP_LAYER,
+        b if is_door(b) => door_layer(b),
+        b if is_stairs(b) => tex_for(SHAPE_FULL[stair_mat(b) as usize], face),
         _ => 14,
     }
 }
 
 /// texture layer the shader renders at full brightness
 pub const LAMP_LAYER: u32 = 27;
+pub const LAVA_LAYER: u32 = 56;
+/// window pane texture; the shader draws quads with this layer through the middle of the cell
+pub const PANE_LAYER: u32 = 55;
+/// textures past the item icons (only shaped blocks use them: see `MeshData::detail`)
+pub const CHEST_LAYER: u32 = crate::textures::EXTRA_BASE as u32;
+pub const CHEST_TOP_LAYER: u32 = CHEST_LAYER + 1;
+pub const LADDER_LAYER: u32 = CHEST_LAYER + 2;
+pub const TRAP_LAYER: u32 = CHEST_LAYER + 3;
 
 // ---------------------------------------------------------------- hashing
 
@@ -214,7 +504,7 @@ impl Hasher for FxHasher {
         self.0
     }
 }
-type Fx = BuildHasherDefault<FxHasher>;
+pub type Fx = BuildHasherDefault<FxHasher>;
 pub type Key = (i32, i32);
 
 // ---------------------------------------------------------------- noise
@@ -265,6 +555,10 @@ fn perlin(seed: u32, x: f32, z: f32) -> f32 {
 
 fn fbm(seed: u32, mut x: f32, mut z: f32, oct: u32) -> f32 {
     let (mut amp, mut sum, mut norm) = (1.0, 0.0, 0.0);
+    // (shifted off the lattice, where the noise is zero whatever the seed: otherwise the
+    // middle of every world would be the same low plain)
+    x += 0.37;
+    z += 0.61;
     for i in 0..oct {
         sum += perlin(seed.wrapping_add(i * 131), x, z) * amp;
         norm += amp;
@@ -293,7 +587,42 @@ pub fn height_at(seed: u32, x: i32, z: i32) -> i32 {
         let r = r.max(0.0);
         h += m * r * r * 58.0;
     }
+    // the highest peaks level off gently instead of being cut flat at the build limit
+    if h > 96.0 {
+        h = 96.0 + 20.0 * (1.0 - (-(h - 96.0) / 20.0).exp());
+    }
     (h as i32).clamp(3, CH - 12)
+}
+
+/// Where a new world's player starts: the nearest spot to the origin on fairly level
+/// green land, clear of sea, desert and mountains. Returns the column and its height.
+pub fn spawn_point(seed: u32) -> (i32, i32, i32) {
+    let ok = |x: i32, z: i32, strict: bool| -> Option<i32> {
+        let h = height_at(seed, x, z);
+        if h <= SEA + 2 || h >= 78 {
+            return None;
+        }
+        if strict {
+            let level = [(6, 0), (-6, 0), (0, 6), (0, -6)].iter().all(|&(dx, dz)| (height_at(seed, x + dx, z + dz) - h).abs() <= 3);
+            if !level || is_desert(seed, x, z) {
+                return None;
+            }
+        }
+        Some(h)
+    };
+    // rings of points 16 apart, growing outwards; first the choosy pass, then any land
+    for strict in [true, false] {
+        for ring in 0..96i32 {
+            for i in -ring..=ring {
+                for (x, z) in [(i, -ring), (i, ring), (-ring, i), (ring, i)] {
+                    if let Some(h) = ok(x * 16, z * 16, strict) {
+                        return (x * 16, h, z * 16);
+                    }
+                }
+            }
+        }
+    }
+    (0, height_at(seed, 0, 0).max(SEA), 0)
 }
 
 #[inline]
@@ -328,26 +657,88 @@ fn perlin3(seed: u32, x: f32, y: f32, z: f32) -> f32 {
     lerp(lerp(x00, x10, v), lerp(x01, x11, v), w)
 }
 
-/// Winding tunnels: the space where two noise fields are both near zero.
-pub fn is_cave(seed: u32, x: i32, y: i32, z: i32) -> bool {
+/// The two fields whose zero surfaces the tunnel networks follow. They change slowly, so
+/// `generate` samples them on every other level of a column and fills in between.
+fn tunnel_fields(seed: u32, x: i32, y: i32, z: i32) -> (f32, f32) {
+    // (off the lattice, like the terrain)
+    let (xf, yf, zf) = (x as f32 + 16.3, y as f32 + 9.7, z as f32 + 26.9);
+    (perlin3(seed.wrapping_add(8000), xf / 44.0, yf / 26.0, zf / 44.0), perlin3(seed.wrapping_add(8500), xf / 30.0, yf / 34.0, zf / 30.0))
+}
+
+/// Winding tunnels: the space where two noise fields are both near zero. Two networks
+/// of them cross each other; the first widens into rooms here and there, the second is
+/// finer and steeper, so it links the levels of the first. `a` and `c` are the values
+/// of `tunnel_fields` at the cell.
+fn in_tunnel(seed: u32, x: i32, y: i32, z: i32, a: f32, c: f32) -> bool {
     if y < 2 {
         return false;
     }
-    let (xf, yf, zf) = (x as f32, y as f32, z as f32);
-    let a = perlin3(seed.wrapping_add(8000), xf / 44.0, yf / 26.0, zf / 44.0);
-    if a.abs() > 0.1 {
+    let (xf, yf, zf) = (x as f32 + 16.3, y as f32 + 9.7, z as f32 + 26.9);
+    if a.abs() < 0.13 {
+        let b = perlin3(seed.wrapping_add(8100), xf / 44.0, yf / 26.0, zf / 44.0);
+        let room = perlin3(seed.wrapping_add(8200), xf / 90.0, yf / 60.0, zf / 90.0).max(0.0);
+        if a * a + b * b < 0.0042 + room * 0.008 {
+            return true;
+        }
+    }
+    if c.abs() < 0.09 {
+        let d = perlin3(seed.wrapping_add(8600), xf / 30.0, yf / 34.0, zf / 30.0);
+        return c * c + d * d < 0.0030;
+    }
+    false
+}
+
+/// True if a tunnel passes through the cell.
+pub fn is_cave(seed: u32, x: i32, y: i32, z: i32) -> bool {
+    // (between the sampled levels the fields are the mean of their neighbours, as in `generate`)
+    let (p, q) = (tunnel_fields(seed, x, y - y % 2, z), tunnel_fields(seed, x, y + y % 2, z));
+    in_tunnel(seed, x, y, z, (p.0 + q.0) * 0.5, (p.1 + q.1) * 0.5)
+}
+
+/// Caverns: wide halls in the deep rock, rare near the surface and commoner and larger
+/// the further down. Their floors lie under lava below `LAVA_LEVEL`. This is the slow,
+/// broad field that places them; `generate` samples it every fourth block of a column
+/// and fills in between.
+fn cavern_field(seed: u32, x: i32, y: i32, z: i32) -> f32 {
+    perlin3(seed.wrapping_add(8300), (x as f32 + 5.9) / 58.0, (y as f32 + 3.1) / 22.0, (z as f32 + 12.7) / 58.0)
+}
+
+/// True if the cell lies in a cavern, given the cavern field's value there.
+fn in_cavern(seed: u32, x: i32, y: i32, z: i32, hall: f32) -> bool {
+    if hall < 0.12 || y < 2 || y > CAVERN_TOP {
         return false;
     }
-    let b = perlin3(seed.wrapping_add(8100), xf / 44.0, yf / 26.0, zf / 44.0);
-    // wider rooms here and there
-    let room = perlin3(seed.wrapping_add(8200), xf / 90.0, yf / 60.0, zf / 90.0).max(0.0);
-    a * a + b * b < 0.0034 + room * 0.007
+    let deep = ((CAVERN_TOP - y) as f32 / 34.0).min(1.0);
+    // (a finer field roughens the walls and leaves pillars standing)
+    let rough = perlin3(seed.wrapping_add(8400), (x as f32 + 5.9) / 15.0, (y as f32 + 3.1) / 11.0, (z as f32 + 12.7) / 15.0);
+    hall + rough * 0.22 > 0.47 - 0.16 * deep
+}
+/// no cavern reaches higher than this
+const CAVERN_TOP: i32 = 44;
+
+/// Where a chunk's cave chest stands, if it has one: on a cave floor of a column picked
+/// by the seed, the deepest that is clear of the lava.
+fn cave_chest(seed: u32, cx: i32, cz: i32, blocks: &[u8], h: impl Fn(i32, i32) -> i32) -> Option<(i32, i32, i32)> {
+    let r = hash2(seed ^ 0x7c3a_91d5, cx, cz);
+    if r % 5 >= 2 {
+        return None;
+    }
+    // a few columns are tried, since most of the rock holds no cave
+    (0..12).find_map(|k| {
+        let q = hash2(r, k, 77);
+        let (x, z) = ((q & 15) as i32, ((q >> 4) & 15) as i32);
+        (LAVA_LEVEL + 1..(h(x, z) - 8).min(40)).find(|&y| {
+            blocks[bidx(x, y, z)] == AIR && blocks[bidx(x, y + 1, z)] == AIR && matches!(blocks[bidx(x, y - 1, z)], STONE | COAL_ORE | IRON_ORE | GOLD_ORE | CRYSTAL_ORE)
+        })
+        .map(|y| (x, y, z))
+    })
 }
 
 /// Ore pockets inside stone, rarer and deeper for the better ones.
 fn ore_at(seed: u32, x: i32, y: i32, z: i32) -> Block {
     let (xf, yf, zf) = (x as f32, y as f32, z as f32);
-    let n = perlin3(seed.wrapping_add(9000), xf / 5.5, yf / 5.5, zf / 5.5);
+    // (pockets grow towards the bottom of the world)
+    let n = perlin3(seed.wrapping_add(9000), xf / 5.5, yf / 5.5, zf / 5.5) + ((44 - y) as f32 / 44.0).clamp(0.0, 1.0) * 0.07;
     if n < 0.5 {
         return STONE;
     }
@@ -422,6 +813,24 @@ pub fn generate(seed: u32, cx: i32, cz: i32) -> ChunkData {
                 }
             };
             let low = h.min(hget(x - 1, z)).min(hget(x + 1, z)).min(hget(x, z - 1)).min(hget(x, z + 1));
+            // the cavern field up the column, at y = 0, 4, 8, ...
+            let mut halls = [0.0f32; (CAVERN_TOP / 4 + 2) as usize];
+            for (k, v) in halls.iter_mut().enumerate() {
+                *v = cavern_field(seed, wx, k as i32 * 4, wz);
+            }
+            // and the tunnel fields at y = 0, 2, 4, ...
+            let mut fields = [(0.0f32, 0.0f32); (CH / 2 + 1) as usize];
+            for (k, v) in fields.iter_mut().enumerate().take((h / 2 + 2) as usize) {
+                *v = tunnel_fields(seed, wx, k as i32 * 2, wz);
+            }
+            let tunnel = |y: i32| {
+                let (p, q) = (fields[(y / 2) as usize], fields[(y / 2 + y % 2) as usize]);
+                in_tunnel(seed, wx, y, wz, (p.0 + q.0) * 0.5, (p.1 + q.1) * 0.5)
+            };
+            let cavern = |y: i32| {
+                let (k, t) = ((y / 4) as usize, (y % 4) as f32 * 0.25);
+                y < low - 7 && y <= CAVERN_TOP && in_cavern(seed, wx, y, wz, halls[k] + (halls[k + 1] - halls[k]) * t)
+            };
             for y in 0..=h {
                 let mut b = if y == 0 {
                     BEDROCK
@@ -454,7 +863,11 @@ pub fn generate(seed: u32, cx: i32, cz: i32) -> ChunkData {
                 } else {
                     STONE
                 };
-                if b != BEDROCK && !(y <= SEA + 1 && y >= low - 4) && is_cave(seed, wx, y, wz) {
+                // caves; the caverns keep a roof of rock under the land and the sea bed
+                if b != BEDROCK && !(y <= SEA + 1 && y >= low - 4) && (tunnel(y) || cavern(y)) {
+                    if y <= LAVA_LEVEL {
+                        blocks[bidx(x, y, z)] = LAVA;
+                    }
                     continue;
                 }
                 if b == STONE && y < h - 3 {
@@ -474,6 +887,10 @@ pub fn generate(seed: u32, cx: i32, cz: i32) -> ChunkData {
                 }
             }
         }
+    }
+
+    if let Some((x, y, z)) = cave_chest(seed, cx, cz, &blocks, &hget) {
+        blocks[bidx(x, y, z)] = LOOT_CHEST;
     }
 
     // trees
@@ -596,9 +1013,16 @@ pub struct MeshData {
     /// packed quad vertices (4 per quad): opaque quads first, then transparent
     pub verts: Vec<u32>,
     pub opaque_quads: u32,
+    /// how many of the opaque quads, the last ones, are buried: walls of caves well
+    /// below the ground that no daylight reaches. From afar they cannot be seen from
+    /// above ground, and need not be drawn.
+    pub deep_quads: u32,
     /// plants: alpha-tested, drawn double sided
     pub cut_quads: u32,
     pub trans_quads: u32,
+    /// shaped blocks (stairs, slabs, fences, doors...): quads of two words per vertex,
+    /// x 9 bits | y 12 | z 9 in sixteenths of a block | sky 2, then face 3 | layer 8
+    pub detail: Vec<u32>,
     /// highest y used by any vertex (for tight frustum culling)
     pub top: f32,
 }
@@ -640,7 +1064,7 @@ pub fn mesh(n: &[Arc<ChunkData>; 9]) -> MeshData {
             let mut y = CH - 1;
             while y > 0 {
                 let b = c.blocks[bidx(lx, y, lz)];
-                if is_opaque(b) && !is_leaves(b) {
+                if roofs(b) {
                     break;
                 }
                 y -= 1;
@@ -649,6 +1073,9 @@ pub fn mesh(n: &[Arc<ChunkData>; 9]) -> MeshData {
         }
     }
     let top_at = |x: i32, z: i32| tops[((z + 2) * TW + x + 2) as usize];
+    // faces below this that no daylight reaches count as buried
+    let buried_below = tops.iter().copied().min().unwrap_or(0) - 6;
+    let mut deep: Vec<u32> = Vec::new();
     // 2 = open sky, 1 = next to open sky, 0 = enclosed
     let sky_at = |x: i32, y: i32, z: i32| -> u32 {
         if y > top_at(x, z) {
@@ -693,7 +1120,7 @@ pub fn mesh(n: &[Arc<ChunkData>; 9]) -> MeshData {
                     let b = at(i);
                     let m = &mut mask[vv * nu + uu];
                     *m = 0;
-                    if b == AIR || b == TORCH || is_plant(b) {
+                    if b == AIR || b == TORCH || is_plant(b) || is_shaped(b) {
                         continue;
                     }
                     let q = i + sa;
@@ -776,21 +1203,29 @@ pub fn mesh(n: &[Arc<ChunkData>; 9]) -> MeshData {
                     if aoc[order[0]] + aoc[order[2]] > aoc[order[1]] + aoc[order[3]] {
                         order = [order[1], order[2], order[3], order[0]];
                     }
-                    let out = if k & (1 << 30) != 0 { &mut trans } else { &mut opaque };
-                    for &ci in &order {
+                    let mut quad = [0u32; 4];
+                    let mut high = 0;
+                    for (i, &ci) in order.iter().enumerate() {
                         let mut p = [0u32; 3];
                         p[a] = ac as u32;
                         p[u] = corners[ci].0 as u32;
                         p[v] = corners[ci].1 as u32;
-                        out.push(
-                            p[0] | p[1] << 5
-                                | p[2] << 13
-                                | (face as u32) << 18
-                                | (k & 127) << 21
-                                | aoc[ci] << 28
-                                | ((k >> 16) & 3) << 30,
-                        );
+                        high = high.max(p[1] as i32);
+                        quad[i] = p[0] | p[1] << 5
+                            | p[2] << 13
+                            | (face as u32) << 18
+                            | (k & 127) << 21
+                            | aoc[ci] << 28
+                            | ((k >> 16) & 3) << 30;
                     }
+                    let out = if k & (1 << 30) != 0 {
+                        &mut trans
+                    } else if (k >> 16) & 3 == 0 && high < buried_below {
+                        &mut deep
+                    } else {
+                        &mut opaque
+                    };
+                    out.extend_from_slice(&quad);
                     uu += w;
                 }
             }
@@ -798,10 +1233,82 @@ pub fn mesh(n: &[Arc<ChunkData>; 9]) -> MeshData {
     }
     // plants: two crossed diagonal planes per block (face code 6)
     let mut cut: Vec<u32> = Vec::new();
+    let mut detail: Vec<u32> = Vec::new();
     for y in 1..CH {
         for z in 0..CW {
             for x in 0..CW {
-                let b = at(pidx([x, y, z]));
+                let i = pidx([x, y, z]);
+                let b = at(i);
+                if b == PANE {
+                    // a flat upright quad (face code 7) the shader moves to the middle of
+                    // the cell: `code` 0 = towards +x, 2 = towards +z
+                    let sky = sky_at(x, y, z);
+                    let (x, y, z) = (x as u32, y as u32, z as u32);
+                    let quad = |out: &mut Vec<u32>, code: u32| {
+                        let tail = 7 << 18 | PANE_LAYER << 21 | code << 28 | sky << 30;
+                        let corners = if code == 0 {
+                            [(x, y, z), (x, y, z + 1), (x, y + 1, z + 1), (x, y + 1, z)]
+                        } else {
+                            [(x, y, z), (x + 1, y, z), (x + 1, y + 1, z), (x, y + 1, z)]
+                        };
+                        for (px, py, pz) in corners {
+                            out.push(px | py << 5 | pz << 13 | tail);
+                        }
+                    };
+                    let j = |d: isize| pane_joins(at(i + d));
+                    let (ax, az) = pane_axes(j(-stride[0]) || j(stride[0]), j(-stride[2]) || j(stride[2]));
+                    if ax {
+                        quad(&mut trans, 2);
+                    }
+                    if az {
+                        quad(&mut trans, 0);
+                    }
+                    continue;
+                }
+                if is_shaped(b) {
+                    let side = |dx: i32, dz: i32| at(i + dx as isize * stride[0] + dz as isize * stride[2]);
+                    let (boxes, n) = draw_boxes(b, side);
+                    let up = sky_at(x, y + 1, z);
+                    // light and neighbour for each face: 0 +X, 1 -X, 2 +Y, 3 -Y, 4 +Z, 5 -Z
+                    let next = [(1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1)];
+                    let mut sky = [0u32; 6];
+                    let mut hidden = [false; 6];
+                    for (f, (dx, dy, dz)) in next.into_iter().enumerate() {
+                        let s = sky_at(x + dx, y + dy, z + dz);
+                        sky[f] = if f == 3 { s } else { s.max(up) };
+                        hidden[f] = is_opaque(at(i + dx as isize * stride[0] + dy as isize * stride[1] + dz as isize * stride[2]));
+                    }
+                    let fence = is_fence(b);
+                    for (k, q) in boxes[..n].iter().enumerate() {
+                        // a fence arm is drawn as two rails
+                        let rails: &[(f32, f32)] = if fence && k > 0 { &[(0.375, 0.5625), (0.75, 0.9375)] } else { &[(q[1], q[4])] };
+                        for &(y0, y1) in rails {
+                            let q = [q[0], y0, q[2], q[3], y1, q[5]];
+                            let g = |v: f32, base: i32| (base * 16 + (v * 16.0).round() as i32) as u32;
+                            let (x0, y0, z0, x1, y1, z1) = (g(q[0], x), g(q[1], y), g(q[2], z), g(q[3], x), g(q[4], y), g(q[5], z));
+                            let faces = [
+                                ([(x1, y0, z0), (x1, y1, z0), (x1, y1, z1), (x1, y0, z1)], q[3] >= 1.0),
+                                ([(x0, y0, z0), (x0, y0, z1), (x0, y1, z1), (x0, y1, z0)], q[0] <= 0.0),
+                                ([(x0, y1, z0), (x0, y1, z1), (x1, y1, z1), (x1, y1, z0)], q[4] >= 1.0),
+                                ([(x0, y0, z0), (x1, y0, z0), (x1, y0, z1), (x0, y0, z1)], q[1] <= 0.0),
+                                ([(x0, y0, z1), (x1, y0, z1), (x1, y1, z1), (x0, y1, z1)], q[5] >= 1.0),
+                                ([(x0, y0, z0), (x0, y1, z0), (x1, y1, z0), (x1, y0, z0)], q[2] <= 0.0),
+                            ];
+                            for (f, (corners, outer)) in faces.into_iter().enumerate() {
+                                // a face flush with the cell wall is covered by a full block there
+                                if outer && hidden[f] {
+                                    continue;
+                                }
+                                let tail = f as u32 | tex_for(b, f) << 3;
+                                for (px, py, pz) in corners {
+                                    detail.push(px | py << 9 | pz << 21 | sky[f] << 30);
+                                    detail.push(tail);
+                                }
+                            }
+                        }
+                    }
+                    continue;
+                }
                 if !is_plant(b) {
                     continue;
                 }
@@ -815,11 +1322,14 @@ pub fn mesh(n: &[Arc<ChunkData>; 9]) -> MeshData {
             }
         }
     }
+    let dq = (deep.len() / 4) as u32;
+    opaque.extend_from_slice(&deep);
     let (oq, cq, tq) = ((opaque.len() / 4) as u32, (cut.len() / 4) as u32, (trans.len() / 4) as u32);
     opaque.extend_from_slice(&cut);
     opaque.extend_from_slice(&trans);
-    let top = opaque.iter().map(|v| (v >> 5) & 255).max().unwrap_or(0) as f32;
-    MeshData { verts: opaque, opaque_quads: oq, cut_quads: cq, trans_quads: tq, top }
+    let top = opaque.iter().map(|v| (v >> 5) & 255).max().unwrap_or(0);
+    let top = top.max(detail.chunks_exact(2).map(|v| (((v[0] >> 9) & 4095) + 15) / 16).max().unwrap_or(0)) as f32;
+    MeshData { verts: opaque, opaque_quads: oq, deep_quads: dq, cut_quads: cq, trans_quads: tq, detail, top }
 }
 
 // ---------------------------------------------------------------- world / streaming
@@ -1004,9 +1514,10 @@ impl World {
                 JobResult::Gen(k, data, modified) => {
                     self.gen_pending.remove(&k);
                     let mut lights = Vec::new();
-                    if modified {
+                    {
                         for (i, &b) in data.blocks.iter().enumerate() {
-                            if is_light(b) {
+                            let lava = b == LAVA && i & 0x33 == 0x11 && data.blocks[i + 256] != LAVA;
+                            if (modified && is_light(b)) || lava {
                                 let i = i as i32;
                                 lights.push((
                                     IVec3::new(k.0 * CW + (i & 15), i >> 8, k.1 * CW + ((i >> 4) & 15)),
@@ -1176,7 +1687,7 @@ impl World {
         let s = self.chunks.get(&(x >> 4, z >> 4))?;
         (0..CH).rev().find(|&y| {
             let b = s.data.get(x & 15, y, z & 15);
-            b != AIR && b != TORCH && !is_plant(b)
+            b != AIR && b != TORCH && !is_plant(b) && !is_ladder(b)
         })
     }
 
@@ -1208,14 +1719,13 @@ impl World {
         s.dirty = true;
     }
 
-    /// Edits a block and remeshes the affected chunks immediately.
-    pub fn set_block(&mut self, gfx: &Gfx, x: i32, y: i32, z: i32, b: Block) -> bool {
+    /// Writes a block without remeshing. False if the spot cannot be edited.
+    fn write_block(&mut self, x: i32, y: i32, z: i32, b: Block) -> bool {
         if y < 1 || y >= CH {
             return false;
         }
-        let k = (x >> 4, z >> 4);
         let (lx, lz) = (x & 15, z & 15);
-        let Some(s) = self.chunks.get_mut(&k) else { return false };
+        let Some(s) = self.chunks.get_mut(&(x >> 4, z >> 4)) else { return false };
         if s.data.get(lx, y, lz) == BEDROCK {
             return false;
         }
@@ -1226,6 +1736,31 @@ impl World {
         if is_light(b) {
             s.lights.push((wp, b));
         }
+        true
+    }
+
+    /// Edits a block and the one above it with a single remesh (both halves of a door).
+    pub fn set_pair(&mut self, gfx: &Gfx, x: i32, y: i32, z: i32, lower: Block, upper: Block) -> bool {
+        if y + 1 >= CH || !self.write_block(x, y, z, lower) {
+            return false;
+        }
+        self.write_block(x, y + 1, z, upper);
+        self.remesh_edit(gfx, x, z);
+        true
+    }
+
+    /// Edits a block and remeshes the affected chunks immediately.
+    pub fn set_block(&mut self, gfx: &Gfx, x: i32, y: i32, z: i32, b: Block) -> bool {
+        if !self.write_block(x, y, z, b) {
+            return false;
+        }
+        self.remesh_edit(gfx, x, z);
+        true
+    }
+
+    fn remesh_edit(&mut self, gfx: &Gfx, x: i32, z: i32) {
+        let k = (x >> 4, z >> 4);
+        let (lx, lz) = (x & 15, z & 15);
         // sky exposure reaches two columns across a chunk border
         let xs: &[i32] = if lx <= 1 { &[0, -1] } else if lx >= 14 { &[0, 1] } else { &[0] };
         let zs: &[i32] = if lz <= 1 { &[0, -1] } else if lz >= 14 { &[0, 1] } else { &[0] };
@@ -1234,7 +1769,52 @@ impl World {
                 self.remesh_now(gfx, (k.0 + dx, k.1 + dz));
             }
         }
-        true
+    }
+
+    /// A small loaded world for tests: flat stone up to y = 9, plus what `extra` puts in.
+    #[cfg(test)]
+    pub fn flat(extra: impl Fn(i32, i32, i32) -> Option<Block>) -> World {
+        let mut w = World::new(1, 2, None);
+        for cz in -1..=1 {
+            for cx in -1..=1 {
+                let mut blocks = vec![AIR; VOL].into_boxed_slice();
+                for y in 0..CH {
+                    for z in 0..CW {
+                        for x in 0..CW {
+                            blocks[bidx(x, y, z)] = extra(cx * CW + x, y, cz * CW + z).unwrap_or(if y <= 9 { STONE } else { AIR });
+                        }
+                    }
+                }
+                let slot = Slot { data: Arc::new(ChunkData { blocks }), mesh: None, lights: Vec::new(), dirty: false, pending: false, version: 0, modified: false };
+                w.chunks.insert((cx, cz), slot);
+            }
+        }
+        w
+    }
+
+    /// How open to the sky a cell is, as the mesher has it: 2 open, 1 beside open sky,
+    /// 0 enclosed.
+    pub fn sky_level(&self, x: i32, y: i32, z: i32) -> u8 {
+        let open = |x: i32, z: i32| ((y + 1).max(1)..CH).all(|h| !roofs(self.get_block(x, h, z)));
+        if open(x, z) {
+            2
+        } else if open(x - 1, z) || open(x + 1, z) || open(x, z - 1) || open(x, z + 1) {
+            1
+        } else {
+            0
+        }
+    }
+
+    /// Boxes of the shaped block `b` at a cell, in world coordinates.
+    pub fn shape_at(&self, b: Block, x: i32, y: i32, z: i32) -> Boxes {
+        let (mut v, n) = shape_boxes(b, |dx, dz| self.get_block(x + dx, y, z + dz));
+        let o = [x as f32, y as f32, z as f32];
+        for bx in &mut v[..n] {
+            for i in 0..6 {
+                bx[i] += o[i % 3];
+            }
+        }
+        (v, n)
     }
 }
 
@@ -1243,8 +1823,256 @@ mod tests {
     use super::*;
 
     #[test]
+    fn shaped_blocks_mesh_into_boxes() {
+        // one of each shape standing on a stone floor in the middle chunk
+        let shapes = [SLAB, SLAB_TOP + 1, STAIR_BASE + 2, STAIR_BASE + 13, FENCE, CHEST];
+        let w = World::flat(|x, y, z| (y == 10 && z == 4 && x >= 2 && x % 2 == 0 && (x - 2) / 2 < 6).then(|| shapes[((x - 2) / 2) as usize]));
+        let n = w.neighbours((0, 0)).unwrap();
+        let m = mesh(&n);
+        // slab 6 faces - 1 hidden by the floor, top slab 6, stairs 2 boxes, fence post, chest, ...
+        assert_eq!(m.detail.len() % 8, 0);
+        assert_eq!(m.detail.len() / 8, 5 + 6 + 11 + 11 + 5 + 5);
+        assert!(m.top >= 11.0);
+        // every vertex stays inside the chunk and names a real texture
+        for v in m.detail.chunks_exact(2) {
+            let (x, y, z) = (v[0] & 511, (v[0] >> 9) & 4095, (v[0] >> 21) & 511);
+            assert!(x <= 256 && z <= 256 && (160..=184).contains(&y), "{x} {y} {z}");
+            assert!((v[1] & 7) < 6 && ((v[1] >> 3) as usize) < crate::textures::LAYERS);
+        }
+        // the collision boxes: a fence is one and a half blocks high, a ladder is no obstacle
+        assert_eq!(shape_boxes(FENCE, |_, _| AIR).0[0][4], 1.5);
+        assert_eq!(shape_boxes(FENCE, |_, _| STONE).1, 5);
+        // stairs rising to +z turn a corner to meet stairs set crosswise before or behind
+        let a = STAIR_BASE + 3;
+        let with = |x: i32, z: i32, b: Block| shape_boxes(a, move |dx, dz| if (dx, dz) == (x, z) { b } else { AIR });
+        let half = [0.0, 0.5, 0.5, 1.0, 1.0, 1.0];
+        let outer = with(0, 1, STAIR_BASE + 1);
+        assert_eq!((outer.1, outer.0[1]), (2, [0.5, 0.5, 0.5, 1.0, 1.0, 1.0]));
+        let inner = with(0, -1, STAIR_BASE + 1);
+        assert_eq!((inner.1, inner.0[1], inner.0[2]), (3, half, [0.5, 0.5, 0.0, 1.0, 1.0, 0.5]));
+        // a straight run, stairs the other way up and other blocks leave it straight
+        for (x, z, b) in [(1, 0, a), (0, 1, STAIR_BASE + 1 + STAIR_FLIP), (0, -1, STONE), (0, 1, a)] {
+            let s = with(x, z, b);
+            assert_eq!((s.1, s.0[1]), (2, half), "{x} {z} {b}");
+        }
+        // the sky reaches an open cell, half reaches one beside it, none under a wide roof
+        let roofed = World::flat(|x, y, z| (y == 14 && (0..8).contains(&x) && (0..8).contains(&z)).then_some(STONE));
+        assert_eq!([roofed.sky_level(12, 10, 4), roofed.sky_level(7, 10, 4), roofed.sky_level(4, 10, 4)], [2, 1, 0]);
+        assert!(!is_solid(LADDER_BASE + 2) && is_solid(TRAP_BASE) && !is_opaque(SLAB) && !is_opaque(STAIR_BASE + 31));
+        for b in 0..=255u8 {
+            assert_eq!(is_shaped(b), b == PANE || is_slab(b) || is_fence(b) || b == CHEST || is_ladder(b) || is_trapdoor(b) || is_door(b) || is_stairs(b) || (TRAP_END..DOOR_BASE).contains(&b), "block {b}");
+        }
+    }
+
+    /// Run by hand to look at many worlds at once:
+    /// `CUBEWILD_MAP_DIR=/some/dir cargo test --release worldgen_survey -- --ignored --nocapture`
+    /// prints one line of figures per seed and writes a top-down map of each.
+    #[test]
+    #[ignore]
+    fn worldgen_survey() {
+        let dir = std::env::var("CUBEWILD_MAP_DIR").ok();
+        let seeds = [0u32, 1, 2, 3, 7, 42, 2026, 131, 1000, 65536, 123_456_789, 987_654_321, 555_555_555, 314_159_265, 271_828_182, 4_294_967_295, 808_080, 90_210, 77_777_777, 600_613];
+        for seed in seeds {
+            const R: i32 = 768;
+            const STEP: i32 = 4;
+            let n = (2 * R / STEP) as usize;
+            let (mut land, mut high, mut snow, mut desert, mut total) = (0, 0, 0, 0, 0);
+            let (mut lo, mut hi) = (CH, 0);
+            let mut img = vec![0u8; n * n * 3];
+            for (j, z) in (-R..R).step_by(STEP as usize).enumerate() {
+                for (i, x) in (-R..R).step_by(STEP as usize).enumerate() {
+                    let h = height_at(seed, x, z);
+                    total += 1;
+                    lo = lo.min(h);
+                    hi = hi.max(h);
+                    let d = h > SEA + 1 && h < 82 && is_desert(seed, x, z);
+                    let c: [u8; 3] = if h <= SEA {
+                        let k = (h - 3).clamp(0, 40) as u8;
+                        [20, 40 + k * 2, 110 + k * 3]
+                    } else if h <= SEA + 1 || d {
+                        [222, 206, 150]
+                    } else if h >= 98 {
+                        [245, 245, 250]
+                    } else if h >= 86 {
+                        [128, 128, 132]
+                    } else {
+                        let k = ((h - SEA) * 2).clamp(0, 90) as u8;
+                        [60 + k / 2, 150 - k, 50]
+                    };
+                    img[(j * n + i) * 3..][..3].copy_from_slice(&c);
+                    land += (h > SEA) as u32;
+                    high += (h >= 86) as u32;
+                    snow += (h >= 98) as u32;
+                    desert += d as u32;
+                }
+            }
+            let pct = |v: u32| v as f32 * 100.0 / total as f32;
+            // a closer look at the 8 x 8 chunks around the origin
+            let (mut trees, mut ore, mut cave, mut below, mut wet_holes, mut floating) = (0, [0u32; 4], 0u32, 0u32, 0, 0);
+            let (mut band, mut lava, mut chests) = ([(0u32, 0u32); 4], 0u32, 0u32);
+            for cz in -4..4 {
+                for cx in -4..4 {
+                    let c = generate(seed, cx, cz);
+                    for z in 0..CW {
+                        for x in 0..CW {
+                            let h = height_at(seed, cx * CW + x, cz * CW + z);
+                            for y in 1..CH - 1 {
+                                let b = c.get(x, y, z);
+                                let under = c.get(x, y - 1, z);
+                                if y <= h {
+                                    below += 1;
+                                    cave += (b == AIR || b == LAVA) as u32;
+                                    let k = (y / 12).min(3) as usize;
+                                    band[k].0 += 1;
+                                    band[k].1 += (b == AIR || b == LAVA) as u32;
+                                }
+                                lava += (b == LAVA) as u32;
+                                chests += (b == LOOT_CHEST) as u32;
+                                match b {
+                                    LOG | BIRCH_LOG if under != LOG && under != BIRCH_LOG => {
+                                        trees += 1;
+                                        floating += (under == AIR) as u32;
+                                    }
+                                    COAL_ORE => ore[0] += 1,
+                                    IRON_ORE => ore[1] += 1,
+                                    GOLD_ORE => ore[2] += 1,
+                                    CRYSTAL_ORE => ore[3] += 1,
+                                    WATER => {
+                                        // water with nothing to hold it in
+                                        let open = under == AIR || (x > 0 && c.get(x - 1, y, z) == AIR && y < SEA) || (x < CW - 1 && c.get(x + 1, y, z) == AIR && y < SEA);
+                                        wet_holes += open as u32;
+                                    }
+                                    b if is_plant(b) || b == CACTUS => floating += (under == AIR || under == WATER) as u32,
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            println!(
+                "seed {seed:>10}: land {:>5.1}%  mountain {:>4.1}%  snow {:>4.1}%  desert {:>4.1}%  height {lo}..{hi}  | near origin: trees {trees:>4}  coal {:>5} iron {:>4} gold {:>3} crystal {:>3}  caves {:.2}% (by depth {:.0}/{:.0}/{:.0}/{:.0}%)  lava {lava}  chests {chests}  open water {wet_holes}  floating {floating}",
+                pct(land), pct(high), pct(snow), pct(desert), ore[0], ore[1], ore[2], ore[3], cave as f32 * 100.0 / below as f32,
+                band[0].1 as f32 * 100.0 / band[0].0 as f32, band[1].1 as f32 * 100.0 / band[1].0 as f32, band[2].1 as f32 * 100.0 / band[2].0 as f32, band[3].1 as f32 * 100.0 / band[3].0 as f32
+            );
+            if let Some(d) = &dir {
+                let mut out = format!("P6\n{n} {n}\n255\n").into_bytes();
+                out.extend_from_slice(&img);
+                std::fs::write(format!("{d}/map-{seed}.ppm"), out).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn worlds_differ_and_hold_together() {
+        let seeds: Vec<u32> = (0..120u32).map(|i| hash2(i, 5, 9) % 1_000_000_000).chain([0, 1, 2026, u32::MAX]).collect();
+        let (mut flat_top, mut snow) = (0u32, 0u32);
+        let mut origin = std::collections::HashSet::new();
+        for &seed in &seeds {
+            let (mut land, mut total) = (0u32, 0u32);
+            for z in (-512..512).step_by(16) {
+                for x in (-512..512).step_by(16) {
+                    let h = height_at(seed, x, z);
+                    assert!((3..=CH - 12).contains(&h));
+                    total += 1;
+                    land += (h > SEA) as u32;
+                    snow += (h >= 98) as u32;
+                    flat_top += (h == CH - 12) as u32;
+                }
+            }
+            // no world is all sea or all land
+            let share = land as f32 / total as f32;
+            assert!((0.35..0.97).contains(&share), "seed {seed}: land {share}");
+            origin.insert(height_at(seed, 0, 0));
+            // the start is on level green land, not far from the middle
+            let (x, h, z) = spawn_point(seed);
+            assert_eq!(h, height_at(seed, x, z));
+            assert!(h > SEA + 2 && h < 78 && !is_desert(seed, x, z), "seed {seed}: spawn {x} {h} {z}");
+            assert!(x.abs().max(z.abs()) <= 400, "seed {seed}: spawn {x} {z}");
+        }
+        // peaks are not sliced off at the build limit, and the middle of the world varies
+        assert!(snow > 500 && flat_top == 0, "{flat_top} of {snow}");
+        assert!(origin.len() > 20, "{}", origin.len());
+
+        let (mut lava, mut chests, mut rock) = (0u32, 0u32, [(0u32, 0u32); 3]);
+        for &seed in &seeds[..6] {
+            // the same seed always gives the same chunk, another seed another one
+            let (a, b) = (generate(seed, 0, 0), generate(seed, 0, 0));
+            assert!(a.blocks == b.blocks);
+            let other = seed ^ 0x5bd1_e995;
+            let points = (-512..512).step_by(64).flat_map(|z| (-512..512).step_by(64).map(move |x| (x, z)));
+            let same = points.filter(|&(x, z)| height_at(seed, x, z) == height_at(other, x, z)).count();
+            assert!(same < 64, "seed {seed}: {same} of 256 heights alike");
+            // nothing hangs in the air, no water stands beside a hole, and the player's
+            // start is not buried
+            for (cx, cz) in [(0, 0), (-1, 0), (3, -2), (20, 11)] {
+                let c = generate(seed, cx, cz);
+                for z in 0..CW {
+                    for x in 0..CW {
+                        let h = height_at(seed, cx * CW + x, cz * CW + z);
+                        assert_eq!(c.get(x, 0, z), BEDROCK);
+                        for y in 1..CH - 1 {
+                            let (b, under) = (c.get(x, y, z), c.get(x, y - 1, z));
+                            if is_plant(b) || b == CACTUS {
+                                assert!(is_opaque(under) || under == CACTUS, "seed {seed}: block {b} on {under} at {x} {y} {z}");
+                            }
+                            if b == WATER {
+                                assert!(y <= SEA && under != AIR, "seed {seed}: water at {x} {y} {z}");
+                            }
+                            // lava lies only in the deepest caves, and cave chests stand on rock
+                            if b == LAVA {
+                                assert!(y <= LAVA_LEVEL && under != AIR, "seed {seed}: lava at {x} {y} {z}");
+                                lava += 1;
+                            }
+                            if b == LOOT_CHEST {
+                                assert!(is_opaque(under) && c.get(x, y + 1, z) == AIR && y > LAVA_LEVEL && y < h - 6, "seed {seed}: chest at {x} {y} {z}");
+                                chests += 1;
+                            }
+                            // and the caves grow with depth
+                            if y <= h && y < 48 {
+                                let k = (y / 16) as usize;
+                                rock[k].0 += 1;
+                                rock[k].1 += (b == AIR || b == LAVA) as u32;
+                            }
+                            if (b == LOG || b == BIRCH_LOG) && y > h {
+                                assert!(under != AIR && under != WATER, "seed {seed}: tree in the air at {x} {y} {z}");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let share = rock.map(|(all, open)| open as f32 / all as f32);
+        assert!(lava > 0 && chests > 0, "lava {lava}, chests {chests}");
+        assert!(share[0] > share[1] && share[1] > share[2] && share[0] > 0.08 && share[2] > 0.01, "{share:?}");
+        assert!(!is_solid(LAVA) && !is_target(LAVA) && is_replaceable(LAVA) && is_shaped(LOOT_CHEST) && tex_for(LAVA, 2) == LAVA_LAYER);
+    }
+
+    /// `cargo test --release gen_speed -- --ignored --nocapture`: time to generate and mesh chunks.
+    #[test]
+    #[ignore]
+    fn gen_speed() {
+        let t = std::time::Instant::now();
+        let mut air = 0usize;
+        for cz in 0..8 {
+            for cx in 0..8 {
+                air += generate(2026, cx, cz).blocks.iter().filter(|b| **b == AIR).count();
+            }
+        }
+        println!("generate: {:.2} ms a chunk ({air})", t.elapsed().as_secs_f64() * 1000.0 / 64.0);
+        let n: [Arc<ChunkData>; 9] = std::array::from_fn(|i| Arc::new(generate(2026, (i % 3) as i32, (i / 3) as i32)));
+        let t = std::time::Instant::now();
+        let mut quads = 0;
+        for _ in 0..20 {
+            let m = mesh(&n);
+            quads += m.detail.len();
+        }
+        println!("mesh: {:.2} ms a chunk ({quads})", t.elapsed().as_secs_f64() * 1000.0 / 20.0);
+    }
+
+    #[test]
     fn worldgen_stats() {
-        let mut counts = [0usize; 32];
+        let mut counts = [0usize; 256];
         let mut solid_cols = 0usize;
         let mut below = 0usize;
         for cz in -6..6 {
@@ -1269,6 +2097,6 @@ mod tests {
             }
         }
         let air = counts[AIR as usize] as f32 / below as f32;
-        assert!(air > 0.005 && air < 0.12, "cave fraction {air}");
+        assert!(air > 0.03 && air < 0.25, "cave fraction {air}");
     }
 }

@@ -3,7 +3,20 @@
 pub const TEX: usize = 16;
 /// first layer holding item and HUD icons
 pub const ICON_BASE: usize = 64;
-pub const LAYERS: usize = ICON_BASE + 103;
+/// textures added after the icons: chest side, chest top, ladder, trapdoor
+pub const EXTRA_BASE: usize = ICON_BASE + 103;
+/// icons of the four slabs and two fences
+pub const SHAPE_ICONS: usize = EXTRA_BASE + 4;
+/// the eight door textures (they are drawn with the detailed shapes, which can name any
+/// layer; the first 128 layers are kept for the blocks of the terrain mesh)
+pub const DOOR_TEX: usize = SHAPE_ICONS + 6;
+/// the player's arm in first person: skin, then sleeve
+pub const ARM_TEX: usize = DOOR_TEX + 8;
+pub const LAYERS: usize = ARM_TEX + 2;
+/// lava, in the slot the doors used to start at
+const LAVA_TEX: usize = 56;
+/// block textures the slab / stair / fence icons are cut from
+const SHAPE_TEX: [usize; 4] = [8, 44, 9, 15];
 
 fn h(layer: u32, x: i32, y: i32) -> f32 {
     let mut v = layer.wrapping_mul(0x9e37_79b9)
@@ -36,7 +49,31 @@ fn grass(l: u32, x: i32, y: i32) -> [u8; 4] {
 
 const CLEAR: [u8; 4] = [0, 0, 0, 0];
 
+/// One pixel of a layer, for building meshes from the icons.
+pub fn texel(layer: usize, x: i32, y: i32) -> [u8; 4] {
+    pixel(layer, x, y)
+}
+
 fn pixel(layer: usize, x: i32, y: i32) -> [u8; 4] {
+    if layer == LAVA_TEX {
+        // slow bright veins in dark red crust
+        let n = h(56, x / 2, y / 2) * 0.6 + h(57, x, y) * 0.4;
+        let vein = ((x as f32 * 0.55 + (y as f32 * 0.7).sin() * 1.6).sin() * 0.5 + 0.5) * 0.6 + n * 0.4;
+        return if vein > 0.62 {
+            shade([255.0, 214.0, 90.0], 0.92 + n * 0.08)
+        } else if vein > 0.4 {
+            shade([246.0, 128.0, 30.0], 0.85 + n * 0.15)
+        } else {
+            shade([196.0, 62.0, 18.0], 0.8 + n * 0.2)
+        };
+    }
+    if layer >= ARM_TEX {
+        let n = h(layer as u32, x, y);
+        let c = if layer == ARM_TEX { [226.0, 176.0, 134.0] } else { [176.0, 92.0, 52.0] };
+        return shade(c, 0.93 + n * 0.07);
+    }
+    // (doors keep the numbering their drawing code was written for)
+    let layer = if layer >= DOOR_TEX { layer - DOOR_TEX + 56 } else { layer };
     let l = layer as u32;
     let n = h(l, x, y);
     match layer {
@@ -388,11 +425,139 @@ fn pixel(layer: usize, x: i32, y: i32) -> [u8; 4] {
                 CLEAR
             }
         }
+        55 => {
+            // window pane: clear glass in a slim wooden frame
+            if x == 0 || y == 0 || x == 15 || y == 15 {
+                shade([150.0, 112.0, 68.0], 0.9 + n * 0.14)
+            } else if (x - y == 3 || x - y == 4) && (3..10).contains(&x) {
+                [235, 245, 250, 150]
+            } else {
+                [190, 220, 235, 34]
+            }
+        }
+        56..=63 => {
+            // doors: 56 oak top, 57 oak bottom, 58/59 birch; 60..63 the same mirrored
+            let k = layer - 56;
+            let x = if k >= 4 { 15 - x } else { x };
+            let wood = if k % 4 < 2 { [178.0, 140.0, 86.0] } else { [218.0, 200.0, 152.0] };
+            let grain = 0.94 + h(56 + (k % 4) as u32, x / 2, y) * 0.1;
+            let frame = x == 0 || x == 15;
+            if k % 2 == 0 {
+                // top half: four small lights
+                let glass = matches!(x, 3..=6 | 9..=12) && matches!(y, 3..=6 | 8..=11);
+                let rim = matches!(x, 2..=13) && matches!(y, 2..=12);
+                if glass {
+                    CLEAR
+                } else if frame || y == 0 {
+                    shade(wood, 0.66)
+                } else if rim {
+                    shade(wood, 0.78)
+                } else {
+                    shade(wood, grain)
+                }
+            } else {
+                let panel = matches!(x, 3..=12) && matches!(y, 5..=12);
+                let edge = panel && (x == 3 || x == 12 || y == 5 || y == 12);
+                if matches!(x, 12 | 13) && matches!(y, 1 | 2) {
+                    [58, 56, 62, 255] // knob
+                } else if frame || y == 15 {
+                    shade(wood, 0.66)
+                } else if edge {
+                    shade(wood, 0.72)
+                } else if panel {
+                    shade(wood, grain * 0.9)
+                } else {
+                    shade(wood, grain)
+                }
+            }
+        }
+        l if l >= EXTRA_BASE => extra_pixel(l - EXTRA_BASE, x, y),
         l if l >= ICON_BASE => item_pixel(l - ICON_BASE, x, y),
         _ => [0, 0, 0, 0],
     }
 }
 
+
+/// Chest, ladder and trapdoor textures, and the icons of slabs and fences.
+fn extra_pixel(k: usize, x: i32, y: i32) -> [u8; 4] {
+    let n = h(700 + k as u32, x, y);
+    let wood = [178.0, 140.0, 86.0];
+    match k {
+        0 => {
+            // chest side: boards, a lid seam and an iron latch
+            // (the chest is drawn a pixel narrower than its cell and two shorter)
+            if matches!(x, 7 | 8) && matches!(y, 5..=8) {
+                [196, 198, 206, 255]
+            } else if x <= 1 || x >= 14 || y <= 2 || y >= 15 {
+                shade([112.0, 80.0, 44.0], 0.9 + n * 0.1)
+            } else if y == 6 {
+                shade([112.0, 80.0, 44.0], 0.7)
+            } else {
+                shade([164.0, 118.0, 62.0], 0.9 + h(700, x / 4, 0) * 0.12 + n * 0.06)
+            }
+        }
+        1 => {
+            // chest lid
+            if x <= 1 || x >= 14 || y <= 1 || y >= 14 {
+                shade([112.0, 80.0, 44.0], 0.9 + n * 0.1)
+            } else {
+                shade([164.0, 118.0, 62.0], 0.92 + h(701, 0, y / 4) * 0.12 + n * 0.06)
+            }
+        }
+        2 => {
+            // ladder: two rails and four rungs
+            if matches!(x, 2 | 3 | 12 | 13) {
+                shade([150.0, 110.0, 62.0], 0.88 + n * 0.16)
+            } else if y % 4 == 1 && (2..=13).contains(&x) {
+                shade([170.0, 128.0, 74.0], 0.9 + n * 0.14)
+            } else if y % 4 == 2 && (4..=11).contains(&x) {
+                shade([120.0, 86.0, 48.0], 0.9)
+            } else {
+                CLEAR
+            }
+        }
+        3 => {
+            // trapdoor: a framed hatch with slits and iron bands
+            let frame = x <= 1 || x >= 14 || y <= 1 || y >= 14;
+            if !frame && matches!(x, 4 | 5 | 10 | 11) && matches!(y, 4..=6 | 9..=11) {
+                CLEAR
+            } else if frame && (matches!(x, 3 | 12) || matches!(y, 3 | 12)) {
+                [92, 94, 104, 255]
+            } else if frame {
+                shade(wood, 0.7 + n * 0.08)
+            } else {
+                shade(wood, 0.9 + h(703, 0, y / 3) * 0.1 + n * 0.06)
+            }
+        }
+        4..=7 => {
+            // slab: the lower half of the block, with a lit top edge
+            match y {
+                0..=6 => CLEAR,
+                7..=9 => lighten(pixel(SHAPE_TEX[k - 4], x, y - 7), 1.18),
+                _ => darken(pixel(SHAPE_TEX[k - 4], x, y), 0.86),
+            }
+        }
+        _ => {
+            // fence: two posts and two rails
+            let t = pixel(SHAPE_TEX[k - 8], x, y);
+            if matches!(x, 2..=4 | 11..=13) && y >= 1 {
+                t
+            } else if matches!(y, 4 | 5 | 10 | 11) {
+                darken(t, 0.82)
+            } else {
+                CLEAR
+            }
+        }
+    }
+}
+
+fn darken(c: [u8; 4], k: f32) -> [u8; 4] {
+    [(c[0] as f32 * k) as u8, (c[1] as f32 * k) as u8, (c[2] as f32 * k) as u8, c[3]]
+}
+
+fn lighten(c: [u8; 4], k: f32) -> [u8; 4] {
+    [(c[0] as f32 * k).min(255.0) as u8, (c[1] as f32 * k).min(255.0) as u8, (c[2] as f32 * k).min(255.0) as u8, c[3]]
+}
 
 /// 16x16 icons for non-block items (transparent background).
 fn item_pixel(item: usize, x: i32, y: i32) -> [u8; 4] {
@@ -806,6 +971,35 @@ fn item_pixel(item: usize, x: i32, y: i32) -> [u8; 4] {
                 wood(0.9)
             } else {
                 NONE
+            }
+        }
+        66 | 67 => {
+            // door
+            let c = if item == 66 { [178.0, 140.0, 86.0] } else { [218.0, 200.0, 152.0] };
+            if !(4..=11).contains(&x) || !(1..=14).contains(&y) {
+                NONE
+            } else if x == 4 || x == 11 || y == 1 || y == 14 {
+                shade(c, 0.62)
+            } else if matches!(x, 6..=9) && matches!(y, 3..=6) {
+                [176, 214, 236, 255]
+            } else if x == 10 && y == 8 {
+                [58, 56, 62, 255]
+            } else if y == 9 || (y > 9 && (x == 6 || x == 9) && y < 13) {
+                shade(c, 0.78)
+            } else {
+                shade(c, 0.92 + n * 0.1)
+            }
+        }
+        70..=73 => {
+            // stairs seen from the side: three steps of the block's own texture
+            let t = pixel(SHAPE_TEX[item - 70], x, y);
+            let step = 15 - (x / 5).min(2) * 5 - 5;
+            if y < step {
+                NONE
+            } else if y == step || (x % 5 == 0 && x > 0 && x < 15 && y < step + 5) {
+                lighten(t, 1.15)
+            } else {
+                darken(t, 0.88)
             }
         }
         100 => {

@@ -70,7 +70,15 @@ pub const CRYSTAL_HELMET: Item = 126;
 pub const CRYSTAL_CHEST: Item = 127;
 pub const CRYSTAL_LEGS: Item = 128;
 pub const CRYSTAL_BOOTS: Item = 129;
-const ITEM_END: Item = 130;
+pub const OAK_DOOR: Item = 130;
+pub const BIRCH_DOOR: Item = 131;
+pub const LADDER: Item = 132;
+pub const TRAPDOOR: Item = 133;
+/// oak, birch, cobblestone, stone brick (the order of `SHAPE_FULL`)
+pub const STAIRS: Item = 134;
+pub const ITEM_END: Item = 138;
+/// slots in a chest
+pub const CHEST_SLOTS: usize = 27;
 /// first texture layer holding item icons
 const ICON_BASE: u32 = crate::textures::ICON_BASE as u32;
 pub const ICON_HEART: u32 = ICON_BASE + 100;
@@ -130,6 +138,22 @@ pub fn name(i: Item) -> &'static str {
         CLOTH => "Cloth",
         THATCH => "Thatch",
         FARMLAND => "Farmland",
+        PANE => "Window Pane",
+        SLAB => "Oak Slab",
+        51 => "Birch Slab",
+        52 => "Cobblestone Slab",
+        53 => "Stone Brick Slab",
+        FENCE => "Oak Fence",
+        BIRCH_FENCE => "Birch Fence",
+        CHEST => "Chest",
+        LADDER => "Ladder",
+        TRAPDOOR => "Trapdoor",
+        STAIRS => "Oak Stairs",
+        135 => "Birch Stairs",
+        136 => "Cobblestone Stairs",
+        137 => "Stone Brick Stairs",
+        OAK_DOOR => "Oak Door",
+        BIRCH_DOOR => "Birch Door",
         STICK => "Stick",
         MEAT => "Raw Meat",
         HIDE => "Hide",
@@ -202,7 +226,14 @@ pub fn name(i: Item) -> &'static str {
 
 /// Texture-array layer used as the item's icon.
 pub fn icon(i: Item) -> u32 {
-    if is_block(i) {
+    if (SLAB..=BIRCH_FENCE).contains(&i) {
+        // a picture of the shape rather than a face of it
+        crate::textures::SHAPE_ICONS as u32 + (i - SLAB) as u32
+    } else if i == LADDER {
+        LADDER_LAYER
+    } else if i == TRAPDOOR {
+        TRAP_LAYER
+    } else if is_block(i) {
         tex_for(i, if i == FURNACE { 4 } else { 0 })
     } else {
         ICON_BASE + (i - 64) as u32
@@ -375,7 +406,8 @@ pub fn kind(i: Item) -> &'static str {
         None => match i {
             SPEAR | FLINT_KNIFE | BOW | ARROW => "Weapon",
             SHEARS | BUCKET | WATER_BUCKET | FISHING_ROD | COMPASS | CLOCK => "Tool",
-            WORKBENCH | FURNACE | BED | TORCH | LAMP => "Utility block",
+            WORKBENCH | FURNACE | BED | TORCH | LAMP | OAK_DOOR | BIRCH_DOOR | CHEST | LADDER | TRAPDOOR => "Utility block",
+            i if i >= STAIRS => "Block",
             i if food(i) > 0.0 => "Food",
             i if is_plant(i) => "Plant",
             i if is_block(i) => "Block",
@@ -426,6 +458,14 @@ pub fn desc(i: Item) -> &'static str {
         DEAD_BUSH => "Dry twigs. Breaks into sticks.",
         GOLD_BLOCK | IRON_BLOCK => "Solid metal. Shows off your wealth.",
         FARMLAND => "Tilled soil. Plant seeds on it.",
+        PANE => "A thin window that joins the walls beside it.",
+        OAK_DOOR | BIRCH_DOOR => "Right click to open or close. Monsters cannot open it.",
+        SLAB..=53 => "Half a block high. Two of a kind make a full block again.",
+        FENCE | BIRCH_FENCE => "Too high to jump: keeps animals in and monsters out.",
+        CHEST => "Right click to store 27 stacks. Break it to spill them.",
+        LADDER => "Hangs on a wall. Walk into it to climb, sneak to hold on.",
+        TRAPDOOR => "A hatch for a hole in the floor. Right click to open or close.",
+        STAIRS..=137 => "Walk up without jumping. Place high for upside down.",
         STICK => "Handles for tools, torches and weapons.",
         MEAT | RAW_FISH => "Restores a little hunger. Better cooked.",
         COOKED_MEAT | COOKED_FISH => "A hearty meal.",
@@ -507,6 +547,10 @@ pub const RECIPES: &[Recipe] = &[
     r(Cat::Utility, (FURNACE, 1), &[(COBBLE, 8)], WORKBENCH),
     r(Cat::Utility, (BED, 1), &[(PLANKS, 3), (HIDE, 3)], WORKBENCH),
     r(Cat::Utility, (LAMP, 1), &[(CRYSTAL, 1), (GLASS, 1)], WORKBENCH),
+    r(Cat::Utility, (CHEST, 1), &[(PLANKS, 8)], WORKBENCH),
+    r(Cat::Utility, (CHEST, 1), &[(BIRCH_PLANKS, 8)], WORKBENCH),
+    r(Cat::Utility, (LADDER, 3), &[(STICK, 7)], WORKBENCH),
+    r(Cat::Utility, (TRAPDOOR, 2), &[(PLANKS, 6)], WORKBENCH),
     r(Cat::Utility, (BUCKET, 1), &[(IRON_INGOT, 3)], WORKBENCH),
     r(Cat::Utility, (COMPASS, 1), &[(IRON_INGOT, 4), (CRYSTAL, 1)], WORKBENCH),
     r(Cat::Utility, (CLOCK, 1), &[(GOLD_INGOT, 4), (CRYSTAL, 1)], WORKBENCH),
@@ -568,6 +612,19 @@ pub const RECIPES: &[Recipe] = &[
     r(Cat::Building, (THATCH, 2), &[(FIBER, 3)], AIR),
     r(Cat::Building, (CLOTH, 1), &[(FIBER, 4)], AIR),
     r(Cat::Building, (LEATHER, 1), &[(HIDE, 2)], AIR),
+    r(Cat::Building, (PANE, 16), &[(GLASS, 6)], WORKBENCH),
+    r(Cat::Building, (OAK_DOOR, 3), &[(PLANKS, 6)], WORKBENCH),
+    r(Cat::Building, (BIRCH_DOOR, 3), &[(BIRCH_PLANKS, 6)], WORKBENCH),
+    r(Cat::Building, (STAIRS, 4), &[(PLANKS, 6)], WORKBENCH),
+    r(Cat::Building, (STAIRS + 1, 4), &[(BIRCH_PLANKS, 6)], WORKBENCH),
+    r(Cat::Building, (STAIRS + 2, 4), &[(COBBLE, 6)], WORKBENCH),
+    r(Cat::Building, (STAIRS + 3, 4), &[(STONE_BRICK, 6)], WORKBENCH),
+    r(Cat::Building, (SLAB, 6), &[(PLANKS, 3)], WORKBENCH),
+    r(Cat::Building, (SLAB + 1, 6), &[(BIRCH_PLANKS, 3)], WORKBENCH),
+    r(Cat::Building, (SLAB + 2, 6), &[(COBBLE, 3)], WORKBENCH),
+    r(Cat::Building, (SLAB + 3, 6), &[(STONE_BRICK, 3)], WORKBENCH),
+    r(Cat::Building, (FENCE, 3), &[(PLANKS, 4), (STICK, 2)], WORKBENCH),
+    r(Cat::Building, (BIRCH_FENCE, 3), &[(BIRCH_PLANKS, 4), (STICK, 2)], WORKBENCH),
     r(Cat::Building, (IRON_BLOCK, 1), &[(IRON_INGOT, 4)], WORKBENCH),
     r(Cat::Building, (GOLD_BLOCK, 1), &[(GOLD_INGOT, 4)], WORKBENCH),
 ];
@@ -594,6 +651,72 @@ impl Stack {
         let max = max_wear(self.item);
         (max > 0 && !self.is_empty()).then(|| 1.0 - self.wear as f32 / max as f32)
     }
+}
+
+/// Left click on a slot with `held` on the mouse: pick up, put down, merge or swap.
+/// `accepts` is false where the slot will not take the held item.
+pub fn click_stack(held: &mut Stack, slot: &mut Stack, accepts: bool) {
+    let s = *slot;
+    if held.is_empty() {
+        *held = s;
+        *slot = Stack::default();
+    } else if !accepts {
+    } else if !s.is_empty() && s.item == held.item && max_stack(s.item) > 1 {
+        let k = held.n.min(max_stack(s.item).saturating_sub(s.n));
+        slot.n += k;
+        *held = if held.n > k { Stack::new(held.item, held.n - k) } else { Stack::default() };
+    } else {
+        *slot = *held;
+        *held = s;
+    }
+}
+
+/// Right click on a slot: take half of it, or put down one of the held stack.
+pub fn right_click_stack(held: &mut Stack, slot: &mut Stack, accepts: bool) {
+    let s = *slot;
+    if held.is_empty() {
+        if !s.is_empty() {
+            let k = (s.n + 1) / 2;
+            *held = Stack { n: k, ..s };
+            *slot = if s.n > k { Stack { n: s.n - k, ..s } } else { Stack::default() };
+        }
+    } else if max_stack(held.item) == 1 {
+        if s.is_empty() {
+            click_stack(held, slot, accepts);
+        }
+    } else if accepts && (s.is_empty() || (s.item == held.item && s.n < max_stack(s.item))) {
+        *slot = Stack { item: held.item, n: s.n + 1, wear: s.wear };
+        held.n -= 1;
+        if held.n == 0 {
+            *held = Stack::default();
+        }
+    }
+}
+
+/// Moves a whole stack (keeping its wear) into `slots`: tops up matching stacks, then
+/// fills empty slots. Returns what did not fit.
+pub fn stash_in(slots: &mut [Stack], st: Stack) -> Stack {
+    if st.is_empty() {
+        return st;
+    }
+    let max = max_stack(st.item);
+    let mut n = st.n;
+    if max > 1 {
+        for s in slots.iter_mut().filter(|s| !s.is_empty() && s.item == st.item) {
+            let k = n.min(max.saturating_sub(s.n));
+            s.n += k;
+            n -= k;
+        }
+    }
+    for s in slots.iter_mut().filter(|s| s.is_empty()) {
+        if n == 0 {
+            break;
+        }
+        let k = n.min(max);
+        *s = Stack { item: st.item, n: k, wear: st.wear };
+        n -= k;
+    }
+    if n > 0 { Stack { n, ..st } } else { Stack::default() }
 }
 
 /// slots 0..9 are the hotbar, 9..36 the backpack, 36..40 armour (head, chest, legs, feet)
@@ -667,20 +790,12 @@ impl Inventory {
 
     /// Moves a whole stack (keeping its wear) into `range`. Returns what did not fit.
     fn stash(&mut self, range: std::ops::Range<usize>, st: Stack) -> Stack {
-        if st.is_empty() {
-            return st;
-        }
-        if max_stack(st.item) == 1 {
-            return match range.clone().find(|&i| self.slots[i].is_empty()) {
-                Some(free) => {
-                    self.slots[free] = st;
-                    Stack::default()
-                }
-                None => st,
-            };
-        }
-        let left = self.add_to(range, st.item, st.n);
-        if left > 0 { Stack::new(st.item, left) } else { Stack::default() }
+        stash_in(&mut self.slots[range], st)
+    }
+
+    /// Picks a stack up into the hotbar and backpack. Returns what did not fit.
+    pub fn pick_up(&mut self, st: Stack) -> Stack {
+        if valid(st.item) { self.stash(0..BAG_END, st) } else { Stack::default() }
     }
 
     /// Adds items. Returns how many did not fit.
@@ -785,39 +900,14 @@ impl Inventory {
 
     /// Left click: pick up, drop, merge or swap the held stack.
     pub fn click(&mut self, slot: usize) {
-        let s = self.slots[slot];
-        if self.held.is_empty() {
-            self.held = s;
-            self.slots[slot] = Stack::default();
-        } else if !Self::accepts(slot, self.held.item) {
-        } else if !s.is_empty() && s.item == self.held.item && max_stack(s.item) > 1 {
-            let left = self.put(slot, self.held.item, self.held.n);
-            self.held = if left > 0 { Stack::new(self.held.item, left) } else { Stack::default() };
-        } else {
-            self.slots[slot] = self.held;
-            self.held = s;
-        }
+        let ok = Self::accepts(slot, self.held.item);
+        click_stack(&mut self.held, &mut self.slots[slot], ok);
     }
 
     /// Right click: take half a stack, or drop a single held item.
     pub fn right_click(&mut self, slot: usize) {
-        let s = self.slots[slot];
-        if self.held.is_empty() {
-            if !s.is_empty() {
-                let k = (s.n + 1) / 2;
-                self.held = Stack { n: k, ..s };
-                self.slots[slot] = if s.n > k { Stack { n: s.n - k, ..s } } else { Stack::default() };
-            }
-        } else if max_stack(self.held.item) == 1 {
-            if s.is_empty() {
-                self.click(slot);
-            }
-        } else if Self::accepts(slot, self.held.item) && self.put(slot, self.held.item, 1) == 0 {
-            self.held.n -= 1;
-            if self.held.n == 0 {
-                self.held = Stack::default();
-            }
-        }
+        let ok = Self::accepts(slot, self.held.item);
+        right_click_stack(&mut self.held, &mut self.slots[slot], ok);
     }
 
     /// Shift click: send a stack to the other half of the inventory (armour goes on).
@@ -861,6 +951,24 @@ impl Inventory {
     }
 }
 
+/// The item that places (and drops from) a door block.
+pub fn door_item(b: Block) -> Item {
+    OAK_DOOR + door_wood(b)
+}
+
+/// The item a block in the world stands for (middle click, and what it drops).
+pub fn item_of(b: Block) -> Item {
+    match b {
+        b if is_door(b) => door_item(b),
+        b if is_slab(b) => SLAB + slab_mat(b),
+        b if is_stairs(b) => STAIRS + stair_mat(b),
+        b if is_ladder(b) => LADDER,
+        b if is_trapdoor(b) => TRAPDOOR,
+        LOOT_CHEST => CHEST,
+        b => b,
+    }
+}
+
 /// Pickaxe tier a block needs before it drops anything.
 pub fn tier_needed(b: Block) -> u8 {
     match b {
@@ -892,7 +1000,7 @@ pub fn drop_for(b: Block, tool: Item) -> Item {
         WHEAT_0 | WHEAT_1 | WHEAT_2 => SEEDS,
         WHEAT_3 => WHEAT,
         WATER | BEDROCK | AIR => AIR,
-        b => b,
+        b => item_of(b),
     }
 }
 
@@ -914,6 +1022,13 @@ pub fn break_time(b: Block, tool: Item) -> f32 {
             with(Kind::Pick, 2.6 * hard, 1.0)
         }
         LOG | PLANKS | WORKBENCH | BED | BIRCH_LOG | BIRCH_PLANKS => with(Kind::Axe, 1.1, 2.0),
+        b if is_door(b) || is_trapdoor(b) || b == CHEST || b == LOOT_CHEST => with(Kind::Axe, 1.5, 2.0),
+        b if is_slab(b) || is_stairs(b) => {
+            let mat = if is_slab(b) { slab_mat(b) } else { stair_mat(b) };
+            if mat < 2 { with(Kind::Axe, 1.1, 2.0) } else { with(Kind::Pick, 2.6, 1.0) }
+        }
+        FENCE | BIRCH_FENCE => with(Kind::Axe, 1.1, 2.0),
+        b if is_ladder(b) => 0.3,
         GRASS | DIRT | SAND | GRAVEL | CLAY | SNOW | FARMLAND => with(Kind::Shovel, 0.5, 2.0),
         LEAVES | BIRCH_LEAVES | PINE_LEAVES | CLOTH | THATCH => {
             if tool == SHEARS {
@@ -922,7 +1037,7 @@ pub fn break_time(b: Block, tool: Item) -> f32 {
                 0.18
             }
         }
-        GLASS | LAMP => 0.15,
+        GLASS | LAMP | PANE => 0.15,
         TORCH => 0.05,
         b if is_plant(b) => 0.05,
         _ => 0.3,
@@ -1008,6 +1123,45 @@ mod tests {
         assert_eq!(inv.count(STONE_PICK), 0);
         inv.sort_bag();
         assert_eq!(inv.count(COBBLE), 87);
+    }
+
+    #[test]
+    fn chest_slots_and_pick_up() {
+        let mut inv = Inventory::new();
+        let mut chest = [Stack::default(); CHEST_SLOTS];
+        inv.add(COBBLE, 70);
+        // carry a stack across with the mouse, then split one off with a right click
+        inv.click(0);
+        click_stack(&mut inv.held, &mut chest[3], true);
+        assert!(inv.held.is_empty());
+        assert_eq!(chest[3], Stack::new(COBBLE, 70));
+        right_click_stack(&mut inv.held, &mut chest[3], true);
+        assert_eq!((inv.held.n, chest[3].n), (35, 35));
+        right_click_stack(&mut inv.held, &mut chest[4], true);
+        assert_eq!((inv.held.n, chest[4].n), (34, 1));
+        inv.stow_held();
+        // shift-click style moves keep a tool's wear
+        let pick = Stack { item: IRON_PICK, n: 1, wear: 9 };
+        assert!(stash_in(&mut chest, pick).is_empty());
+        assert!(chest.contains(&pick));
+        assert_eq!(stash_in(&mut chest, Stack::new(COBBLE, 100)).n, 0);
+        assert_eq!(chest.iter().filter(|s| s.item == COBBLE).map(|s| s.n).sum::<u32>(), 136);
+        // a full inventory hands back what it cannot take
+        let mut full = Inventory::new();
+        for s in &mut full.slots[..BAG_END] {
+            *s = Stack::new(DIRT, 99);
+        }
+        full.slots[5].n = 90;
+        assert_eq!(full.pick_up(Stack::new(DIRT, 20)).n, 11);
+        assert_eq!(full.pick_up(pick), pick);
+    }
+
+    #[test]
+    fn shaped_blocks_drop_their_items() {
+        for (b, item) in [(SLAB_TOP + 2, SLAB + 2), (STAIR_BASE + 8 + 5, STAIRS + 1), (LADDER_BASE + 3, LADDER), (TRAP_BASE + 13, TRAPDOOR), (DOOR_BASE + 40, BIRCH_DOOR), (CHEST, CHEST)] {
+            assert_eq!(drop_for(b, AIR), item);
+            assert!(valid(item) && name(item) != "?" && !desc(item).is_empty());
+        }
     }
 
     #[test]

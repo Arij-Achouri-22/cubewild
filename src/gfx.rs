@@ -14,6 +14,18 @@ pub struct EntVert {
     pub color: [u8; 4],
 }
 
+/// A textured vertex for items lying in the world (camera-relative position).
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+pub struct ItemVert {
+    pub pos: [f32; 3],
+    pub uv: [f32; 2],
+    pub layer: u32,
+    pub light: f32,
+    /// 0..1 share of daylight reaching it
+    pub sky: f32,
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 pub struct UiVert {
@@ -41,14 +53,19 @@ pub const EMISSIVE: u8 = 250;
 pub struct ChunkMesh {
     vbuf: wgpu::Buffer,
     opaque_quads: u32,
+    /// the last of the opaque quads: buried cave walls (see `MeshData::deep_quads`)
+    deep_quads: u32,
     cut_quads: u32,
     trans_quads: u32,
+    /// shaped blocks, in their own vertex format (see `MeshData::detail`)
+    detail: Option<(wgpu::Buffer, u32)>,
     pub top: f32,
 }
 
 impl ChunkMesh {
-    pub fn quads(&self) -> u32 {
-        self.opaque_quads + self.cut_quads + self.trans_quads
+    /// Quads drawn for this chunk, with or without its buried cave walls.
+    pub fn quads(&self, deep: bool) -> u32 {
+        self.opaque_quads - if deep { 0 } else { self.deep_quads } + self.cut_quads + self.trans_quads + self.detail.as_ref().map_or(0, |d| d.1)
     }
 }
 
@@ -59,15 +76,23 @@ pub struct Frame<'a> {
     pub fog_start: f32,
     pub fog_end: f32,
     /// visible chunks sorted near -> far, with camera-relative origin
-    /// (mesh, origin, draw its plants)
-    pub chunks: &'a [(&'a ChunkMesh, [f32; 3], bool)],
+    /// (mesh, origin, draw its plants, draw its buried cave walls)
+    pub chunks: &'a [(&'a ChunkMesh, [f32; 3], bool, bool)],
     /// 0..1 brightness of the sky
     pub daylight: f32,
+    /// brightness of animals and monsters
+    pub ent_light: f32,
+    /// height of the camera in the world (the deep is darker)
+    pub eye_y: f32,
     /// camera-relative light positions, w = reach in blocks
     pub lights: &'a [[f32; 4]],
     /// sun, moon and stars: drawn first, behind everything
     pub sky: &'a [EntVert],
     pub ents: &'a [EntVert],
+    /// dropped items: quads of four vertices
+    pub items: &'a [ItemVert],
+    /// how many of the last `items` vertices are the item in the player's hand
+    pub hand: usize,
     pub ui: &'a [UiVert],
 }
 
@@ -99,19 +124,70 @@ struct COut {
 @vertex fn vs_chunk(@location(0) v: u32, @location(1) off: vec4<f32>) -> COut {
   let x = f32(v & 31u); let y = f32((v >> 5u) & 255u); let z = f32((v >> 13u) & 31u);
   let face = (v >> 18u) & 7u;
-  let ao = f32((v >> 28u) & 3u);
-  let p = vec3<f32>(x, y, z) + off.xyz;
+  var ao = f32((v >> 28u) & 3u);
+  var p = vec3<f32>(x, y, z) + off.xyz;
   var o: COut;
+  o.layer = (v >> 21u) & 127u;
+  if (face == 7u) {
+    // window panes: an upright quad moved from the cell boundary to the middle of the cell
+    var dirs = array<vec3<f32>, 4>(vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(-1.0, 0.0, 0.0), vec3<f32>(0.0, 0.0, 1.0), vec3<f32>(0.0, 0.0, -1.0));
+    p += dirs[u32(ao)] * 0.5;
+  }
   o.pos = g.view_proj * vec4<f32>(p, 1.0);
-  if (face < 2u) { o.uv = vec2<f32>(z, -y); }
+  if (face == 7u) {
+    if (ao < 2.0) { o.uv = vec2<f32>(z, -y); } else { o.uv = vec2<f32>(x, -y); }
+    ao = 3.0;
+  }
+  else if (face < 2u) { o.uv = vec2<f32>(z, -y); }
   else if (face < 4u) { o.uv = vec2<f32>(x, z); }
   else { o.uv = vec2<f32>(x, -y); }
   var shade = array<f32, 8>(0.80, 0.80, 1.0, 0.50, 0.66, 0.66, 0.95, 0.95);
   o.light = shade[face] * (0.45 + ao * 0.1834);
-  o.layer = (v >> 21u) & 127u;
   o.p = p;
   var skyl = array<f32, 4>(0.2, 0.52, 1.0, 1.0);
   o.sky = skyl[(v >> 30u) & 3u];
+  return o;
+}
+
+// shaped blocks: positions in sixteenths of a block, textures laid out by world position
+@vertex fn vs_detail(@location(0) v: vec2<u32>, @location(1) off: vec4<f32>) -> COut {
+  let q = vec3<f32>(f32(v.x & 511u), f32((v.x >> 9u) & 4095u), f32((v.x >> 21u) & 511u)) / 16.0;
+  let face = v.y & 7u;
+  let p = q + off.xyz;
+  var o: COut;
+  o.layer = (v.y >> 3u) & 255u;
+  o.pos = g.view_proj * vec4<f32>(p, 1.0);
+  if (face < 2u) { o.uv = vec2<f32>(q.z, -q.y); }
+  else if (face < 4u) { o.uv = vec2<f32>(q.x, q.z); }
+  else { o.uv = vec2<f32>(q.x, -q.y); }
+  var shade = array<f32, 6>(0.80, 0.80, 1.0, 0.50, 0.66, 0.66);
+  o.light = shade[face];
+  o.p = p;
+  var skyl = array<f32, 4>(0.2, 0.52, 1.0, 1.0);
+  o.sky = skyl[(v.x >> 30u) & 3u];
+  return o;
+}
+@vertex fn vs_item(@location(0) p: vec3<f32>, @location(1) uv: vec2<f32>, @location(2) layer: u32, @location(3) light: f32, @location(4) sky: f32) -> COut {
+  var o: COut;
+  o.pos = g.view_proj * vec4<f32>(p, 1.0);
+  o.uv = uv;
+  o.layer = layer;
+  o.light = light;
+  o.p = p;
+  o.sky = sky;
+  return o;
+}
+// the arms and the held item: squeezed to the front of the depth range, so they sort
+// among themselves but nothing in the world cuts into them
+@vertex fn vs_hand(@location(0) p: vec3<f32>, @location(1) uv: vec2<f32>, @location(2) layer: u32, @location(3) light: f32, @location(4) sky: f32) -> COut {
+  var o: COut;
+  o.pos = g.view_proj * vec4<f32>(p, 1.0);
+  o.pos.z = o.pos.z * 0.05;
+  o.uv = uv;
+  o.layer = layer;
+  o.light = light;
+  o.p = p;
+  o.sky = sky;
   return o;
 }
 
@@ -123,8 +199,13 @@ fn chunk_color(i: COut, c: vec4<f32>) -> vec4<f32> {
     glow = max(glow, 1.0 - distance(i.p, l.xyz) / l.w);
   }
   glow = glow * glow * 1.15;
-  var lit = min(vec3<f32>(max(i.sky * g.misc.x, 0.035)) + vec3<f32>(1.0, 0.8, 0.52) * glow, vec3<f32>(1.15)) * i.light;
+  // what daylight seeps into enclosed places fades out on the way down
+  let dim = mix(0.1, 1.0, smoothstep(12.0, 44.0, i.p.y + g.misc.w));
+  var sky = i.sky;
+  if (sky < 0.6) { sky = sky * dim; }
+  var lit = min(vec3<f32>(max(sky * g.misc.x, 0.035 * mix(0.3, 1.0, dim))) + vec3<f32>(1.0, 0.8, 0.52) * glow, vec3<f32>(1.15)) * i.light;
   if (i.layer == 27u) { lit = vec3<f32>(1.0, 0.97, 0.9); }
+  if (i.layer == 56u) { lit = vec3<f32>(1.0, 0.92, 0.85); }
   return vec4<f32>(mix(c.rgb * lit, g.fog_color.rgb, fogf(length(i.p))), c.a);
 }
 @fragment fn fs_chunk(i: COut) -> @location(0) vec4<f32> {
@@ -217,6 +298,10 @@ pub struct Gfx {
     chunk_pipe: wgpu::RenderPipeline,
     trans_pipe: wgpu::RenderPipeline,
     cut_pipe: wgpu::RenderPipeline,
+    detail_pipe: wgpu::RenderPipeline,
+    item_pipe: wgpu::RenderPipeline,
+    hand_pipe: wgpu::RenderPipeline,
+    item_buf: wgpu::Buffer,
     ent_pipe: wgpu::RenderPipeline,
     sky_pipe: wgpu::RenderPipeline,
     sky_buf: wgpu::Buffer,
@@ -461,6 +546,25 @@ impl Gfx {
                 attributes: &inst_attrs,
             }),
         ];
+        let detail_attrs = wgpu::vertex_attr_array![0 => Uint32x2];
+        let detail_bufs = [
+            Some(wgpu::VertexBufferLayout {
+                array_stride: 8,
+                step_mode: wgpu::VertexStepMode::Vertex,
+                attributes: &detail_attrs,
+            }),
+            Some(wgpu::VertexBufferLayout {
+                array_stride: 16,
+                step_mode: wgpu::VertexStepMode::Instance,
+                attributes: &inst_attrs,
+            }),
+        ];
+        let item_attrs = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x2, 2 => Uint32, 3 => Float32, 4 => Float32];
+        let item_bufs = [Some(wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<ItemVert>() as u64,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &item_attrs,
+        })];
         let ent_bufs = [Some(wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<EntVert>() as u64,
             step_mode: wgpu::VertexStepMode::Vertex,
@@ -518,6 +622,10 @@ impl Gfx {
         };
         let chunk_pipe = make("vs_chunk", "fs_chunk", &chunk_bufs, false, true, Some(true), true);
         let cut_pipe = make("vs_chunk", "fs_chunk_cut", &chunk_bufs, false, false, Some(true), true);
+        let detail_pipe = make("vs_detail", "fs_chunk_cut", &detail_bufs, false, false, Some(true), true);
+        let item_pipe = make("vs_item", "fs_chunk_cut", &item_bufs, false, false, Some(true), true);
+        // the held item is drawn over the world, never cut into by a wall
+        let hand_pipe = make("vs_hand", "fs_chunk_cut", &item_bufs, false, false, Some(true), true);
         let trans_pipe = make("vs_chunk", "fs_chunk", &chunk_bufs, true, false, Some(false), true);
         let ent_pipe = make("vs_ent", "fs_ent", &ent_bufs, true, false, Some(true), true);
         let sky_pipe = make("vs_sky", "fs_sky", &ent_bufs, true, false, None, true);
@@ -604,6 +712,10 @@ impl Gfx {
             blit_sampler,
             inst_buf: vbuf(&device, (MAX_INSTANCES * 16) as u64),
             ent_buf: vbuf(&device, 1 << 20),
+            item_buf: vbuf(&device, 1 << 16),
+            detail_pipe,
+            item_pipe,
+            hand_pipe,
             sky_buf: vbuf(&device, 1 << 16),
             sky_pipe,
             ui_buf: vbuf(&device, 1 << 20),
@@ -710,14 +822,21 @@ impl Gfx {
     }
 
     pub fn upload_mesh(&self, m: &MeshData) -> Option<ChunkMesh> {
-        if m.verts.is_empty() {
+        if m.verts.is_empty() && m.detail.is_empty() {
             return None;
         }
-        let vbuf = vbuf(&self.device, (m.verts.len() * 4) as u64);
+        let vbuf = vbuf(&self.device, (m.verts.len().max(1) * 4) as u64);
         self.queue.write_buffer(&vbuf, 0, bytemuck::cast_slice(&m.verts));
+        let detail = (!m.detail.is_empty()).then(|| {
+            let buf = self::vbuf(&self.device, (m.detail.len() * 4) as u64);
+            self.queue.write_buffer(&buf, 0, bytemuck::cast_slice(&m.detail));
+            (buf, ((m.detail.len() / 8) as u32).min(MAX_QUADS))
+        });
         Some(ChunkMesh {
             vbuf,
+            detail,
             opaque_quads: m.opaque_quads.min(MAX_QUADS),
+            deep_quads: if m.opaque_quads <= MAX_QUADS { m.deep_quads } else { 0 },
             cut_quads: m.cut_quads.min(MAX_QUADS),
             trans_quads: m.trans_quads.min(MAX_QUADS),
             top: m.top,
@@ -749,20 +868,24 @@ impl Gfx {
             view_proj: f.view_proj.to_cols_array_2d(),
             fog_color: [f.fog_color[0], f.fog_color[1], f.fog_color[2], 1.0],
             fog: [f.fog_start, f.fog_end, 0.0, 0.0],
-            misc: [f.daylight, f.lights.len().min(MAX_LIGHTS) as f32, 0.3 + 0.7 * f.daylight, 0.0],
+            misc: [f.daylight, f.lights.len().min(MAX_LIGHTS) as f32, f.ent_light, f.eye_y],
             lights: std::array::from_fn(|i| f.lights.get(i).copied().unwrap_or([0.0, 0.0, 0.0, 1.0])),
         };
         self.queue.write_buffer(&self.globals, 0, bytemuck::bytes_of(&g));
 
         let chunks = &f.chunks[..f.chunks.len().min(MAX_INSTANCES)];
         self.inst_scratch.clear();
-        self.inst_scratch.extend(chunks.iter().map(|(_, o, _)| [o[0], o[1], o[2], 0.0]));
+        self.inst_scratch.extend(chunks.iter().map(|(_, o, _, _)| [o[0], o[1], o[2], 0.0]));
         if !chunks.is_empty() {
             self.queue.write_buffer(&self.inst_buf, 0, bytemuck::cast_slice(&self.inst_scratch));
         }
         let mut ent_buf = std::mem::replace(&mut self.ent_buf, vbuf(&self.device, 4));
         self.fill(&mut ent_buf, bytemuck::cast_slice(f.ents));
         self.ent_buf = ent_buf;
+        let mut item_buf = std::mem::replace(&mut self.item_buf, vbuf(&self.device, 4));
+        let items = &f.items[..f.items.len().min(MAX_QUADS as usize * 4)];
+        self.fill(&mut item_buf, bytemuck::cast_slice(items));
+        self.item_buf = item_buf;
         let mut sky_buf = std::mem::replace(&mut self.sky_buf, vbuf(&self.device, 4));
         self.fill(&mut sky_buf, bytemuck::cast_slice(f.sky));
         self.sky_buf = sky_buf;
@@ -811,15 +934,35 @@ impl Gfx {
             rp.set_pipeline(&self.chunk_pipe);
             rp.set_index_buffer(self.quad_ibuf.slice(..), wgpu::IndexFormat::Uint32);
             rp.set_vertex_buffer(1, self.inst_buf.slice(..));
-            for (i, (m, _, _)) in chunks.iter().enumerate() {
-                if m.opaque_quads > 0 {
+            for (i, (m, _, _, deep)) in chunks.iter().enumerate() {
+                let quads = m.opaque_quads - if *deep { 0 } else { m.deep_quads };
+                if quads > 0 {
                     rp.set_vertex_buffer(0, m.vbuf.slice(..));
-                    rp.draw_indexed(0..m.opaque_quads * 6, 0, i as u32..i as u32 + 1);
+                    rp.draw_indexed(0..quads * 6, 0, i as u32..i as u32 + 1);
                 }
+            }
+            // stairs, slabs, fences, doors and the like
+            let mut first = true;
+            for (i, (m, _, _, _)) in chunks.iter().enumerate() {
+                if let Some((buf, quads)) = &m.detail {
+                    if std::mem::take(&mut first) {
+                        rp.set_pipeline(&self.detail_pipe);
+                    }
+                    rp.set_vertex_buffer(0, buf.slice(..));
+                    rp.draw_indexed(0..quads * 6, 0, i as u32..i as u32 + 1);
+                }
+            }
+            // items lying on the ground
+            let lying = (items.len() - f.hand.min(items.len())) / 4 * 6;
+            if lying > 0 {
+                rp.set_pipeline(&self.item_pipe);
+                rp.set_vertex_buffer(0, self.item_buf.slice(..));
+                rp.draw_indexed(0..lying as u32, 0, 0..1);
             }
             // plants
             rp.set_pipeline(&self.cut_pipe);
-            for (i, (m, _, plants)) in chunks.iter().enumerate() {
+            rp.set_vertex_buffer(1, self.inst_buf.slice(..));
+            for (i, (m, _, plants, _)) in chunks.iter().enumerate() {
                 if m.cut_quads > 0 && *plants {
                     rp.set_vertex_buffer(0, m.vbuf.slice(..));
                     rp.draw_indexed(0..m.cut_quads * 6, (m.opaque_quads * 4) as i32, i as u32..i as u32 + 1);
@@ -834,7 +977,7 @@ impl Gfx {
             // water / glass, back to front
             rp.set_pipeline(&self.trans_pipe);
             rp.set_vertex_buffer(1, self.inst_buf.slice(..));
-            for (i, (m, _, _)) in chunks.iter().enumerate().rev() {
+            for (i, (m, _, _, _)) in chunks.iter().enumerate().rev() {
                 if m.trans_quads > 0 {
                     rp.set_vertex_buffer(0, m.vbuf.slice(..));
                     rp.draw_indexed(
@@ -843,6 +986,12 @@ impl Gfx {
                         i as u32..i as u32 + 1,
                     );
                 }
+            }
+            // the item in the player's hand, last and over everything
+            if items.len() / 4 * 6 > lying {
+                rp.set_pipeline(&self.hand_pipe);
+                rp.set_vertex_buffer(0, self.item_buf.slice(..));
+                rp.draw_indexed(lying as u32..(items.len() / 4 * 6) as u32, 0, 0..1);
             }
         }
         {
