@@ -11,6 +11,7 @@ mod mobs;
 mod path;
 mod player;
 mod textures;
+mod trade;
 mod ui;
 mod village;
 mod world;
@@ -311,6 +312,8 @@ enum Screen {
     Chest,
     /// the furnace at `Game::chest_at` is open
     Furnace,
+    /// trading with the villager `Game::trading`
+    Trade,
     Dead,
 }
 
@@ -337,6 +340,8 @@ enum Action {
     ChestSlot(usize, bool),
     /// slot of the open furnace, right button
     FurnaceSlot(usize, bool),
+    /// make the villager's offer of this number
+    Trade(usize),
     Volume(f32),
     Music(f32),
     /// throw the stack on the mouse out of the window
@@ -484,6 +489,10 @@ struct Game {
     boats: boat::Boats,
     /// seconds to the next paddle stroke sound
     paddle_t: f32,
+    /// the villager being traded with (their village square and home)
+    trading: Option<((i32, i32), usize)>,
+    /// offers used up today: (villager, offer) -> times made
+    trade_uses: std::collections::HashMap<(((i32, i32), usize), usize), u32>,
 }
 
 fn data_dir(seed: u32) -> Option<PathBuf> {
@@ -708,7 +717,8 @@ const FACE_SHADE: [f32; 6] = [0.80, 0.80, 1.0, 0.50, 0.66, 0.66];
 
 /// True for items held as a small block rather than as their icon.
 fn held_as_cube(item: Item) -> bool {
-    items::is_block(item) && !is_plant(item) && !is_shaped(item) && item != TORCH && item != GLASS
+    let b = items::block_of(item);
+    items::is_block(item) && !is_plant(b) && !is_shaped(b) && b != TORCH && b != GLASS
 }
 
 /// An item's icon given thickness, a sixteenth of its width: the picture on both sides,
@@ -829,7 +839,7 @@ fn push_hand(out: &mut Vec<ItemVert>, dir: Vec3, item: Item, model: &[HandQuad],
         // a small block, turned so its top and two sides show
         let at = Vec3::new(0.6, -0.5, -1.05);
         let m = stroke(at) * Mat4::from_translation(at) * Mat4::from_rotation_x(0.5) * Mat4::from_rotation_y(0.78) * Mat4::from_scale(Vec3::splat(0.3)) * Mat4::from_translation(Vec3::splat(-0.5));
-        cube(m, &|f| tex_for(item, f));
+        cube(m, &|f| tex_for(items::block_of(item), f));
         return;
     }
     // icons: tools and weapons are drawn handle at the lower left, head at the upper
@@ -937,6 +947,9 @@ impl Game {
         };
         let mut mobs = Mobs::new(seed as u64 * 7919 + 17);
         mobs.ignore = mode == Mode::Creative;
+        if let Some(d) = &save_dir {
+            mobs.load(&d.join("animals.txt"));
+        }
         let mut game = Game {
             window,
             gfx,
@@ -1039,6 +1052,8 @@ impl Game {
             riding: None,
             boats,
             paddle_t: 0.0,
+            trading: None,
+            trade_uses: Default::default(),
         };
         // developer hook: start a new world at once, as the title screen's buttons do
         if let Some(v) = env("CUBEWILD_NEW") {
@@ -1072,6 +1087,10 @@ impl Game {
         self.save_dir = l.save_dir;
         self.mobs = Mobs::new(seed as u64 * 7919 + 17);
         self.mobs.ignore = self.mode == Mode::Creative;
+        if let Some(d) = &self.save_dir {
+            self.mobs.load(&d.join("animals.txt"));
+        }
+        self.trading = None;
         self.arrows.clear();
         self.mining = None;
         self.fishing = None;
@@ -1136,6 +1155,7 @@ impl Game {
         loot::save_chests(&self.chests, &d.join("chests.txt"));
         furnace::save(&self.furnaces, &d.join("furnaces.txt"));
         self.boats.save(&d.join("boats.txt"));
+        self.mobs.save(&d.join("animals.txt"));
     }
 
     fn save(&self) {
@@ -1165,7 +1185,7 @@ impl Game {
             self.window.set_cursor_visible(true);
             self.buttons = [false; 2];
             self.keys.clear();
-            if matches!(self.screen, Screen::Inventory | Screen::Chest | Screen::Furnace) {
+            if matches!(self.screen, Screen::Inventory | Screen::Chest | Screen::Furnace | Screen::Trade) {
                 // what was on the mouse goes back in the pack, or on the ground
                 self.inv.stow_held();
                 let left = std::mem::take(&mut self.inv.held);
@@ -1438,6 +1458,171 @@ impl Game {
         self.ready = false;
         self.unstick = true;
         self.goto(Screen::Play);
+    }
+
+    /// Uses the held item on creature `i`. False if that did nothing (so a block can
+    /// still be placed past it).
+    fn use_on_mob(&mut self, i: usize, item: Item) -> bool {
+        let (kind, at) = (self.mobs.list[i].kind, self.mobs.list[i].pos);
+        let head = at + Vec3::Y;
+        match self.mobs.interact(i, item) {
+            mobs::Use::Nothing => return false,
+            mobs::Use::Fed => {
+                self.spend();
+                self.audio.play_var(Snd::Eat, head, 0.7);
+            }
+            mobs::Use::Love => {
+                self.spend();
+                self.audio.play_var(Snd::Eat, head, 0.7);
+                self.audio.play_var(Snd::Voice(kind, audio::Call::Idle), head, 0.8);
+            }
+            mobs::Use::Healed => {
+                self.spend();
+                self.audio.play_var(Snd::Bark, head, 0.8);
+            }
+            mobs::Use::Dyed => {
+                self.spend();
+                self.audio.play_var(Snd::Pop, head, 0.6);
+            }
+            mobs::Use::Sheared { item, n } => {
+                self.audio.play_var(Snd::Shear, head, 0.9);
+                self.spill(head, item, n);
+                self.wear_held();
+            }
+            mobs::Use::Tamed => {
+                self.spend();
+                self.audio.play_var(Snd::Bark, head, 1.0);
+                for _ in 0..6 {
+                    self.particles.sparks(&mut self.rng, head, 2);
+                }
+                self.say("Tamed! Right click your dog to make it sit or follow".into());
+            }
+            mobs::Use::NotYet => {
+                self.spend();
+                for _ in 0..5 {
+                    self.particles.smoke(&mut self.rng, head + Vec3::Y * 0.3, false);
+                }
+            }
+            mobs::Use::Sit(sitting) => self.say(if sitting { "Your dog sits and waits" } else { "Your dog follows you" }.into()),
+            mobs::Use::Trade => {
+                if let Some(id) = self.mobs.villager_id(i) {
+                    self.trading = Some(id);
+                    self.audio.play_var(Snd::Voice(kind, audio::Call::Idle), head, 0.9);
+                    self.goto(Screen::Trade);
+                }
+            }
+        }
+        true
+    }
+
+    /// The villager being traded with: their index now, if they are still close by.
+    fn trader(&self) -> Option<usize> {
+        let id = self.trading?;
+        (0..self.mobs.list.len()).find(|&i| self.mobs.villager_id(i) == Some(id) && self.mobs.alive(i) && self.mobs.list[i].pos.distance(self.player.pos) < 8.0)
+    }
+
+    /// Makes offer `k` of the villager traded with, if the player has what it costs.
+    fn trade(&mut self, k: usize) {
+        let (Some(i), Some(id)) = (self.trader(), self.trading) else { return };
+        let Some(of) = trade::offers(self.mobs.profession(i)).get(k) else { return };
+        let used = self.trade_uses.get(&(id, k)).copied().unwrap_or(0);
+        if used >= of.uses {
+            self.say("Sold out until tomorrow".into());
+            return;
+        }
+        if of.give.iter().any(|&(it, n)| n > 0 && self.inv.count(it) < n) {
+            self.say("You don't have enough for that".into());
+            return;
+        }
+        for &(it, n) in &of.give {
+            if n > 0 {
+                self.inv.take(it, n);
+            }
+        }
+        self.give(of.get.0, of.get.1);
+        self.trade_uses.insert((id, k), used + 1);
+        let at = self.mobs.list[i].pos;
+        self.audio.play_var(Snd::Voice(mobs::Kind::Villager, audio::Call::Idle), at + Vec3::Y, 0.8);
+        self.audio.play(Snd::Pop, 0.6, 1.2);
+        let xp = 1 + (self.rng.f() < 0.5) as u32;
+        self.gain_xp(xp);
+    }
+
+    /// A puffcap bursts: a crater of broken blocks (a few of them drop), and a blast
+    /// that hurts and throws whatever is near.
+    fn explode(&mut self, at: Vec3, radius: f32) {
+        let c = at.floor().as_ivec3();
+        let r = radius.ceil() as i32;
+        let mut edits = Vec::new();
+        for dy in -r..=r {
+            for dz in -r..=r {
+                for dx in -r..=r {
+                    let p = c + IVec3::new(dx, dy, dz);
+                    let d = (p.as_vec3() + 0.5 - at).length();
+                    // a ragged edge, not a perfect ball
+                    if d > radius * (0.7 + 0.3 * self.rng.f()) {
+                        continue;
+                    }
+                    let b = self.world.get_block(p.x, p.y, p.z);
+                    // (chests and furnaces are sturdy enough to keep what they hold)
+                    if matches!(b, AIR | BEDROCK | WATER | LAVA | CHEST | LOOT_CHEST | FURNACE) {
+                        continue;
+                    }
+                    edits.push((p, AIR));
+                }
+            }
+        }
+        let broken = self.world.set_many(&self.gfx, &edits);
+        self.weather.dirty();
+        for (p, b) in broken {
+            // a third of what breaks is left to pick up
+            if self.rng.f() < 0.33 && self.mode == Mode::Survival {
+                let drop = items::drop_for(b, AIR);
+                if drop != AIR {
+                    self.pickups.pop(&mut self.rng, p.as_vec3() + 0.5, Stack::new(drop, 1));
+                }
+            }
+            if self.rng.f() < 0.15 {
+                let col = self.block_color(b);
+                self.particles.chips(&mut self.rng, p, col, 3);
+            }
+        }
+        for _ in 0..40 {
+            let o = Vec3::new(self.rng.range(-1.5, 1.5), self.rng.range(-0.5, 1.5), self.rng.range(-1.5, 1.5));
+            let dark = self.rng.f() < 0.5;
+            self.particles.smoke(&mut self.rng, at + o, dark);
+        }
+        for _ in 0..16 {
+            let o = Vec3::new(self.rng.range(-1.0, 1.0), self.rng.range(0.0, 1.0), self.rng.range(-1.0, 1.0));
+            self.particles.ember(&mut self.rng, at + o);
+        }
+        self.particles.sparks(&mut self.rng, at, 24);
+        self.audio.play_at(Snd::Boom, at, 1.4, 0.9 + self.rng.f() * 0.2);
+        // the blast: worse the closer you are, softened by armour; it throws you back
+        let reach = radius * 2.0;
+        let to = self.player.pos + Vec3::Y * 0.9 - at;
+        let d = to.length();
+        if d < reach && self.mode == Mode::Survival && self.screen != Screen::Dead {
+            let k = 1.0 - d / reach;
+            self.strike(16.0 * k);
+            self.player.vel += to.normalize_or(Vec3::Y) * 12.0 * k + Vec3::Y * 5.0 * k;
+            if self.health <= 0.0 {
+                self.die();
+            }
+        }
+        for i in 0..self.mobs.list.len() {
+            let m = &self.mobs.list[i];
+            let d = (m.pos + Vec3::Y * 0.5 - at).length();
+            if !self.mobs.alive(i) || d >= reach {
+                continue;
+            }
+            let (kind, pos) = (m.kind, m.pos);
+            let dmg = (14.0 * (1.0 - d / reach)).ceil() as i32;
+            if let Some(drops) = self.mobs.hit(i, at, dmg) {
+                self.loot(drops, pos);
+                self.kill_xp(kind, pos);
+            }
+        }
     }
 
     /// Steps out of the boat: on top of it if there is room, else beside it.
@@ -1819,6 +2004,13 @@ impl Game {
             self.swing = SWING;
         }
         let target = self.target();
+        // use the held item on a creature in reach: feed, shear, dye, tame, trade
+        if let Some((i, t)) = self.mobs.pick(self.player.eye(), self.player.look_dir(), 4.0) {
+            if target.map_or(true, |b| t < b.2) && self.use_on_mob(i, item) {
+                self.place_cd = 0.3;
+                return;
+            }
+        }
         // get into a boat in reach (unless a block is nearer)
         if self.riding.is_none() {
             if let Some((i, t)) = self.boats.pick(self.player.eye(), self.player.look_dir(), 4.0) {
@@ -2034,7 +2226,7 @@ impl Game {
                     (q, if high { SLAB_TOP + mat } else { i })
                 }
             }
-            i if items::is_block(i) => (q, i),
+            i if items::is_block(i) => (q, items::block_of(i)),
             _ => return,
         };
         let cur = self.world.get_block(at.x, at.y, at.z);
@@ -2213,13 +2405,13 @@ impl Game {
         match code {
             KeyCode::Escape => match self.screen {
                 Screen::Play => self.goto(Screen::Pause),
-                Screen::Pause | Screen::Inventory | Screen::Chest | Screen::Furnace => self.goto(Screen::Play),
+                Screen::Pause | Screen::Inventory | Screen::Chest | Screen::Furnace | Screen::Trade => self.goto(Screen::Play),
                 Screen::Dead | Screen::Title => {}
                 _ => self.goto(Screen::Pause),
             },
             KeyCode::KeyE | KeyCode::Tab => match self.screen {
                 Screen::Play => self.goto(Screen::Inventory),
-                Screen::Inventory | Screen::Chest | Screen::Furnace => self.goto(Screen::Play),
+                Screen::Inventory | Screen::Chest | Screen::Furnace | Screen::Trade => self.goto(Screen::Play),
                 _ => {}
             },
             KeyCode::KeyQ if self.screen == Screen::Play => self.drop_selected(self.keys.contains(&KeyCode::ControlLeft)),
@@ -2393,6 +2585,7 @@ impl Game {
                     self.gain_xp(whole);
                 }
             }
+            Action::Trade(k) => self.trade(k),
             Action::Volume(v) => {
                 self.settings.volume = v;
                 self.audio.set_volume(v, self.settings.music);
@@ -2549,9 +2742,14 @@ impl Game {
             }
         }
         // the world keeps running while the inventory is open, but pauses in the menus
-        let simulate = self.ready && matches!(self.screen, Screen::Play | Screen::Inventory | Screen::Chest | Screen::Furnace);
+        let simulate = self.ready && matches!(self.screen, Screen::Play | Screen::Inventory | Screen::Chest | Screen::Furnace | Screen::Trade);
         if simulate {
+            let was = self.time;
             self.time = (self.time + dt / DAY_SECS).rem_euclid(1.0);
+            if self.time < was {
+                // a new day: the villagers have restocked
+                self.trade_uses.clear();
+            }
             let fall_speed = -self.player.vel.y;
             let before = self.player.pos;
             let ridden = self.riding.map(|i| (i, &input));
@@ -2586,7 +2784,28 @@ impl Game {
             if self.test_house.is_none() && std::mem::take(&mut self.test_mobs) {
                 self.mobs.spawn_test(&self.world, self.player.pos);
             }
-            let bites = self.mobs.update(&self.world, self.player.pos, input.sneak && !self.player.flying, night, dt);
+            if self.screen == Screen::Trade {
+                if let Some(i) = self.trader() {
+                    self.mobs.hold(i);
+                }
+            }
+            let lure = self.inv.hot(self.sel);
+            let bites = self.mobs.update(&self.world, self.player.pos, input.sneak && !self.player.flying, night, lure, dt);
+            for ev in std::mem::take(&mut self.mobs.events) {
+                match ev {
+                    mobs::MobEvent::Born { kind, pos } => {
+                        self.audio.play_var(Snd::Voice(kind, audio::Call::Idle), pos + Vec3::Y, 0.8);
+                        let xp = 1 + (self.rng.f() * 4.0) as u32;
+                        self.orbs.spawn(&mut self.rng, pos + Vec3::Y * 0.5, xp);
+                    }
+                    mobs::MobEvent::Killed { kind, pos, drops } => {
+                        self.loot(drops, pos);
+                        self.kill_xp(kind, pos);
+                    }
+                    mobs::MobEvent::Fuse { pos } => self.audio.play_at(Snd::Fuse, pos + Vec3::Y, 1.0, 1.0),
+                    mobs::MobEvent::Explode { pos } => self.explode(pos, 3.2),
+                }
+            }
             for (pos, vel) in self.mobs.shots.drain(..) {
                 self.arrows.push(Arrow { pos, vel, life: 5.0, hostile: true });
             }
@@ -2980,7 +3199,7 @@ impl Game {
         let slot = (58.0 * s).round();
         let hx = (cx - slot * 4.5).round();
         let hy = (hf - slot - 12.0 * s).round();
-        if self.ready && !matches!(self.screen, Screen::Inventory | Screen::Chest | Screen::Furnace) {
+        if self.ready && !matches!(self.screen, Screen::Inventory | Screen::Chest | Screen::Furnace | Screen::Trade) {
             for i in 0..9 {
                 draw_slot(&mut ui, hx + i as f32 * slot, hy, slot, self.inv.slots[i], i == self.sel, false);
             }
@@ -3656,6 +3875,94 @@ impl Game {
                         ui.rect(px + 14.0 * s, py + 18.0 * s, tw, th, [16, 14, 22, 246]);
                         ui.outline(px + 14.0 * s, py + 18.0 * s, tw, th, 1.0, ACCENT);
                         ui.text(px + 24.0 * s, py + 24.0 * s, SMALL, text, TEXT);
+                    }
+                }
+                Screen::Trade => {
+                    ui.rect(0.0, 0.0, wf, hf, [6, 10, 16, 140]);
+                    let slot = (58.0 * s).round();
+                    let pad = (20.0 * s).round();
+                    let head = (46.0 * s).round();
+                    let trader = self.trader();
+                    let prof = trader.map_or(0, |i| self.mobs.profession(i));
+                    let offers = trade::offers(prof);
+                    let row = (slot * 0.95).round();
+                    let mw = 9.0 * slot + 2.0 * pad;
+                    let top_h = offers.len() as f32 * row + 8.0 * s;
+                    let mh = 2.0 * head + top_h + 3.0 * slot + 10.0 * s + slot + pad;
+                    let (mx, wy) = ((cx - mw * 0.5).round(), ((hf - mh) * 0.5).round());
+                    draw_window(&mut ui, mx, wy, mw, mh);
+                    ui.text(mx + pad, wy + 11.0 * s, HEAD, trade::PROFESSIONS[prof as usize], INK);
+                    let gems = self.inv.count(items::GEM);
+                    ui.text_right(mx + mw - pad, wy + 18.0 * s, SMALL, &format!("You have {gems} gems   ·   restocks each morning"), INK_DIM);
+                    let mut tip: Option<Stack> = None;
+                    let id = self.trading;
+                    for (k, of) in offers.iter().enumerate() {
+                        let y = wy + head + k as f32 * row;
+                        let small = (slot * 0.82).round();
+                        let mut x = mx + pad;
+                        for &(it, n) in of.give.iter().filter(|g| g.1 > 0) {
+                            let st = Stack::new(it, n);
+                            if draw_slot(&mut ui, x, y, small, st, false, true) {
+                                tip = Some(st);
+                            }
+                            x += small + 4.0 * s;
+                        }
+                        // an arrow, then what it buys
+                        let ax = mx + pad + 2.0 * (small + 4.0 * s) + 8.0 * s;
+                        let ay = y + small * 0.5;
+                        ui.rect(ax, ay - 3.0 * s, slot * 0.7, 6.0 * s, INK_DIM);
+                        ui.rect(ax + slot * 0.7, ay - 9.0 * s, 8.0 * s, 18.0 * s, INK_DIM);
+                        let gx = ax + slot * 0.7 + 22.0 * s;
+                        let st = Stack::new(of.get.0, of.get.1);
+                        if draw_slot(&mut ui, gx, y, small, st, false, true) {
+                            tip = Some(st);
+                        }
+                        let used = id.and_then(|id| self.trade_uses.get(&(id, k)).copied()).unwrap_or(0);
+                        let left = of.uses.saturating_sub(used);
+                        let can = trader.is_some() && left > 0 && of.give.iter().all(|&(it, n)| n == 0 || self.inv.count(it) >= n);
+                        let label = if left == 0 { "Sold out".to_string() } else { format!("{left} left") };
+                        let lx = gx + small + 16.0 * s;
+                        ui.text(lx, y + small * 0.5 - font.height(SMALL) * 0.5, SMALL, &label, INK_DIM);
+                        let (bw, bh) = ((150.0 * s).round(), (small * 0.75).round());
+                        if ui.button(mx + mw - pad - bw, y + (small - bh) * 0.5, bw, bh, "Trade", can) {
+                            actions.push(Action::Trade(k));
+                        }
+                    }
+                    let iy2 = wy + head + top_h;
+                    ui.text(mx + pad, iy2 + 11.0 * s, HEAD, "Inventory", INK);
+                    let gy = iy2 + head;
+                    for i in 0..items::BAG_END {
+                        let k = i.wrapping_sub(items::HOTBAR);
+                        let (x, y) = if i < items::HOTBAR {
+                            (mx + pad + i as f32 * slot, gy + 3.0 * slot + 10.0 * s)
+                        } else {
+                            (mx + pad + (k % 9) as f32 * slot, gy + (k / 9) as f32 * slot)
+                        };
+                        let st = self.inv.slots[i];
+                        if draw_slot(&mut ui, x, y, slot, st, i == self.sel, true) {
+                            if !st.is_empty() {
+                                tip = Some(st);
+                            }
+                            if ui.ptr.clicked {
+                                actions.push(Action::Slot(i, false));
+                            } else if ui.ptr.rclicked {
+                                actions.push(Action::Slot(i, true));
+                            }
+                        }
+                    }
+                    let held = self.inv.held;
+                    if !held.is_empty() {
+                        let (px, py) = (ui.ptr.x, ui.ptr.y);
+                        draw_stack(&mut ui, px - slot * 0.5, py - slot * 0.5, slot, held);
+                        if ui.ptr.clicked && !ui.hover(mx, wy, mw, mh) {
+                            actions.push(Action::DropHeld);
+                        }
+                    } else if let Some(st) = tip {
+                        draw_tip(&mut ui, st, wf, hf);
+                    }
+                    if trader.is_none() {
+                        // they walked off (or worse)
+                        actions.push(Action::Goto(Screen::Play));
                     }
                 }
                 Screen::Furnace => {

@@ -163,7 +163,8 @@ impl Pickups {
             let (s, c) = t.sin_cos();
             let item = p.stack.item;
             let sky = [0.2, 0.52, 1.0][p.sky.min(2) as usize];
-            let cube = items::is_block(item) && !is_plant(item) && !is_shaped(item) && item != TORCH && item != GLASS;
+            let block = items::block_of(item);
+            let cube = items::is_block(item) && !is_plant(block) && !is_shaped(block) && block != TORCH && block != GLASS;
             for copy in 0..if p.stack.n > 1 { 2 } else { 1 } {
                 let k = copy as f32;
                 let mid = rel + Vec3::new(k * 0.09, 0.22 + (p.age * 2.4).sin() * 0.04 + k * 0.07, k * 0.09);
@@ -179,7 +180,7 @@ impl Pickups {
                         [(-h, -h, -h), (h, -h, -h), (h, h, -h), (-h, h, -h)],
                     ];
                     for (f, q) in faces.iter().enumerate() {
-                        let layer = tex_for(item, f);
+                        let layer = tex_for(block, f);
                         for (v, &(x, y, z)) in q.iter().enumerate() {
                             out.push(ItemVert { pos: turn(x, y, z).into(), uv: UV[v], layer, light: SHADE[f], sky });
                         }

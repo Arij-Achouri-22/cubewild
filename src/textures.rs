@@ -72,6 +72,13 @@ fn pixel(layer: usize, x: i32, y: i32) -> [u8; 4] {
         let c = if layer == ARM_TEX { [226.0, 176.0, 134.0] } else { [176.0, 92.0, 52.0] };
         return shade(c, 0.93 + n * 0.07);
     }
+    if (crate::world::WOOL_LAYER as usize..crate::world::WOOL_LAYER as usize + 15).contains(&layer) {
+        // dyed wool: the cloth weave in a colour
+        let c = crate::world::COLOURS[layer - crate::world::WOOL_LAYER as usize + 1];
+        let n = h(48, x, y);
+        let weave = if (x + y) % 2 == 0 { 0.92 } else { 1.0 } * if x % 4 == 0 || y % 4 == 0 { 0.9 } else { 1.0 };
+        return shade([c[0] as f32, c[1] as f32, c[2] as f32], weave * (0.94 + n * 0.08));
+    }
     if (57..ICON_BASE).contains(&layer) {
         return biome_pixel(layer, x, y);
     }
@@ -1089,6 +1096,39 @@ fn item_pixel(item: usize, x: i32, y: i32) -> [u8; 4] {
                 shade(c, 0.78)
             } else {
                 shade(c, 0.92 + n * 0.1)
+            }
+        }
+        75..=90 => {
+            // dye: a little heap of powder in its colour
+            let c = crate::world::COLOURS[item - 75];
+            let (dx, dy) = (x as f32 - 7.5, y as f32 - 10.0);
+            let heap = dy > -5.0 + dx.abs() * 0.55 && dy < 4.0 && dx.abs() < 6.5;
+            if heap {
+                let k = 0.82 + n * 0.25 + if dy < -2.0 { 0.12 } else { 0.0 };
+                shade([c[0] as f32, c[1] as f32, c[2] as f32], k)
+            } else {
+                NONE
+            }
+        }
+        91 => {
+            // bone: a shaft with knobbed ends, corner to corner
+            let on_shaft = (x + y == 15 || x + y == 16) && (4..=11).contains(&x);
+            let knob = |cx: i32, cy: i32| (x - cx).abs() + (y - cy).abs() <= 1 || ((x - cx).abs() <= 1 && (y - cy).abs() <= 1 && (x + y) % 2 == 0);
+            if on_shaft || knob(3, 12) || knob(4, 13) || knob(12, 3) || knob(13, 4) {
+                shade([236.0, 230.0, 210.0], 0.9 + n * 0.12)
+            } else {
+                NONE
+            }
+        }
+        92 => {
+            // gem: a cut green stone
+            let (dx, dy) = ((x as f32 - 7.5).abs(), (y as f32 - 7.5).abs());
+            if dx + dy * 0.8 < 6.2 {
+                let facet = if y < 7 { if x < 8 { 1.15 } else { 1.0 } } else if x < 8 { 0.82 } else { 0.7 };
+                let glint = if (x == 5 || x == 6) && y == 4 { 1.5 } else { 1.0 };
+                shade([60.0, 200.0, 110.0], facet * glint * (0.95 + n * 0.08))
+            } else {
+                NONE
             }
         }
         74 => {
