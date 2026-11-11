@@ -1,6 +1,7 @@
 //! Cubewild — a small open-world voxel sandbox: gather, craft, build, hunt.
 
 mod audio;
+mod boat;
 mod furnace;
 mod fx;
 mod gfx;
@@ -229,6 +230,8 @@ struct Settings {
     /// loudness of everything, and of the music on top of that (0..1)
     volume: f32,
     music: f32,
+    /// the camera bobs with each step
+    bobbing: bool,
 }
 
 /// Per-user folder for settings (`roaming`) or saves, following each platform's habit:
@@ -255,7 +258,7 @@ fn config_path() -> Option<PathBuf> {
 
 impl Settings {
     fn load() -> Settings {
-        let mut s = Settings { view_dist: 14, fov: 72.0, sens: 1.0, vsync: true, fullscreen: false, show_fps: true, render_scale: 1.0, auto_scale: true, volume: 0.8, music: 0.5 };
+        let mut s = Settings { view_dist: 14, fov: 72.0, sens: 1.0, vsync: true, fullscreen: false, show_fps: true, render_scale: 1.0, auto_scale: true, volume: 0.8, music: 0.5, bobbing: true };
         let text = config_path().and_then(|p| std::fs::read_to_string(p).ok()).unwrap_or_default();
         for line in text.lines() {
             let Some((k, v)) = line.split_once('=') else { continue };
@@ -271,6 +274,7 @@ impl Settings {
                 "auto_scale" => s.auto_scale = v == "true",
                 "volume" => s.volume = v.parse().unwrap_or(s.volume).clamp(0.0, 1.0),
                 "music" => s.music = v.parse().unwrap_or(s.music).clamp(0.0, 1.0),
+                "bobbing" => s.bobbing = v == "true",
                 _ => {}
             }
         }
@@ -283,8 +287,8 @@ impl Settings {
             std::fs::create_dir_all(dir).ok();
         }
         let text = format!(
-            "view_dist={}\nfov={}\nsens={}\nvsync={}\nfullscreen={}\nshow_fps={}\nrender_scale={}\nauto_scale={}\nvolume={}\nmusic={}\n",
-            self.view_dist, self.fov, self.sens, self.vsync, self.fullscreen, self.show_fps, self.render_scale, self.auto_scale, self.volume, self.music
+            "view_dist={}\nfov={}\nsens={}\nvsync={}\nfullscreen={}\nshow_fps={}\nrender_scale={}\nauto_scale={}\nvolume={}\nmusic={}\nbobbing={}\n",
+            self.view_dist, self.fov, self.sens, self.vsync, self.fullscreen, self.show_fps, self.render_scale, self.auto_scale, self.volume, self.music, self.bobbing
         );
         if let Err(e) = std::fs::write(&p, text) {
             eprintln!("cubewild: failed to save settings: {e}");
@@ -319,6 +323,7 @@ enum Action {
     ToggleVsync,
     ToggleFullscreen,
     ToggleFps,
+    ToggleBob,
     Scale(f32),
     ToggleAuto,
     /// take the crafting result; true = craft as many as possible
@@ -470,6 +475,15 @@ struct Game {
     landings: Vec<Vec3>,
     /// the biome the player stands in is looked up once a second
     biome_t: f32,
+    /// 1 when the held item has just changed, falling to 0 as it comes up into view
+    equip: f32,
+    /// walking sway: phase (0..2, a step per unit) and strength
+    bob: (f32, f32),
+    /// the boat being ridden
+    riding: Option<usize>,
+    boats: boat::Boats,
+    /// seconds to the next paddle stroke sound
+    paddle_t: f32,
 }
 
 fn data_dir(seed: u32) -> Option<PathBuf> {
@@ -552,6 +566,7 @@ struct Loaded {
     level: u32,
     xp: u32,
     weather: Weather,
+    boats: boat::Boats,
 }
 
 /// Opens the world of a seed: from its save if there is one (which also decides the
@@ -665,7 +680,8 @@ fn load_world(seed: u32, view_dist: i32, save: bool, mode: Mode) -> Loaded {
     let pickups = save_dir.as_ref().map_or_else(Pickups::default, |d| Pickups::load(&d.join("drops.txt")));
     let chests = save_dir.as_ref().map_or_else(Chests::default, |d| loot::load_chests(&d.join("chests.txt")));
     let furnaces = save_dir.as_ref().map_or_else(Furnaces::default, |d| furnace::load(&d.join("furnaces.txt")));
-    Loaded { world, player, inv, sel, health, food, air, time, spawn, pickups, chests, furnaces, mode, save_dir, level, xp, weather }
+    let boats = save_dir.as_ref().map_or_else(boat::Boats::default, |d| boat::Boats::load(&d.join("boats.txt")));
+    Loaded { world, player, inv, sel, health, food, air, time, spawn, pickups, chests, furnaces, mode, save_dir, level, xp, weather, boats }
 }
 
 /// One face of a held item's model: corners in the model's own space, texture
@@ -740,58 +756,97 @@ fn icon_model(item: Item) -> Vec<HandQuad> {
 /// a tool stands up out of the fist by its handle, other things are held upright by
 /// their lower edge, a block rests on the fist. `swing` runs from 1 to 0 through a
 /// stroke; `model` is `icon_model` of the item (unused for blocks).
-fn push_hand(out: &mut Vec<ItemVert>, dir: Vec3, item: Item, model: &[HandQuad], swing: f32, sky: f32) {
+/// How the first-person hand moves this frame: the swing (0..1 through a stroke), the
+/// dip of an item being taken out (1 = just changed, 0 = settled), and the sway of
+/// walking (phase, 0..1 strength).
+#[derive(Clone, Copy, Default)]
+struct HandPose {
+    swing: f32,
+    equip: f32,
+    bob: f32,
+    bob_amp: f32,
+}
+
+/// Where a held item's own x and y axes point in view space: its diagonal (handle to tip
+/// of a tool icon) along `d`, its face turned towards `n`.
+fn item_basis(d: Vec3, n: Vec3) -> (Vec3, Vec3, Vec3) {
+    let d = d.normalize();
+    let n = (n - d * n.dot(d)).normalize();
+    let e = d.cross(n);
+    let s = std::f32::consts::FRAC_1_SQRT_2;
+    ((d + e) * s, (d - e) * s, n)
+}
+
+/// The first-person view of the right hand. With nothing held it is the bare arm,
+/// reaching up from the lower right of the screen; anything held is shown on its own
+/// there instead (a tool or weapon diagonal, its head up and inwards; a block as a
+/// small cube turned to show three faces). `cam` is the camera's bobbing offset, which
+/// the hand follows.
+fn push_hand(out: &mut Vec<ItemVert>, dir: Vec3, item: Item, model: &[HandQuad], pose: HandPose, sky: f32, cam: Vec3) {
+    use std::f32::consts::PI;
     // the view's own axes: x to the right, y up, z back towards the viewer
     let right = dir.cross(Vec3::Y).normalize_or(Vec3::X);
     let view = Mat3::from_cols(right, right.cross(dir), -dir);
+    let put = |p: Vec3| view * p + cam;
     let mut cube = |m: Mat4, layer: &dyn Fn(usize) -> u32| {
         for (f, q) in CUBE_FACES.iter().enumerate() {
             for (i, &(x, y, z)) in q.iter().enumerate() {
-                let pos = view * m.transform_point3(Vec3::new(x, y, z));
+                let pos = put(m.transform_point3(Vec3::new(x, y, z)));
                 out.push(ItemVert { pos: pos.into(), uv: QUAD_UV[i], layer: layer(f), light: FACE_SHADE[f], sky });
             }
         }
     };
-    // an arm is a box from the shoulder (out of view) to the fist: sleeve, then skin
-    let mut arm = |m: Mat4, a: Vec3, b: Vec3| {
-        let w = b - a;
-        let u = w.cross(Vec3::Z).normalize();
-        let v = u.cross(w).normalize();
-        for (from, to, r, layer) in [(0.0, 0.84, 0.068, textures::ARM_TEX as u32 + 1), (0.84, 1.0, 0.074, textures::ARM_TEX as u32)] {
-            let o = a + w * from - (u + v) * r;
+    // walking sways the hand in a small arc; taking out an item raises it from below
+    let sway = Vec3::new((pose.bob * PI).sin() * 0.022, -(pose.bob * PI).sin().abs() * 0.026, 0.0) * pose.bob_amp;
+    let rest = Vec3::new(0.0, -0.55 * pose.equip * pose.equip, 0.0) + sway;
+    // a stroke: forward, down and in towards the middle of the screen, then back
+    let t = pose.swing.clamp(0.0, 1.0);
+    let k = (t * PI).sin();
+    let k2 = (t.sqrt() * PI).sin();
+    let reach = Vec3::new(-0.24 * k2, 0.1 * (t.sqrt() * PI * 2.0).sin() - 0.06 * k, -0.14 * k);
+    let stroke = |pivot: Vec3| {
+        Mat4::from_translation(pivot + rest + reach) * Mat4::from_rotation_y(0.55 * k2) * Mat4::from_rotation_x(-0.9 * k) * Mat4::from_rotation_z(0.25 * k) * Mat4::from_translation(-pivot)
+    };
+    if item == AIR {
+        // the bare arm: thick and square, its fist low on the right
+        let (shoulder, fist) = (Vec3::new(0.98, -1.2, -0.42), Vec3::new(0.5, -0.4, -1.0));
+        let m = stroke(fist);
+        let w = fist - shoulder;
+        // turned so its top and inner side face the eye
+        let u0 = w.cross(Vec3::new(-0.5, 0.35, 1.0)).normalize();
+        let v0 = u0.cross(w).normalize();
+        // (a quarter turn about its length, so two faces show and the arm reads as a block)
+        let (u, v) = ((u0 + v0) * std::f32::consts::FRAC_1_SQRT_2, (v0 - u0) * std::f32::consts::FRAC_1_SQRT_2);
+        let r = 0.12;
+        for (from, to, layer) in [(0.0, 0.5, textures::ARM_TEX as u32 + 1), (0.5, 1.0, textures::ARM_TEX as u32)] {
+            let o = shoulder + w * from - (u + v) * r;
             let part = Mat4::from_cols((u * 2.0 * r).extend(0.0), (w * (to - from)).extend(0.0), (v * 2.0 * r).extend(0.0), o.extend(1.0));
             cube(m * part, &|_| layer);
         }
-    };
-    let k = (swing * std::f32::consts::PI).sin();
-    let shoulder = Vec3::new(0.6, -0.72, -0.2);
-    let fist = Vec3::new(0.33, -0.27, -0.62);
-    // a stroke turns the arm, and what it holds, forward and inward about the shoulder
-    let stroke = Mat4::from_translation(shoulder) * Mat4::from_rotation_x(-0.45 * k) * Mat4::from_rotation_y(0.3 * k) * Mat4::from_translation(-shoulder);
-    arm(Mat4::IDENTITY, Vec3::new(-0.6, -0.72, -0.2), Vec3::new(-0.38, -0.36, -0.62));
-    arm(stroke, shoulder, fist);
-    if item == AIR {
         return;
     }
     if held_as_cube(item) {
-        let m = stroke * Mat4::from_translation(fist + Vec3::new(-0.01, 0.05, 0.0)) * Mat4::from_rotation_y(0.6) * Mat4::from_rotation_x(0.12) * Mat4::from_scale(Vec3::splat(0.15)) * Mat4::from_translation(Vec3::new(-0.5, 0.0, -0.5));
+        // a small block, turned so its top and two sides show
+        let at = Vec3::new(0.6, -0.5, -1.05);
+        let m = stroke(at) * Mat4::from_translation(at) * Mat4::from_rotation_x(0.5) * Mat4::from_rotation_y(0.78) * Mat4::from_scale(Vec3::splat(0.3)) * Mat4::from_translation(Vec3::splat(-0.5));
         cube(m, &|f| tex_for(item, f));
         return;
     }
-    // tools are drawn corner to corner, handle at the lower left: stood on end, the
-    // handle goes down into the fist; anything else is held by the middle of its base
+    // icons: tools and weapons are drawn handle at the lower left, head at the upper
+    // right; they are held by the handle with the head up, leaning in and away. Other
+    // things are held upright by the middle of their base, turned a little.
     let tool = items::max_wear(item) > 0 && items::armor(item).is_none();
-    let (grip, roll, size) = if tool { (Vec3::new(0.2, 0.2, 0.0), 0.95, 0.44) } else { (Vec3::new(0.5, 0.06, 0.0), 0.0, 0.3) };
-    let m = stroke
-        * Mat4::from_translation(fist + Vec3::new(0.0, 0.03, 0.0))
-        * Mat4::from_rotation_y(-0.95)
-        * Mat4::from_rotation_x(-0.3)
-        * Mat4::from_rotation_z(roll)
-        * Mat4::from_scale(Vec3::splat(size))
-        * Mat4::from_translation(-grip);
+    let (grip, size, at, d, n) = if tool {
+        (Vec3::new(0.22, 0.22, 0.0), 0.6, Vec3::new(0.62, -0.6, -1.0), Vec3::new(-0.22, 0.9, -0.38), Vec3::new(-0.8, 0.1, 0.6))
+    } else {
+        (Vec3::new(0.5, 0.0, 0.0), 0.42, Vec3::new(0.6, -0.56, -1.0), Vec3::new(0.5, 0.82, -0.25), Vec3::new(-0.4, 0.1, 0.9))
+    };
+    let (ax, ay, az) = item_basis(d, n);
+    let place = Mat4::from_cols((ax * size).extend(0.0), (ay * size).extend(0.0), (az * size).extend(0.0), at.extend(1.0));
+    let m = stroke(at) * place * Mat4::from_translation(-grip);
     for q in model {
         for i in 0..4 {
-            out.push(ItemVert { pos: (view * m.transform_point3(q.p[i])).into(), uv: q.uv[i], layer: q.layer, light: q.light, sky });
+            out.push(ItemVert { pos: put(m.transform_point3(q.p[i])).into(), uv: q.uv[i], layer: q.layer, light: q.light, sky });
         }
     }
 }
@@ -835,7 +890,7 @@ impl Game {
         let (font, atlas) = Font::bake(ui_scale(gfx.size().1));
         gfx.upload_font(&atlas);
 
-        let Loaded { world, mut player, mut inv, sel, health, food, air, mut time, spawn, pickups, chests, furnaces, mut mode, save_dir, level, xp, mut weather } = load_world(seed, settings.view_dist, save, Mode::Survival);
+        let Loaded { world, mut player, mut inv, sel, health, food, air, mut time, spawn, pickups, chests, furnaces, mut mode, save_dir, level, xp, mut weather, boats } = load_world(seed, settings.view_dist, save, Mode::Survival);
         // CUBEWILD_RAIN=rain|storm|clear sets the weather (for testing)
         match env("CUBEWILD_RAIN").as_deref() {
             Some("clear") => (weather.want, weather.rain, weather.storm) = (0.0, 0.0, false),
@@ -979,6 +1034,11 @@ impl Game {
             smoke_t: 0.0,
             landings: Vec::new(),
             biome_t: 0.0,
+            equip: 0.0,
+            bob: (0.0, 0.0),
+            riding: None,
+            boats,
+            paddle_t: 0.0,
         };
         // developer hook: start a new world at once, as the title screen's buttons do
         if let Some(v) = env("CUBEWILD_NEW") {
@@ -1004,6 +1064,8 @@ impl Game {
         self.furnaces = l.furnaces;
         (self.level, self.xp) = (l.level, l.xp);
         self.weather = l.weather;
+        self.boats = l.boats;
+        self.riding = None;
         self.orbs = Orbs::default();
         self.particles = Particles::default();
         self.mode = l.mode;
@@ -1073,6 +1135,7 @@ impl Game {
         self.pickups.save(&d.join("drops.txt"));
         loot::save_chests(&self.chests, &d.join("chests.txt"));
         furnace::save(&self.furnaces, &d.join("furnaces.txt"));
+        self.boats.save(&d.join("boats.txt"));
     }
 
     fn save(&self) {
@@ -1186,6 +1249,7 @@ impl Game {
     /// Everything carried and worn falls to the ground where the player died.
     fn die(&mut self) {
         self.health = 0.0;
+        self.riding = None;
         let at = self.player.pos + Vec3::Y * 0.9;
         // some of the experience is left behind, the rest is lost
         let keep = (self.level * 4).min(60);
@@ -1204,7 +1268,7 @@ impl Game {
             return true;
         }
         let (boxes, n) = self.world.shape_at(b, q.x, q.y, q.z);
-        let (lo, hi) = (self.player.pos - Vec3::new(PLAYER_HW, 0.0, PLAYER_HW), self.player.pos + Vec3::new(PLAYER_HW, PLAYER_H, PLAYER_HW));
+        let (lo, hi) = (self.player.pos - Vec3::new(PLAYER_HW, 0.0, PLAYER_HW), self.player.pos + Vec3::new(PLAYER_HW, self.player.height(), PLAYER_HW));
         boxes[..n].iter().all(|bx| {
             let (min, max) = (Vec3::new(bx[0], bx[1], bx[2]), Vec3::new(bx[3], bx[4], bx[5]));
             !(hi.cmpgt(min).all() && lo.cmplt(max).all()) && !self.mobs.blocks_box(min, max)
@@ -1323,6 +1387,7 @@ impl Game {
 
     /// Experience a slain creature leaves.
     fn kill_xp(&mut self, kind: mobs::Kind, at: Vec3) {
+        self.audio.play_var(Snd::Voice(kind, audio::Call::Death), at + Vec3::Y, 0.9);
         let n = match kind {
             mobs::Kind::Villager => 0,
             mobs::Kind::Hare => 1,
@@ -1335,33 +1400,19 @@ impl Game {
         }
     }
 
-    /// The voice of a creature.
+    /// The everyday call of a creature.
     fn mob_voice(kind: mobs::Kind) -> Snd {
-        use mobs::Kind as K;
-        match kind {
-            K::Deer => Snd::Deer,
-            K::Boar => Snd::Boar,
-            K::Hare => Snd::Hare,
-            K::Wolf => Snd::Wolf,
-            K::Zombie => Snd::Zombie,
-            K::Skeleton => Snd::Skeleton,
-            K::Spider => Snd::Spider,
-            K::Slime => Snd::Slime,
-            K::Villager => Snd::Villager,
-        }
+        Snd::Voice(kind, audio::Call::Idle)
     }
 
     /// A blow lands on creature `i`: sound and sparks.
     fn mob_struck(&mut self, i: usize, at: Vec3) {
         let kind = self.mobs.list[i].kind;
         self.audio.play_var(Snd::Hit, at, 0.8);
-        let pitch = match kind {
-            mobs::Kind::Hare => 1.6,
-            mobs::Kind::Zombie | mobs::Kind::Boar => 0.7,
-            mobs::Kind::Slime => 1.3,
-            _ => 1.0,
-        };
-        self.audio.play_at(Snd::MobHurt, at, 0.6, pitch);
+        // the cry of the one hit (or its last, if the blow kills it: see `kill_xp`)
+        if self.mobs.alive(i) {
+            self.audio.play_var(Snd::Voice(kind, audio::Call::Hurt), at + Vec3::Y, 0.8);
+        }
         self.particles.sparks(&mut self.rng, at + Vec3::Y * 0.7, 8);
     }
 
@@ -1377,6 +1428,7 @@ impl Game {
     }
 
     fn respawn(&mut self) {
+        self.riding = None;
         self.player.pos = self.spawn;
         self.player.vel = Vec3::ZERO;
         self.player.flying = false;
@@ -1386,6 +1438,19 @@ impl Game {
         self.ready = false;
         self.unstick = true;
         self.goto(Screen::Play);
+    }
+
+    /// Steps out of the boat: on top of it if there is room, else beside it.
+    fn get_out(&mut self) {
+        let Some(i) = self.riding.take() else { return };
+        let b = self.boats.list[i].pos;
+        let fwd = boat::forward(self.boats.list[i].yaw);
+        let side = Vec3::new(fwd.z, 0.0, -fwd.x);
+        let spots = [b + Vec3::Y * boat::H, b + side * 1.2 + Vec3::Y * 0.6, b - side * 1.2 + Vec3::Y * 0.6, b + fwd * 1.5 + Vec3::Y * 0.6, b - fwd * 1.5 + Vec3::Y * 0.6];
+        let spot = spots.into_iter().find(|&p| !collides(&self.world, p, PLAYER_HW, PLAYER_H)).unwrap_or(b + Vec3::Y * 1.0);
+        self.player.pos = spot;
+        self.player.vel = Vec3::ZERO;
+        self.place_cd = 0.3;
     }
 
     /// Footsteps, landings, splashes and swimming strokes.
@@ -1558,6 +1623,33 @@ impl Game {
         let tool = self.inv.hot(self.sel);
         let block = self.target();
         let (damage, reach) = items::weapon(tool);
+        if let Some((i, t)) = self.boats.pick(o, d, reach) {
+            let nearer = block.map_or(true, |b| t < b.2) && self.mobs.pick(o, d, reach).map_or(true, |m| t < m.1);
+            if nearer {
+                self.mining = None;
+                if self.primary_cd <= 0.0 {
+                    self.primary_cd = 0.4;
+                    self.swing = SWING;
+                    let at = self.boats.list[i].pos;
+                    self.audio.play_var(Snd::Dig(audio::Surface::Wood), at, 0.8);
+                    let creative = self.mode == Mode::Creative;
+                    if self.boats.hit(i, if creative { 9.0 } else { 1.0 }) {
+                        self.boats.list.remove(i);
+                        self.riding = match self.riding {
+                            Some(r) if r == i => None,
+                            Some(r) if r > i => Some(r - 1),
+                            r => r,
+                        };
+                        self.audio.play_var(Snd::Break(audio::Surface::Wood), at, 0.9);
+                        self.particles.chips(&mut self.rng, at.floor().as_ivec3(), [168, 124, 72], 14);
+                        if !creative {
+                            self.spill(at + Vec3::Y * 0.4, items::BOAT, 1);
+                        }
+                    }
+                }
+                return;
+            }
+        }
         if let Some((i, t)) = self.mobs.pick(o, d, reach) {
             if block.map_or(true, |b| t < b.2) {
                 self.mining = None;
@@ -1727,6 +1819,42 @@ impl Game {
             self.swing = SWING;
         }
         let target = self.target();
+        // get into a boat in reach (unless a block is nearer)
+        if self.riding.is_none() {
+            if let Some((i, t)) = self.boats.pick(self.player.eye(), self.player.look_dir(), 4.0) {
+                if target.map_or(true, |b| t < b.2) {
+                    self.riding = Some(i);
+                    self.player.vel = Vec3::ZERO;
+                    self.player.swimming = false;
+                    self.place_cd = 0.4;
+                    self.say("Shift to get out".into());
+                    return;
+                }
+            }
+        }
+        if item == items::BOAT {
+            // on water if the crosshair finds some, otherwise on top of the block aimed at
+            let yaw = self.player.yaw;
+            let at = if let Some(w) = self.water_target(6.0) {
+                // (the top of the water: climb out of any water above the cell aimed at)
+                let mut y = w.y;
+                while self.world.get_block(w.x, y + 1, w.z) == WATER {
+                    y += 1;
+                }
+                Some(Vec3::new(w.x as f32 + 0.5, y as f32 + 0.9, w.z as f32 + 0.5))
+            } else {
+                target.filter(|t| t.1.y == 1).map(|(p, _, _)| p.as_vec3() + Vec3::new(0.5, 1.0, 0.5))
+            };
+            match at {
+                Some(at) if !collides(&self.world, at + Vec3::Y * 0.05, boat::HW, boat::H) => {
+                    self.boats.place(at, yaw);
+                    self.spend();
+                    self.audio.play_var(Snd::Splash, at, 0.4);
+                }
+                _ => self.say("A boat goes on water, or on top of a block".into()),
+            }
+            return;
+        }
         // sneak to place a block against a door, chest or trapdoor instead of using it
         let sneak = self.keys.contains(&KeyCode::ShiftLeft);
         // use the block you are looking at
@@ -2016,7 +2144,11 @@ impl Game {
         } else {
             (p.pos, p.yaw, p.pitch) = (Vec3::new(ox as f32 - 2.6, y0 as f32 + 0.01, oz as f32 + 2.2), 1.35, -0.05);
         }
-        if let Some((y, t)) = std::env::var("CUBEWILD_LOOK").ok().and_then(|v| v.split_once(',').and_then(|(y, t)| Some((y.parse().ok()?, t.parse().ok()?)))) {
+        if std::env::var_os("CUBEWILD_TEST_BOAT").is_some() {
+            // a boat on the yard in front of the hut
+            self.boats.place(Vec3::new(ox as f32 - 0.5, y0 as f32, oz as f32 + 4.5), 0.6);
+        }
+                if let Some((y, t)) = std::env::var("CUBEWILD_LOOK").ok().and_then(|v| v.split_once(',').and_then(|(y, t)| Some((y.parse().ok()?, t.parse().ok()?)))) {
             (p.yaw, p.pitch) = (y, t);
         }
         true
@@ -2028,7 +2160,7 @@ impl Game {
         let q = shape_boxes(b, |_, _| AIR).0[0];
         let min = p.as_vec3() + Vec3::new(q[0], 0.0, q[2]);
         let max = p.as_vec3() + Vec3::new(q[3], 2.0, q[5]);
-        let (lo, hi) = (self.player.pos - Vec3::new(PLAYER_HW, 0.0, PLAYER_HW), self.player.pos + Vec3::new(PLAYER_HW, PLAYER_H, PLAYER_HW));
+        let (lo, hi) = (self.player.pos - Vec3::new(PLAYER_HW, 0.0, PLAYER_HW), self.player.pos + Vec3::new(PLAYER_HW, self.player.height(), PLAYER_HW));
         (hi.cmpgt(min).all() && lo.cmplt(max).all()) || self.mobs.blocks_box(min, max)
     }
 
@@ -2149,6 +2281,7 @@ impl Game {
                 });
             }
             Action::ToggleFps => self.settings.show_fps = !self.settings.show_fps,
+            Action::ToggleBob => self.settings.bobbing = !self.settings.bobbing,
             Action::Scale(v) => {
                 self.settings.render_scale = v;
                 self.gfx.set_scale(v);
@@ -2421,8 +2554,30 @@ impl Game {
             self.time = (self.time + dt / DAY_SECS).rem_euclid(1.0);
             let fall_speed = -self.player.vel.y;
             let before = self.player.pos;
-            self.player.update(&self.world, &input, dt);
-            self.feet(&input, before, fall_speed, dt);
+            let ridden = self.riding.map(|i| (i, &input));
+            let turned = self.boats.update(&self.world, self.player.pos, ridden, dt);
+            if let Some(i) = self.riding {
+                // sitting in the boat: the view turns with it, Shift gets out
+                let b = &self.boats.list[i];
+                let (bpos, bvel, on_water) = (b.pos, b.vel, b.on_water);
+                self.player.yaw += turned;
+                self.player.pos = bpos + Vec3::Y * 0.05 - Vec3::Y * 0.6;
+                self.player.vel = bvel;
+                self.player.on_ground = false;
+                self.player.impact = 0.0;
+                let moving = Vec3::new(bvel.x, 0.0, bvel.z).length() > 0.8;
+                self.paddle_t -= dt;
+                if on_water && moving && self.paddle_t <= 0.0 {
+                    self.paddle_t = 0.8;
+                    self.audio.play_var(Snd::Swim, bpos, 0.35);
+                }
+                if input.sneak {
+                    self.get_out();
+                }
+            } else {
+                self.player.update(&self.world, &input, dt);
+                self.feet(&input, before, fall_speed, dt);
+            }
             // (a thunderstorm is as dark as night to the monsters)
             let night = self.sun().1 < 0.3 || (self.weather.storm && self.weather.rain > 0.5);
             if self.test_house.is_some_and(|inside| self.build_test_house(inside)) {
@@ -2518,7 +2673,7 @@ impl Game {
                 if a.hostile {
                     // a skeleton's arrow: only the player is in danger
                     let p = self.player.pos;
-                    let (min, max) = (p - Vec3::new(PLAYER_HW, 0.0, PLAYER_HW), p + Vec3::new(PLAYER_HW, PLAYER_H, PLAYER_HW));
+                    let (min, max) = (p - Vec3::new(PLAYER_HW, 0.0, PLAYER_HW), p + Vec3::new(PLAYER_HW, self.player.height(), PLAYER_HW));
                     if player::ray_aabb(a.pos, step / len, min, max).is_some_and(|t| t <= len) {
                         if self.bench.is_none() {
                             self.strike(3.0);
@@ -2601,12 +2756,32 @@ impl Game {
         let underwater = self.player.eye_in_water(&self.world);
         let view_dist = self.world.radius as f32 * CW as f32;
         // sprinting widens the view a little
-        let running = input.sprint && (input.forward != 0.0 || input.right != 0.0) && !self.player.in_water && self.player.vel.length() > 5.0;
+        let running = input.sprint && self.riding.is_none() && (input.forward != 0.0 || input.right != 0.0) && !self.player.in_water && self.player.vel.length() > 5.0;
         let k = 1.0 - (-dt * 10.0).exp();
         self.sprint_fov += (running as u8 as f32 - self.sprint_fov) * k;
         let fov = self.settings.fov * (1.0 + 0.12 * self.sprint_fov);
         let proj = perspective(fov.to_radians(), w as f32 / h as f32, 0.08, view_dist * 1.6 + 64.0);
-        let vp = proj * look_to(dir);
+        // view bobbing: the camera rises and falls a little with each step
+        self.equip = (self.equip - dt * 5.0).max(0.0);
+        let pl = &self.player;
+        let speed = Vec3::new(pl.vel.x, 0.0, pl.vel.z).length();
+        let walking = pl.on_ground && !pl.flying && !pl.in_water && self.riding.is_none() && playing;
+        let want = if walking { (speed / 4.4).min(1.3) } else { 0.0 };
+        self.bob.1 += (want - self.bob.1) * (1.0 - (-dt * 8.0).exp());
+        if walking {
+            self.bob.0 = (self.bob.0 + speed * dt * 0.52) % 2.0;
+        }
+        let cam_bob = if self.settings.bobbing {
+            let ph = self.bob.0 * std::f32::consts::PI;
+            let side = dir.cross(Vec3::Y).normalize_or(Vec3::X);
+            (side * ph.sin() * 0.035 - Vec3::Y * ph.sin().abs() * 0.055) * self.bob.1
+        } else {
+            Vec3::ZERO
+        };
+        if !self.settings.bobbing {
+            self.bob.1 = 0.0;
+        }
+        let vp = proj * look_to(dir) * Mat4::from_translation(-cam_bob);
         let (r0, r1, r2, r3) = (vp.row(0), vp.row(1), vp.row(2), vp.row(3));
         let planes: [Vec4; 5] = [r3 + r0, r3 - r0, r3 + r1, r3 - r1, r2];
 
@@ -2701,6 +2876,7 @@ impl Game {
         }
         let right = dir.cross(Vec3::Y).normalize_or(Vec3::X);
         let up = right.cross(dir);
+        self.boats.draw(&mut ents, eye);
         self.particles.draw(&mut ents, eye, right, up);
         self.orbs.draw(&mut ents, eye, right, up);
         self.weather.track(&self.world, eye);
@@ -2722,8 +2898,15 @@ impl Game {
         if playing && self.bench.is_none() {
             if self.hand_model.0 != held {
                 self.hand_model = (held, if held == AIR || held_as_cube(held) { Vec::new() } else { icon_model(held) });
+                self.equip = 1.0;
             }
-            push_hand(&mut item_verts, dir, held, &self.hand_model.1, (self.swing / SWING).clamp(0.0, 1.0), [0.2, 0.52, 1.0][eye_sky as usize]);
+            let pose = HandPose {
+                swing: if self.swing > 0.0 { 1.0 - self.swing / SWING } else { 0.0 },
+                equip: self.equip,
+                bob: self.bob.0,
+                bob_amp: self.bob.1,
+            };
+            push_hand(&mut item_verts, dir, held, &self.hand_model.1, pose, [0.2, 0.52, 1.0][eye_sky as usize], cam_bob);
         }
         let mut sky = std::mem::take(&mut self.sky);
         sky.clear();
@@ -3003,7 +3186,7 @@ impl Game {
                 }
                 Screen::Settings => {
                     ui.rect(0.0, 0.0, wf, hf, [6, 10, 16, 150]);
-                    let (pw, ph) = ((700.0 * s).round(), (770.0 * s).round());
+                    let (pw, ph) = ((700.0 * s).round(), (830.0 * s).round());
                     let (px, py) = ((cx - pw * 0.5).round(), (cy - ph * 0.5).round());
                     let top = ui.panel(px, py, pw, ph, "Settings");
                     let row = (60.0 * s).round();
@@ -3062,6 +3245,7 @@ impl Game {
                         ("Fullscreen", "Also toggled with F11", st.fullscreen, Action::ToggleFullscreen),
                         ("Hold 120 FPS", "Shortens the view distance automatically when needed", st.auto_scale, Action::ToggleAuto),
                         ("Show FPS", "Frame counter in the corner", st.show_fps, Action::ToggleFps),
+                        ("View bobbing", "The camera sways as you walk", st.bobbing, Action::ToggleBob),
                     ] {
                         row_label(&mut ui, y, tx, name, hint, if on { "On" } else { "Off" });
                         if ui.toggle(tx, y + 14.0 * s, tw, (30.0 * s).round(), on) {

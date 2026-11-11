@@ -1091,6 +1091,20 @@ fn item_pixel(item: usize, x: i32, y: i32) -> [u8; 4] {
                 shade(c, 0.92 + n * 0.1)
             }
         }
+        74 => {
+            // boat, from the side: a hull narrowing to the keel, a seat, an oar
+            let c = [168.0, 124.0, 72.0];
+            let hull = (7..=11).contains(&y) && x >= 1 + (y - 8).max(0) && x <= 14 - (y - 8).max(0);
+            if hull {
+                shade(c, if y == 7 { 1.08 } else if y == 11 { 0.6 } else { 0.85 + n * 0.12 })
+            } else if y == 6 && (x == 1 || x == 14) {
+                shade(c, 1.0)
+            } else if (x + y == 13 || x + y == 14) && (3..=10).contains(&x) && y < 7 {
+                shade([120.0, 84.0, 48.0], 1.0)
+            } else {
+                NONE
+            }
+        }
         70..=73 => {
             // stairs seen from the side: three steps of the block's own texture
             let t = pixel(SHAPE_TEX[item - 70], x, y);
