@@ -735,6 +735,11 @@ impl Mobs {
         None
     }
 
+    /// Not dead (or dying).
+    pub fn alive(&self, i: usize) -> bool {
+        self.list[i].dead < 0.0
+    }
+
     /// True if the box overlaps an animal or monster.
     pub fn blocks_box(&self, min: Vec3, max: Vec3) -> bool {
         self.list.iter().any(|m| {

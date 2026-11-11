@@ -1,6 +1,6 @@
 //! Player movement, AABB-vs-voxel physics (shared with animals), and ray casting.
 
-use crate::world::{is_fence, is_ladder, is_shaped, is_solid, is_target, World, LAVA, WATER};
+use crate::world::{is_fence, is_ladder, is_shaped, is_solid, is_target, is_torch, World, LAVA, WATER};
 use glam::{IVec3, Vec3};
 
 pub fn collides(world: &World, pos: Vec3, hw: f32, h: f32) -> bool {
@@ -151,7 +151,7 @@ pub fn raycast_with(world: &World, o: Vec3, d: Vec3, max: f32, hit: impl Fn(u8) 
     while t <= max {
         let b = world.get_block(p.x, p.y, p.z);
         if hit(b) {
-            if !is_shaped(b) {
+            if !is_shaped(b) && !is_torch(b) {
                 return Some((p, normal, t));
             }
             // doors, slabs and the like are only hit where they actually are: you can
@@ -227,6 +227,7 @@ pub const PLAYER_HW: f32 = 0.3;
 pub const PLAYER_H: f32 = 1.8;
 const EYE: f32 = 1.62;
 
+#[derive(Clone)]
 pub struct Player {
     pub pos: Vec3,
     pub vel: Vec3,
@@ -324,6 +325,17 @@ impl Player {
             let k = 1.0 - (-dt * if self.on_ground { 14.0 } else { 3.5 }).exp();
             self.vel.x += (target.x - self.vel.x) * k;
             self.vel.z += (target.z - self.vel.z) * k;
+            if inp.sneak && self.on_ground {
+                // sneaking never steps off an edge: a move that would leave nothing
+                // under the feet is held back, one axis at a time
+                let held = |p: Vec3| collides(world, p - Vec3::Y * 0.6, PLAYER_HW, 0.55);
+                if !held(self.pos + Vec3::new(self.vel.x * dt, 0.0, 0.0)) {
+                    self.vel.x = 0.0;
+                }
+                if !held(self.pos + Vec3::new(0.0, 0.0, self.vel.z * dt)) {
+                    self.vel.z = 0.0;
+                }
+            }
             self.vel.y = (self.vel.y - 29.0 * dt).max(-55.0);
             if inp.jump && self.on_ground {
                 self.vel.y = 8.8;
@@ -393,6 +405,24 @@ mod tests {
         // standing heights
         let w = terrace(Some(SLAB));
         assert!(collides(&w, Vec3::new(3.5, 10.49, 0.5), 0.3, 1.8) && !collides(&w, Vec3::new(3.5, 10.5, 0.5), 0.3, 1.8));
+    }
+
+    #[test]
+    fn sneaking_stops_at_an_edge() {
+        // a ledge: ground up to x = 4, a drop beyond
+        let w = World::flat(move |x, y, _| (y <= 9 && x >= 4).then_some(AIR));
+        let run = |sneak: bool| {
+            let mut p = Player::new(Vec3::new(1.5, 10.0, 0.5));
+            p.yaw = std::f32::consts::FRAC_PI_2;
+            let inp = Input { forward: 1.0, sneak, ..Default::default() };
+            for _ in 0..(4.0 * 120.0) as usize {
+                p.update(&w, &inp, 1.0 / 120.0);
+            }
+            p.pos
+        };
+        let careful = run(true);
+        assert!(careful.y > 9.99 && careful.x < 4.0 + PLAYER_HW + 0.01, "{careful}");
+        assert!(run(false).y < 9.0);
     }
 
     #[test]

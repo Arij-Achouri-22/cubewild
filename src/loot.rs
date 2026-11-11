@@ -37,7 +37,7 @@ pub struct Pickups {
     pub list: Vec<Pickup>,
 }
 
-fn parse_stack(item: u32, n: u32, wear: u32) -> Option<Stack> {
+pub fn parse_stack(item: u32, n: u32, wear: u32) -> Option<Stack> {
     let item = u8::try_from(item).ok().filter(|&i| items::valid(i))?;
     (n > 0).then(|| Stack { item, n: n.min(items::max_stack(item)), wear: wear.min(items::max_wear(item).saturating_sub(1) as u32) as u16 })
 }
