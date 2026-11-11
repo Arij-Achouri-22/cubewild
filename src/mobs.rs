@@ -3,9 +3,10 @@
 
 use crate::gfx::{EntVert, EMISSIVE};
 use crate::items::{Item, ARROW, FIBER, FLINT, HIDE, IRON_INGOT, MEAT};
-use crate::player::{collides, move_collide, ray_aabb};
-use crate::world::{is_leaves, is_solid, World, CLAY, CLOTH, GRASS, SNOW, WATER};
-use glam::{Mat4, Vec3};
+use crate::path::{settle, walk_line, Body, Finder, Probe};
+use crate::player::{collides, move_step, ray_aabb, raycast_with};
+use crate::world::{is_ladder, is_leaves, is_solid, World, AIR, CLAY, CLOTH, GRASS, LAVA, SEA, SNOW, WATER};
+use glam::{IVec3, Mat4, Vec3};
 
 pub struct Rng(pub u64);
 impl Rng {
@@ -70,10 +71,11 @@ fn spec(k: Kind) -> Spec {
         Kind::Deer => sp(0.32, 1.5, 3, 1.3, 6.9, 9.0, 3, 2, 0.0, 0.0),
         Kind::Boar => sp(0.36, 0.9, 4, 1.1, 5.2, 0.0, 2, 1, 0.0, 0.0),
         Kind::Hare => sp(0.18, 0.5, 1, 1.6, 7.4, 6.0, 1, 1, 0.0, 0.0),
-        Kind::Wolf => sp(0.3, 0.85, 6, 1.5, 5.7, 0.0, 0, 1, 26.0, 3.0),
+        // slower than a walking player (4.4), and a bite costs one heart
+        Kind::Wolf => sp(0.3, 0.85, 6, 1.5, 4.0, 0.0, 0, 1, 26.0, 2.0),
         Kind::Zombie => sp(0.3, 1.8, 10, 0.9, 3.0, 0.0, 0, 0, 22.0, 3.0),
         Kind::Skeleton => sp(0.25, 1.8, 7, 1.6, 3.2, 0.0, 0, 0, 20.0, 0.0),
-        Kind::Spider => sp(0.45, 0.6, 5, 1.4, 5.6, 0.0, 0, 0, 16.0, 2.0),
+        Kind::Spider => sp(0.4, 0.6, 5, 1.4, 5.6, 0.0, 0, 0, 16.0, 2.0),
         Kind::Slime => sp(0.4, 0.7, 5, 2.2, 3.6, 0.0, 0, 0, 14.0, 2.0),
     }
 }
@@ -89,14 +91,12 @@ fn drops(k: Kind, rng: &mut Rng) -> Drops {
     }
 }
 
-/// True if nothing solid lies on the straight line from `a` to `b`.
+/// True if nothing solid lies on the straight line from `a` to `b` (an open doorway is
+/// clear, a window pane is not).
 fn clear_path(world: &World, a: Vec3, b: Vec3) -> bool {
     let d = b - a;
-    let n = (d.length() * 2.0).ceil() as i32;
-    (1..n).all(|i| {
-        let p = (a + d * (i as f32 / n as f32)).floor().as_ivec3();
-        !is_solid(world.get_block(p.x, p.y, p.z))
-    })
+    let len = d.length();
+    len < 1e-3 || raycast_with(world, a, d / len, len, is_solid).is_none()
 }
 
 pub struct Mob {
@@ -127,6 +127,17 @@ pub struct Mob {
     hop: f32,
     /// seconds until the sun next scorches the undead
     burn: f32,
+    /// cells still to walk through on the way to the player (used while `direct` is false)
+    path: Vec<IVec3>,
+    path_i: usize,
+    /// seconds until the route is planned again
+    repath: f32,
+    /// the straight line to the player is walkable: no path needed
+    direct: bool,
+    /// seconds for which the straight line is not trusted (it got the mob stuck)
+    distrust: f32,
+    /// a skeleton's line of sight to the player, checked when it plans
+    los: bool,
 }
 
 pub struct Mobs {
@@ -135,7 +146,13 @@ pub struct Mobs {
     pub shots: Vec<(Vec3, Vec3)>,
     rng: Rng,
     spawn_timer: f32,
+    finder: Finder,
+    /// the player is left alone (a creative world)
+    pub ignore: bool,
 }
+
+/// cells one route search may expand; with one search a frame this bounds the cost
+const PATH_BUDGET: usize = 320;
 
 const MAX_ANIMALS: usize = 12;
 const MAX_WOLVES: usize = 4;
@@ -145,7 +162,7 @@ const SAFE_LIGHT: f32 = 9.0;
 
 impl Mobs {
     pub fn new(seed: u64) -> Mobs {
-        Mobs { list: Vec::new(), shots: Vec::new(), rng: Rng(seed | 1), spawn_timer: 0.0 }
+        Mobs { list: Vec::new(), shots: Vec::new(), rng: Rng(seed | 1), spawn_timer: 0.0, finder: Finder::default(), ignore: false }
     }
 
     fn try_spawn(&mut self, world: &World, player: Vec3, night: bool) {
@@ -159,6 +176,40 @@ impl Mobs {
                 k if k.is_monster() => monsters += 1,
                 _ => animals += 1,
             }
+        }
+        // underground, where no daylight reaches, monsters turn up at any hour: more of
+        // them, and sooner, the deeper the player is
+        let (px, py, pz) = (player.x.floor() as i32, player.y.floor() as i32, player.z.floor() as i32);
+        if world.surface_y(px, pz).is_some_and(|top| top - py > 6) && world.sky_level(px, py, pz) == 0 {
+            let deep = ((SEA + 6 - py) as f32 / 36.0).clamp(0.0, 1.0);
+            if monsters < 3 + (deep * 9.0) as usize && self.rng.f() < 0.25 + 0.6 * deep {
+                for _ in 0..8 {
+                    let (dx, dz) = (self.rng.range(-22.0, 22.0), self.rng.range(-22.0, 22.0));
+                    if dx * dx + dz * dz < 81.0 {
+                        continue;
+                    }
+                    let (x, z) = ((player.x + dx).floor() as i32, (player.z + dz).floor() as i32);
+                    // the floor of whatever space lies there, near the player's level
+                    let y0 = py + (self.rng.next() % 13) as i32 - 6;
+                    let floor = (0..6).map(|k| y0 - k).find(|&y| {
+                        y > 1 && world.get_block(x, y, z) == AIR && world.get_block(x, y + 1, z) == AIR && is_solid(world.get_block(x, y - 1, z))
+                    });
+                    let Some(y) = floor else { continue };
+                    let pos = Vec3::new(x as f32 + 0.5, y as f32 + 0.01, z as f32 + 0.5);
+                    if world.sky_level(x, y, z) != 0 || !world.lights_near(pos, SAFE_LIGHT).is_empty() {
+                        continue;
+                    }
+                    let kind = match self.rng.next() % 10 {
+                        0..=3 => Kind::Zombie,
+                        4..=6 => Kind::Skeleton,
+                        7..=8 => Kind::Spider,
+                        _ => Kind::Slime,
+                    };
+                    self.add(kind, pos);
+                    break;
+                }
+            }
+            return;
         }
         let roll = self.rng.next() % 6;
         let kind = if night && monsters < MAX_MONSTERS && roll < 3 {
@@ -243,6 +294,12 @@ impl Mobs {
                 bite: 1.0,
                 hop: 0.0,
                 burn: self.rng.range(0.5, 1.5),
+                path: Vec::new(),
+                path_i: 0,
+                repath: self.rng.range(0.0, 0.5),
+                direct: true,
+                distrust: 0.0,
+                los: true,
             });
         }
     }
@@ -267,8 +324,13 @@ impl Mobs {
                 && m.pos.y > -10.0
                 && world.is_loaded(m.pos.x.floor() as i32, m.pos.z.floor() as i32)
         });
+        let ignore = self.ignore;
         let rng = &mut self.rng;
         let shots = &mut self.shots;
+        let finder = &mut self.finder;
+        let mut probe = Probe::new(world);
+        // route searches allowed this frame; the others wait their turn
+        let mut searches = 1;
         for m in &mut self.list {
             let s = spec(m.kind);
             m.age += dt;
@@ -278,6 +340,7 @@ impl Mobs {
             let mut speed = 0.0;
             // direction to look in when it differs from the direction of travel
             let mut face: Option<f32> = None;
+            let mut hunting = false;
             if m.dead < 0.0 && m.kind.undead() && !night {
                 m.burn -= dt;
                 if m.burn <= 0.0 {
@@ -302,18 +365,75 @@ impl Mobs {
                 m.bite -= dt;
                 m.hop -= dt;
                 // monsters are easier to slip past when sneaking; a wolf's nose is not fooled
-                let sight = if sneaking && m.kind.is_monster() { s.sight * 0.6 } else { s.sight };
-                let hunting = m.flee <= 0.0 && dist < sight;
+                let sight = if ignore {
+                    0.0
+                } else if sneaking && m.kind.is_monster() {
+                    s.sight * 0.6
+                } else {
+                    s.sight
+                };
+                hunting = m.flee <= 0.0 && dist < sight;
                 if hunting {
                     let toward = to_player.x.atan2(to_player.z);
-                    m.heading = toward;
                     m.grazing = false;
                     let flat = Vec3::new(to_player.x, 0.0, to_player.z).length();
+                    // plan the way there: straight if that works, otherwise round the obstacles
+                    m.repath -= dt;
+                    m.distrust -= dt;
+                    if m.repath <= 0.0 {
+                        let body = Body { tall: s.h.ceil() as i32, wide: s.hw * 2.0, drop: 4 };
+                        let mut get = |x, y, z| probe.get(x, y, z);
+                        // (standing on a slab counts as the cell above it)
+                        let cell = |p: Vec3| IVec3::new(p.x.floor() as i32, (p.y + 0.55).floor() as i32, p.z.floor() as i32);
+                        // (perched in the same cell as a door or window: start from beside it)
+                        let from = [(0.0, 0.0), (s.hw, 0.0), (-s.hw, 0.0), (0.0, s.hw), (0.0, -s.hw)]
+                            .into_iter()
+                            .find_map(|(ox, oz)| settle(&mut get, cell(m.pos + Vec3::new(ox, 0.0, oz)), body));
+                        match (from, settle(&mut get, cell(player), body)) {
+                            (Some(a), Some(b)) => {
+                                if m.distrust <= 0.0 && walk_line(&mut get, a, b, body) {
+                                    m.direct = true;
+                                    m.repath = rng.range(0.25, 0.4);
+                                } else if searches > 0 {
+                                    searches -= 1;
+                                    let reached = finder.find(&mut get, a, b, body, PATH_BUDGET, &mut m.path);
+                                    m.path_i = 0;
+                                    // a spider that finds no way round goes over instead
+                                    m.direct = m.path.is_empty() || (!reached && m.kind == Kind::Spider);
+                                    m.repath = rng.range(0.45, 0.75);
+                                }
+                            }
+                            // mid-air, or the player is: keep going as before
+                            _ => m.repath = 0.3,
+                        }
+                        if m.kind == Kind::Skeleton {
+                            m.los = clear_path(world, m.pos + Vec3::new(0.0, 1.35, 0.0), player + Vec3::new(0.0, 1.2, 0.0));
+                        }
+                    }
+                    // head for the next cell of the path, or straight at the player
+                    let mut pathing = false;
+                    m.heading = toward;
+                    // wide bodies have to line up with a gap more exactly
+                    let near = (0.55 - s.hw).clamp(0.15, 0.3);
+                    while !m.direct && m.path_i < m.path.len() {
+                        let wp = m.path[m.path_i];
+                        let (dx, dz, dy) = (wp.x as f32 + 0.5 - m.pos.x, wp.z as f32 + 0.5 - m.pos.z, m.pos.y - wp.y as f32);
+                        if dx * dx + dz * dz < near * near && dy > -0.6 && dy < 1.3 {
+                            m.path_i += 1;
+                            continue;
+                        }
+                        m.heading = dx.atan2(dz);
+                        pathing = true;
+                        break;
+                    }
+                    // stop at arm's length, but keep coming while the player is on another
+                    // level: down in a hole, or where the path still has a way to go
+                    let chase = flat > 1.0 || (to_player.y.abs() > 1.5 && (pathing || to_player.y < 0.0));
                     match m.kind {
                         Kind::Skeleton => {
-                            // keeps its distance and shoots
+                            // keeps its distance and shoots; comes round when it cannot see you
                             face = Some(toward);
-                            if flat > 13.0 {
+                            if flat > 13.0 || (!m.los && chase) {
                                 speed = s.run;
                             } else if flat < 6.0 {
                                 m.heading = toward + std::f32::consts::PI;
@@ -332,7 +452,7 @@ impl Mobs {
                             }
                         }
                         Kind::Spider => {
-                            if flat > 1.0 {
+                            if chase {
                                 speed = s.run;
                             }
                             // pounces from a few blocks away
@@ -344,7 +464,7 @@ impl Mobs {
                             }
                         }
                         _ => {
-                            if flat > 1.0 {
+                            if chase {
                                 speed = s.run;
                             }
                         }
@@ -399,17 +519,37 @@ impl Mobs {
             m.vel.z += (target.z - m.vel.z) * k;
 
             let b = m.pos.floor().as_ivec3();
-            let in_water = world.get_block(b.x, (m.pos.y + s.h * 0.5).floor() as i32, b.z) == WATER;
+            let around = world.get_block(b.x, (m.pos.y + s.h * 0.5).floor() as i32, b.z);
+            let in_water = around == WATER || around == LAVA;
+            if around == LAVA && m.dead < 0.0 {
+                // lava burns whatever blunders into it
+                m.burn -= dt;
+                if m.burn <= 0.0 {
+                    m.burn = 0.5;
+                    m.hp -= 2;
+                    m.hurt = 0.3;
+                    if m.hp <= 0 {
+                        m.dead = 0.0;
+                    }
+                }
+            }
             if in_water {
                 m.vel.y = (m.vel.y + 14.0 * dt).min(1.6);
             } else {
                 m.vel.y = (m.vel.y - 29.0 * dt).max(-50.0);
             }
-            let (ground, wall) = move_collide(world, &mut m.pos, &mut m.vel, s.hw, s.h, dt);
+            // on a ladder a mob slides down slowly, and climbs when it walks into the wall
+            let ladder = !in_water && is_ladder(world.get_block(b.x, (m.pos.y + 0.1).floor() as i32, b.z));
+            if ladder {
+                m.vel.y = m.vel.y.max(-2.6);
+            }
+            let (ground, wall) = move_step(world, &mut m.pos, &mut m.vel, s.hw, s.h, dt, m.on_ground);
             m.on_ground = ground;
             if wall && speed > 0.0 {
-                if m.kind == Kind::Spider {
-                    m.vel.y = 4.0; // spiders climb straight up walls
+                if ladder {
+                    m.vel.y = 2.6;
+                } else if m.kind == Kind::Spider && (m.direct || !hunting) {
+                    m.vel.y = 4.0; // spiders climb straight up walls (unless a path leads round)
                 } else if ground || in_water {
                     m.vel.y = 8.2; // hop up one block
                     m.stuck = m.stuck.saturating_add(1);
@@ -429,6 +569,11 @@ impl Mobs {
                 if m.stall > 0.7 {
                     m.stall = 0.0;
                     m.heading += rng.range(1.6, 4.6);
+                    if hunting {
+                        // the straight line snagged on something: search for a way round
+                        m.distrust = 4.0;
+                        m.repath = 0.0;
+                    }
                 }
             } else {
                 m.stall = 0.0;
@@ -491,9 +636,8 @@ impl Mobs {
         None
     }
 
-    /// True if a block at integer coords would overlap an animal.
-    pub fn blocks_cell(&self, x: i32, y: i32, z: i32) -> bool {
-        let (min, max) = (Vec3::new(x as f32, y as f32, z as f32), Vec3::new(x as f32 + 1.0, y as f32 + 1.0, z as f32 + 1.0));
+    /// True if the box overlaps an animal or monster.
+    pub fn blocks_box(&self, min: Vec3, max: Vec3) -> bool {
         self.list.iter().any(|m| {
             let s = spec(m.kind);
             m.pos.x + s.hw > min.x

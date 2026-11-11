@@ -2,22 +2,25 @@
 
 mod gfx;
 mod items;
+mod loot;
 mod mobs;
+mod path;
 mod player;
 mod textures;
 mod ui;
 mod world;
 
-use gfx::{ChunkMesh, EntVert, Frame, Gfx};
+use gfx::{ChunkMesh, EntVert, Frame, Gfx, ItemVert};
 use glam::{IVec3, Mat3, Mat4, Quat, Vec3, Vec4};
 use items::{Cat, Inventory, Item, Stack, CATS, RECIPES};
+use loot::{Chests, Pickups};
 use mobs::{push_box, Mobs, Rng};
 use player::{collides, raycast, raycast_with, Input, Player, PLAYER_H, PLAYER_HW};
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use ui::{Font, Pointer, Ui, ACCENT, BODY, DIM, HEAD, SMALL, TEXT, TITLE};
 use winit::application::ApplicationHandler;
 use winit::event::{DeviceEvent, DeviceId, ElementState, MouseButton, MouseScrollDelta, WindowEvent};
@@ -81,6 +84,8 @@ const MAX_HEALTH: f32 = 20.0;
 const MAX_FOOD: f32 = 20.0;
 const MAX_AIR: f32 = 10.0;
 /// recipe rows shown at once in the inventory
+/// seconds one swing of the held item takes
+const SWING: f32 = 0.28;
 const RECIPE_COLS: usize = 5;
 const RECIPE_ROWS: usize = 7;
 
@@ -167,6 +172,28 @@ fn item_stats(st: Stack) -> String {
         v.push(format!("Durability {}/{}", max - st.wear.min(max), max));
     }
     v.join("    ")
+}
+
+/// The name, kind, description and numbers of the item under the mouse.
+fn draw_tip(ui: &mut Ui, st: Stack, wf: f32, hf: f32) {
+    let (font, s) = (ui.font, ui.s);
+    let (px, py) = (ui.ptr.x, ui.ptr.y);
+    let (name, kind, desc, stats) = (items::name(st.item), items::kind(st.item), items::desc(st.item), item_stats(st));
+    let lines: Vec<(&str, usize, [u8; 4])> = [(name, BODY, ACCENT), (kind, SMALL, DIM), (desc, SMALL, TEXT), (stats.as_str(), SMALL, [150, 210, 255, 255])]
+        .into_iter()
+        .filter(|l| !l.0.is_empty())
+        .collect();
+    let tw = lines.iter().map(|l| font.width(l.1, l.0)).fold(0.0, f32::max) + 24.0 * s;
+    let th = lines.iter().map(|l| font.height(l.1) + 3.0 * s).sum::<f32>() + 14.0 * s;
+    let tx = (px + 18.0 * s).min(wf - tw - 4.0);
+    let mut ty = (py + 20.0 * s).min(hf - th - 4.0);
+    ui.rect(tx, ty, tw, th, [16, 14, 22, 246]);
+    ui.outline(tx, ty, tw, th, 1.0, ACCENT);
+    ty += 7.0 * s;
+    for (text, style, col) in lines {
+        ui.text(tx + 12.0 * s, ty, style, text, col);
+        ty += font.height(style) + 3.0 * s;
+    }
 }
 
 struct Arrow {
@@ -256,11 +283,15 @@ impl Settings {
 
 #[derive(Clone, Copy, PartialEq)]
 enum Screen {
+    /// choose or start a world
+    Title,
     Play,
     Pause,
     Settings,
     Controls,
     Inventory,
+    /// the chest at `Game::chest_at` is open
+    Chest,
     Dead,
 }
 
@@ -282,8 +313,22 @@ enum Action {
     PickRecipe(usize),
     /// slot index, right button
     Slot(usize, bool),
+    /// slot of the open chest, right button
+    ChestSlot(usize, bool),
+    /// throw the stack on the mouse out of the window
+    DropHeld,
     Sort,
     Respawn,
+    /// start a new world with a seed of its own
+    NewWorld(Mode),
+    /// play a saved world
+    Open(u32),
+    /// first click asks, the second deletes the saved world
+    Delete(u32),
+    /// save and go back to the title screen
+    ToTitle,
+    /// creative: take a full stack of an item (true = straight into the pack)
+    Take(Item, bool),
 }
 
 struct Bench {
@@ -299,6 +344,23 @@ struct Game {
     world: World,
     player: Player,
     mobs: Mobs,
+    mode: Mode,
+    /// saved worlds, for the title screen
+    worlds: Vec<WorldInfo>,
+    /// in the menus of the title screen, with no world entered yet
+    at_title: bool,
+    /// the world whose delete button was clicked once
+    confirm_delete: Option<u32>,
+    /// seconds left of the held item's swing
+    swing: f32,
+    /// the thick model of the held item's icon, rebuilt when the item changes
+    hand_model: (Item, Vec<HandQuad>),
+    /// seconds until lava burns the player again
+    lava_t: f32,
+    /// seconds since Space was last pressed (twice quickly toggles flight in creative)
+    last_jump: f32,
+    /// blocks broken just now drop nothing (creative)
+    quiet: bool,
     inv: Inventory,
     settings: Settings,
     screen: Screen,
@@ -342,8 +404,19 @@ struct Game {
     recipe_craftable: bool,
     shift: bool,
     arrows: Vec<Arrow>,
+    /// items lying in the world
+    pickups: Pickups,
+    chests: Chests,
+    /// the chest whose window is open
+    chest_at: IVec3,
+    item_verts: Vec<ItemVert>,
+    got: Vec<Stack>,
+    /// what was picked up lately, shown as one running line, and seconds until it resets
+    tally: (Vec<Stack>, f32),
     /// CUBEWILD_TEST_MOBS: line up one of each monster once the world is ready
     test_mobs: bool,
+    /// CUBEWILD_TEST_HOUSE: build a hut with doors and windows; true = start inside it
+    test_house: Option<bool>,
     /// water block being fished, seconds waited, seconds until the bite
     fishing: Option<(IVec3, f32, f32)>,
     grow_acc: f32,
@@ -365,14 +438,289 @@ fn data_dir(seed: u32) -> Option<PathBuf> {
 }
 
 fn find_spawn(seed: u32) -> Vec3 {
-    for i in 0..400 {
-        let x = i * 9;
-        let h = height_at(seed, x, 0);
-        if h > SEA + 2 && h < 78 {
-            return Vec3::new(x as f32 + 0.5, h as f32 + 2.0, 0.5);
+    let (x, h, z) = spawn_point(seed);
+    Vec3::new(x as f32 + 0.5, h as f32 + 2.0, z as f32 + 0.5)
+}
+
+/// Survival, or building freely: no damage or hunger, flight, endless blocks.
+#[derive(Clone, Copy, PartialEq)]
+enum Mode {
+    Survival,
+    Creative,
+}
+
+/// A saved world, as the title screen lists it.
+struct WorldInfo {
+    seed: u32,
+    mode: Mode,
+    when: SystemTime,
+}
+
+/// The worlds that have been played, the latest first.
+fn list_worlds() -> Vec<WorldInfo> {
+    let mut v = Vec::new();
+    let entries = user_dir(false).and_then(|d| std::fs::read_dir(d).ok());
+    for e in entries.into_iter().flatten().flatten() {
+        let name = e.file_name();
+        let Some(seed) = name.to_str().and_then(|n| n.strip_prefix("world-")).and_then(|n| n.parse::<u32>().ok()) else { continue };
+        let file = e.path().join("player.txt");
+        let Ok(text) = std::fs::read_to_string(&file) else { continue };
+        let mode = if text.lines().any(|l| l.trim() == "mode creative") { Mode::Creative } else { Mode::Survival };
+        let when = std::fs::metadata(&file).and_then(|m| m.modified()).unwrap_or(UNIX_EPOCH);
+        v.push(WorldInfo { seed, mode, when });
+    }
+    v.sort_by(|a, b| b.when.cmp(&a.when));
+    v
+}
+
+/// A seed no saved world uses yet, different on every call.
+fn fresh_seed() -> u32 {
+    let t = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0x1234_5678, |d| d.as_nanos() as u64);
+    let mut r = Rng((t ^ (std::process::id() as u64) << 40) | 1);
+    for _ in 0..8 {
+        r.next();
+    }
+    loop {
+        let seed = r.next() % 1_000_000_000;
+        let taken = user_dir(false).is_some_and(|d| d.join(format!("world-{seed}")).exists());
+        if seed != 0 && !taken {
+            return seed;
         }
     }
-    Vec3::new(0.5, 100.0, 0.5)
+}
+
+/// Everything that belongs to one world and its player.
+struct Loaded {
+    world: World,
+    player: Player,
+    inv: Inventory,
+    sel: usize,
+    health: f32,
+    food: f32,
+    air: f32,
+    time: f32,
+    spawn: Vec3,
+    pickups: Pickups,
+    chests: Chests,
+    mode: Mode,
+    save_dir: Option<PathBuf>,
+}
+
+/// Opens the world of a seed: from its save if there is one (which also decides the
+/// mode), otherwise new in `mode`. With `save` off nothing is read or written.
+fn load_world(seed: u32, view_dist: i32, save: bool, mode: Mode) -> Loaded {
+    let save_dir = if save { data_dir(seed) } else { None };
+    let world = World::new(seed, view_dist, save_dir.clone());
+    let mut spawn = find_spawn(seed);
+    let mut player = Player::new(spawn);
+    let mut inv = Inventory::new();
+    let mut mode = mode;
+    let mut sel = 0;
+    let (mut health, mut food, mut air, mut time) = (MAX_HEALTH, MAX_FOOD, MAX_AIR, 0.04f32);
+    if let Some(text) = save_dir.as_ref().and_then(|d| std::fs::read_to_string(d.join("player.txt")).ok()) {
+        for (n, line) in text.lines().enumerate() {
+            let mut parts = line.split_whitespace();
+            if n == 0 {
+                let v: Vec<f32> = parts.filter_map(|t| t.parse().ok()).collect();
+                if v.len() >= 5 {
+                    player.pos = Vec3::new(v[0], v[1], v[2]);
+                    player.yaw = v[3];
+                    player.pitch = v[4];
+                }
+                if v.len() >= 6 {
+                    inv.add(items::MEAT, v[5] as u32); // save from before inventories existed
+                }
+                continue;
+            }
+            match parts.next() {
+                Some("inv") => {
+                    // save from before the slot inventory
+                    for (id, c) in parts.filter_map(|t| t.split_once(':')) {
+                        if let (Ok(id), Ok(c)) = (id.parse::<u8>(), c.parse::<u32>()) {
+                            inv.add(id, c);
+                        }
+                    }
+                }
+                Some("hotbar") => {
+                    if let Some(v) = parts.nth(9).and_then(|t| t.parse::<usize>().ok()) {
+                        sel = v.min(8);
+                    }
+                }
+                Some("slots") => {
+                    for t in parts {
+                        let v: Vec<u32> = t.split(':').filter_map(|x| x.parse().ok()).collect();
+                        if v.len() >= 3 && (v[0] as usize) < items::SLOTS && v[1] < 256 && items::valid(v[1] as u8) && v[2] > 0 {
+                            let item = v[1] as u8;
+                            let slot = v[0] as usize;
+                            let wear = v.get(3).copied().unwrap_or(0).min(items::max_wear(item).saturating_sub(1) as u32) as u16;
+                            let st = Stack { item, n: v[2].min(items::max_stack(item)), wear };
+                            // armour saved before there were four slots goes back in the bag
+                            if slot < items::ARMOR || items::armor(item).is_some_and(|a| a.0 == slot - items::ARMOR) {
+                                inv.slots[slot] = st;
+                            } else {
+                                inv.add(item, st.n);
+                            }
+                        }
+                    }
+                }
+                Some("sel") => {
+                    if let Some(v) = parts.next().and_then(|t| t.parse::<usize>().ok()) {
+                        sel = v.min(8);
+                    }
+                }
+                Some("stats") => {
+                    let v: Vec<f32> = parts.filter_map(|t| t.parse().ok()).collect();
+                    if v.len() >= 4 {
+                        health = v[0].clamp(1.0, MAX_HEALTH);
+                        food = v[1].clamp(0.0, MAX_FOOD);
+                        air = v[2].clamp(0.0, MAX_AIR);
+                        time = v[3].rem_euclid(1.0);
+                    }
+                }
+                Some("mode") => {
+                    mode = if parts.next() == Some("creative") { Mode::Creative } else { Mode::Survival };
+                }
+                Some("spawn") => {
+                    let v: Vec<f32> = parts.filter_map(|t| t.parse().ok()).collect();
+                    if v.len() >= 3 {
+                        spawn = Vec3::new(v[0], v[1], v[2]);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let pickups = save_dir.as_ref().map_or_else(Pickups::default, |d| Pickups::load(&d.join("drops.txt")));
+    let chests = save_dir.as_ref().map_or_else(Chests::default, |d| loot::load_chests(&d.join("chests.txt")));
+    Loaded { world, player, inv, sel, health, food, air, time, spawn, pickups, chests, mode, save_dir }
+}
+
+/// One face of a held item's model: corners in the model's own space, texture
+/// coordinates, texture layer and a fixed shade.
+struct HandQuad {
+    p: [Vec3; 4],
+    uv: [[f32; 2]; 4],
+    layer: u32,
+    light: f32,
+}
+
+/// uv runs just inside the texture so the edge never wraps round
+const QUAD_UV: [[f32; 2]; 4] = [[0.01, 0.99], [0.99, 0.99], [0.99, 0.01], [0.01, 0.01]];
+/// the faces of the unit cube, in the order of `tex_for`
+const CUBE_FACES: [[(f32, f32, f32); 4]; 6] = [
+    [(1.0, 0.0, 0.0), (1.0, 0.0, 1.0), (1.0, 1.0, 1.0), (1.0, 1.0, 0.0)],
+    [(0.0, 0.0, 1.0), (0.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 1.0, 1.0)],
+    [(0.0, 1.0, 1.0), (1.0, 1.0, 1.0), (1.0, 1.0, 0.0), (0.0, 1.0, 0.0)],
+    [(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (1.0, 0.0, 1.0), (0.0, 0.0, 1.0)],
+    [(1.0, 0.0, 1.0), (0.0, 0.0, 1.0), (0.0, 1.0, 1.0), (1.0, 1.0, 1.0)],
+    [(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (1.0, 1.0, 0.0), (0.0, 1.0, 0.0)],
+];
+const FACE_SHADE: [f32; 6] = [0.80, 0.80, 1.0, 0.50, 0.66, 0.66];
+
+/// True for items held as a small block rather than as their icon.
+fn held_as_cube(item: Item) -> bool {
+    items::is_block(item) && !is_plant(item) && !is_shaped(item) && item != TORCH && item != GLASS
+}
+
+/// An item's icon given thickness, a sixteenth of its width: the picture on both sides,
+/// and a rim round every pixel that borders an empty one.
+fn icon_model(item: Item) -> Vec<HandQuad> {
+    let layer = items::icon(item);
+    let n = textures::TEX as i32;
+    let solid = |x: i32, y: i32| (0..n).contains(&x) && (0..n).contains(&y) && textures::texel(layer as usize, x, y)[3] >= 128;
+    let t = 0.5 / n as f32;
+    let mut v = Vec::new();
+    for (z, light) in [(t, 1.0), (-t, 0.8)] {
+        let p = [Vec3::new(0.0, 0.0, z), Vec3::new(1.0, 0.0, z), Vec3::new(1.0, 1.0, z), Vec3::new(0.0, 1.0, z)];
+        v.push(HandQuad { p, uv: QUAD_UV, layer, light });
+    }
+    for py in 0..n {
+        for px in 0..n {
+            if !solid(px, py) {
+                continue;
+            }
+            let f = |i: i32| i as f32 / n as f32;
+            // (the picture's first row is its top)
+            let (x0, x1, y0, y1) = (f(px), f(px + 1), 1.0 - f(py + 1), 1.0 - f(py));
+            let uv = [[(px as f32 + 0.5) / n as f32, (py as f32 + 0.5) / n as f32]; 4];
+            let mut rim = |p: [(f32, f32, f32); 4], light: f32| {
+                v.push(HandQuad { p: p.map(|(x, y, z)| Vec3::new(x, y, z)), uv, layer, light });
+            };
+            if !solid(px - 1, py) {
+                rim([(x0, y0, -t), (x0, y0, t), (x0, y1, t), (x0, y1, -t)], 0.7);
+            }
+            if !solid(px + 1, py) {
+                rim([(x1, y0, -t), (x1, y0, t), (x1, y1, t), (x1, y1, -t)], 0.7);
+            }
+            if !solid(px, py - 1) {
+                rim([(x0, y1, -t), (x1, y1, -t), (x1, y1, t), (x0, y1, t)], 0.9);
+            }
+            if !solid(px, py + 1) {
+                rim([(x0, y0, -t), (x1, y0, -t), (x1, y0, t), (x0, y0, t)], 0.55);
+            }
+        }
+    }
+    v
+}
+
+/// The player's arms at the bottom of the view and the selected item in the right fist:
+/// a tool stands up out of the fist by its handle, other things are held upright by
+/// their lower edge, a block rests on the fist. `swing` runs from 1 to 0 through a
+/// stroke; `model` is `icon_model` of the item (unused for blocks).
+fn push_hand(out: &mut Vec<ItemVert>, dir: Vec3, item: Item, model: &[HandQuad], swing: f32, sky: f32) {
+    // the view's own axes: x to the right, y up, z back towards the viewer
+    let right = dir.cross(Vec3::Y).normalize_or(Vec3::X);
+    let view = Mat3::from_cols(right, right.cross(dir), -dir);
+    let mut cube = |m: Mat4, layer: &dyn Fn(usize) -> u32| {
+        for (f, q) in CUBE_FACES.iter().enumerate() {
+            for (i, &(x, y, z)) in q.iter().enumerate() {
+                let pos = view * m.transform_point3(Vec3::new(x, y, z));
+                out.push(ItemVert { pos: pos.into(), uv: QUAD_UV[i], layer: layer(f), light: FACE_SHADE[f], sky });
+            }
+        }
+    };
+    // an arm is a box from the shoulder (out of view) to the fist: sleeve, then skin
+    let mut arm = |m: Mat4, a: Vec3, b: Vec3| {
+        let w = b - a;
+        let u = w.cross(Vec3::Z).normalize();
+        let v = u.cross(w).normalize();
+        for (from, to, r, layer) in [(0.0, 0.84, 0.068, textures::ARM_TEX as u32 + 1), (0.84, 1.0, 0.074, textures::ARM_TEX as u32)] {
+            let o = a + w * from - (u + v) * r;
+            let part = Mat4::from_cols((u * 2.0 * r).extend(0.0), (w * (to - from)).extend(0.0), (v * 2.0 * r).extend(0.0), o.extend(1.0));
+            cube(m * part, &|_| layer);
+        }
+    };
+    let k = (swing * std::f32::consts::PI).sin();
+    let shoulder = Vec3::new(0.6, -0.72, -0.2);
+    let fist = Vec3::new(0.33, -0.27, -0.62);
+    // a stroke turns the arm, and what it holds, forward and inward about the shoulder
+    let stroke = Mat4::from_translation(shoulder) * Mat4::from_rotation_x(-0.45 * k) * Mat4::from_rotation_y(0.3 * k) * Mat4::from_translation(-shoulder);
+    arm(Mat4::IDENTITY, Vec3::new(-0.6, -0.72, -0.2), Vec3::new(-0.38, -0.36, -0.62));
+    arm(stroke, shoulder, fist);
+    if item == AIR {
+        return;
+    }
+    if held_as_cube(item) {
+        let m = stroke * Mat4::from_translation(fist + Vec3::new(-0.01, 0.05, 0.0)) * Mat4::from_rotation_y(0.6) * Mat4::from_rotation_x(0.12) * Mat4::from_scale(Vec3::splat(0.15)) * Mat4::from_translation(Vec3::new(-0.5, 0.0, -0.5));
+        cube(m, &|f| tex_for(item, f));
+        return;
+    }
+    // tools are drawn corner to corner, handle at the lower left: stood on end, the
+    // handle goes down into the fist; anything else is held by the middle of its base
+    let tool = items::max_wear(item) > 0 && items::armor(item).is_none();
+    let (grip, roll, size) = if tool { (Vec3::new(0.2, 0.2, 0.0), 0.95, 0.44) } else { (Vec3::new(0.5, 0.06, 0.0), 0.0, 0.3) };
+    let m = stroke
+        * Mat4::from_translation(fist + Vec3::new(0.0, 0.03, 0.0))
+        * Mat4::from_rotation_y(-0.95)
+        * Mat4::from_rotation_x(-0.3)
+        * Mat4::from_rotation_z(roll)
+        * Mat4::from_scale(Vec3::splat(size))
+        * Mat4::from_translation(-grip);
+    for q in model {
+        for i in 0..4 {
+            out.push(ItemVert { pos: (view * m.transform_point3(q.p[i])).into(), uv: q.uv[i], layer: q.layer, light: q.light, sky });
+        }
+    }
 }
 
 fn ui_scale(h: u32) -> f32 {
@@ -391,8 +739,18 @@ impl Game {
         if let Some(d) = env("CUBEWILD_DIST").and_then(|v| v.parse().ok()) {
             settings.view_dist = d;
         }
-        let seed = env("CUBEWILD_SEED").and_then(|v| v.parse().ok()).unwrap_or(2026);
-        let save_dir = if bench.is_some() { None } else { data_dir(seed) };
+        // a seed given by hand goes straight to that world; otherwise the title screen
+        // opens over the world played last, or over a new one that is not saved yet
+        let env_seed: Option<u32> = env("CUBEWILD_SEED").and_then(|v| v.parse().ok());
+        let env_mode = env("CUBEWILD_MODE").map(|v| if v == "creative" { Mode::Creative } else { Mode::Survival });
+        let worlds = list_worlds();
+        let titled = env_seed.is_none() && bench.is_none();
+        let (seed, save) = match (env_seed, worlds.first()) {
+            (Some(s), _) => (s, bench.is_none()),
+            (None, _) if bench.is_some() => (2026, false),
+            (None, Some(w)) => (w.seed, true),
+            (None, None) => (fresh_seed(), false),
+        };
 
         if settings.fullscreen || std::env::args().any(|a| a == "--fullscreen") {
             settings.fullscreen = true;
@@ -404,81 +762,9 @@ impl Game {
         let (font, atlas) = Font::bake(ui_scale(gfx.size().1));
         gfx.upload_font(&atlas);
 
-        let world = World::new(seed, settings.view_dist, save_dir.clone());
-        let mut spawn = find_spawn(seed);
-        let mut player = Player::new(spawn);
-        let mut inv = Inventory::new();
-        let mut sel = 0;
-        let (mut health, mut food, mut air, mut time) = (MAX_HEALTH, MAX_FOOD, MAX_AIR, 0.04f32);
-        if let Some(text) = save_dir.as_ref().and_then(|d| std::fs::read_to_string(d.join("player.txt")).ok()) {
-            for (n, line) in text.lines().enumerate() {
-                let mut parts = line.split_whitespace();
-                if n == 0 {
-                    let v: Vec<f32> = parts.filter_map(|t| t.parse().ok()).collect();
-                    if v.len() >= 5 {
-                        player.pos = Vec3::new(v[0], v[1], v[2]);
-                        player.yaw = v[3];
-                        player.pitch = v[4];
-                    }
-                    if v.len() >= 6 {
-                        inv.add(items::MEAT, v[5] as u32); // save from before inventories existed
-                    }
-                    continue;
-                }
-                match parts.next() {
-                    Some("inv") => {
-                        // save from before the slot inventory
-                        for (id, c) in parts.filter_map(|t| t.split_once(':')) {
-                            if let (Ok(id), Ok(c)) = (id.parse::<u8>(), c.parse::<u32>()) {
-                                inv.add(id, c);
-                            }
-                        }
-                    }
-                    Some("hotbar") => {
-                        if let Some(v) = parts.nth(9).and_then(|t| t.parse::<usize>().ok()) {
-                            sel = v.min(8);
-                        }
-                    }
-                    Some("slots") => {
-                        for t in parts {
-                            let v: Vec<u32> = t.split(':').filter_map(|x| x.parse().ok()).collect();
-                            if v.len() >= 3 && (v[0] as usize) < items::SLOTS && v[1] < 256 && items::valid(v[1] as u8) && v[2] > 0 {
-                                let item = v[1] as u8;
-                                let slot = v[0] as usize;
-                                let wear = v.get(3).copied().unwrap_or(0).min(items::max_wear(item).saturating_sub(1) as u32) as u16;
-                                let st = Stack { item, n: v[2].min(items::max_stack(item)), wear };
-                                // armour saved before there were four slots goes back in the bag
-                                if slot < items::ARMOR || items::armor(item).is_some_and(|a| a.0 == slot - items::ARMOR) {
-                                    inv.slots[slot] = st;
-                                } else {
-                                    inv.add(item, st.n);
-                                }
-                            }
-                        }
-                    }
-                    Some("sel") => {
-                        if let Some(v) = parts.next().and_then(|t| t.parse::<usize>().ok()) {
-                            sel = v.min(8);
-                        }
-                    }
-                    Some("stats") => {
-                        let v: Vec<f32> = parts.filter_map(|t| t.parse().ok()).collect();
-                        if v.len() >= 4 {
-                            health = v[0].clamp(1.0, MAX_HEALTH);
-                            food = v[1].clamp(0.0, MAX_FOOD);
-                            air = v[2].clamp(0.0, MAX_AIR);
-                            time = v[3].rem_euclid(1.0);
-                        }
-                    }
-                    Some("spawn") => {
-                        let v: Vec<f32> = parts.filter_map(|t| t.parse().ok()).collect();
-                        if v.len() >= 3 {
-                            spawn = Vec3::new(v[0], v[1], v[2]);
-                        }
-                    }
-                    _ => {}
-                }
-            }
+        let Loaded { world, mut player, mut inv, sel, health, food, air, mut time, spawn, pickups, chests, mut mode, save_dir } = load_world(seed, settings.view_dist, save, Mode::Survival);
+        if let Some(m) = env_mode {
+            mode = m;
         }
         if let Some(t) = env("CUBEWILD_TIME").and_then(|v| v.parse::<f32>().ok()) {
             time = t.rem_euclid(1.0);
@@ -489,24 +775,49 @@ impl Game {
         }
         // developer hooks for checking the menus without playing
         if env("CUBEWILD_TEST_ITEMS").is_some() {
-            for (i, n) in [(TORCH, 16), (LOG, 12), (PLANKS, 7), (COBBLE, 5), (DIRT, 31), (SAND, 1), (items::STICK, 3), (items::MEAT, 4), (items::HIDE, 3), (items::STONE_PICK, 1), (items::SPEAR, 1), (LEAVES, 9), (items::STONE_AXE, 1), (items::WOOD_PICK, 1), (GLASS, 2), (STONE_BRICK, 8), (LEATHER, 1), (BRICK, 4), (items::COAL, 9), (IRON_ORE, 6), (items::IRON_INGOT, 5), (items::CRYSTAL, 4), (items::COOKED_MEAT, 3), (WORKBENCH, 1), (FURNACE, 1), (BED, 1), (LAMP, 2), (items::IRON_PICK, 1), (items::IRON_SWORD, 1), (CACTUS, 2), (SANDSTONE, 6), (BIRCH_LOG, 8), (GRAVEL, 7), (CLAY, 6), (GOLD_ORE, 4), (items::FIBER, 12), (items::BERRIES, 5), (MUSHROOM, 4), (FLOWER_RED, 3), (items::FLINT, 2), (items::LEATHER_CHEST, 1), (items::IRON_CHEST, 1), (items::IRON_HELMET, 1), (items::GOLD_LEGS, 1), (items::CRYSTAL_BOOTS, 1), (items::BOW, 1), (items::ARROW, 24), (items::FISHING_ROD, 1), (items::BUCKET, 1), (items::IRON_HOE, 1), (items::SEEDS, 9), (items::IRON_SHOVEL, 1), (items::SHEARS, 1), (items::COMPASS, 1), (items::CLOCK, 1), (items::WHEAT, 6), (items::CRYSTAL_SWORD, 1), (items::GOLD_INGOT, 8), (items::STEW, 1), (THATCH, 6)] {
+            for (i, n) in [(CHEST, 2), (items::LADDER, 8), (items::TRAPDOOR, 4), (items::STAIRS + 2, 12), (SLAB, 12), (FENCE, 12), (TORCH, 16), (items::OAK_DOOR, 6), (items::BIRCH_DOOR, 3), (PANE, 32), (LOG, 12), (PLANKS, 7), (COBBLE, 5), (DIRT, 31), (SAND, 1), (items::STICK, 3), (items::MEAT, 4), (items::HIDE, 3), (items::STONE_PICK, 1), (items::SPEAR, 1), (LEAVES, 9), (items::STONE_AXE, 1), (items::WOOD_PICK, 1), (GLASS, 2), (STONE_BRICK, 8), (LEATHER, 1), (BRICK, 4), (items::COAL, 9), (IRON_ORE, 6), (items::IRON_INGOT, 5), (items::CRYSTAL, 4), (items::COOKED_MEAT, 3), (WORKBENCH, 1), (FURNACE, 1), (BED, 1), (LAMP, 2), (items::IRON_PICK, 1), (items::IRON_SWORD, 1), (CACTUS, 2), (SANDSTONE, 6), (BIRCH_LOG, 8), (GRAVEL, 7), (CLAY, 6), (GOLD_ORE, 4), (items::FIBER, 12), (items::BERRIES, 5), (MUSHROOM, 4), (FLOWER_RED, 3), (items::FLINT, 2), (items::LEATHER_CHEST, 1), (items::IRON_CHEST, 1), (items::IRON_HELMET, 1), (items::GOLD_LEGS, 1), (items::CRYSTAL_BOOTS, 1), (items::BOW, 1), (items::ARROW, 24), (items::FISHING_ROD, 1), (items::BUCKET, 1), (items::IRON_HOE, 1), (items::SEEDS, 9), (items::IRON_SHOVEL, 1), (items::SHEARS, 1), (items::COMPASS, 1), (items::CLOCK, 1), (items::WHEAT, 6), (items::CRYSTAL_SWORD, 1), (items::GOLD_INGOT, 8), (items::STEW, 1), (THATCH, 6)] {
                 inv.add(i, n);
             }
+        }
+        if let Some(v) = env("CUBEWILD_AT") {
+            let c: Vec<f32> = v.split(',').filter_map(|t| t.trim().parse().ok()).collect();
+            if c.len() == 3 {
+                player.pos = Vec3::new(c[0], c[1], c[2]);
+            }
+            if let Some(a) = env("CUBEWILD_LOOK").and_then(|v| v.split_once(',').map(|(y, p)| (y.parse::<f32>(), p.parse::<f32>()))) {
+                (player.yaw, player.pitch) = (a.0.unwrap_or(0.0), a.1.unwrap_or(0.0));
+            }
+        }
+        if let Some(item) = env("CUBEWILD_HOLD").and_then(|v| v.parse::<u8>().ok()).filter(|&i| items::valid(i)) {
+            inv.slots[sel] = Stack::new(item, 1);
         }
         let first_screen = match env("CUBEWILD_SCREEN").as_deref() {
             Some("settings") => Screen::Settings,
             Some("controls") => Screen::Controls,
             Some("inventory") => Screen::Inventory,
+            Some("play" | "chest") => Screen::Play,
             _ if bench.is_some() => Screen::Play,
+            _ if titled => Screen::Title,
             _ => Screen::Pause,
         };
-        Game {
+        let mut mobs = Mobs::new(seed as u64 * 7919 + 17);
+        mobs.ignore = mode == Mode::Creative;
+        let mut game = Game {
             window,
             gfx,
             font: Rc::new(font),
             world,
             player,
-            mobs: Mobs::new(seed as u64 * 7919 + 17),
+            mobs,
+            mode,
+            worlds,
+            at_title: first_screen == Screen::Title,
+            confirm_delete: None,
+            swing: 0.0,
+            hand_model: (AIR, Vec::new()),
+            lava_t: 0.0,
+            last_jump: -1.0,
+            quiet: false,
             inv,
             settings,
             screen: first_screen,
@@ -549,14 +860,21 @@ impl Game {
             hurt_flash: 0.0,
             time,
             spawn,
-            unstick: false,
+            unstick: true,
             recipe_scroll: 0,
             recipe_tab: Cat::All,
             recipe_sel: 0,
             recipe_craftable: false,
             shift: false,
             arrows: Vec::new(),
+            pickups,
+            chests,
+            chest_at: IVec3::ZERO,
+            item_verts: Vec::new(),
+            got: Vec::new(),
+            tally: (Vec::new(), 0.0),
             test_mobs: env("CUBEWILD_TEST_MOBS").is_some(),
+            test_house: env("CUBEWILD_TEST_HOUSE").map(|v| v == "in"),
             fishing: None,
             grow_acc: 0.0,
             auto_cur: 20,
@@ -564,7 +882,66 @@ impl Game {
             auto_hold: 0.0,
             auto_backoff: 25.0,
             auto_raised: false,
+        };
+        // developer hook: start a new world at once, as the title screen's buttons do
+        if let Some(v) = env("CUBEWILD_NEW") {
+            game.enter(fresh_seed(), if v == "creative" { Mode::Creative } else { Mode::Survival });
         }
+        if env("CUBEWILD_AT").is_some() {
+            game.unstick = false;
+        }
+        game
+    }
+
+    /// Puts a loaded world in place of the current one.
+    fn install(&mut self, l: Loaded) {
+        let seed = l.world.seed;
+        self.world = l.world;
+        self.player = l.player;
+        self.inv = l.inv;
+        self.sel = l.sel;
+        (self.health, self.food, self.air, self.time) = (l.health, l.food, l.air, l.time);
+        self.spawn = l.spawn;
+        self.pickups = l.pickups;
+        self.chests = l.chests;
+        self.mode = l.mode;
+        self.save_dir = l.save_dir;
+        self.mobs = Mobs::new(seed as u64 * 7919 + 17);
+        self.mobs.ignore = self.mode == Mode::Creative;
+        self.arrows.clear();
+        self.mining = None;
+        self.fishing = None;
+        self.ready = false;
+        self.unstick = true;
+        self.started = false;
+        self.toast.1 = 0.0;
+        self.tally.1 = 0.0;
+        self.auto_cur = 20;
+        self.apply_dist();
+    }
+
+    /// Saves the current world and enters another: the saved one of that seed, or a
+    /// new one in `mode`.
+    fn enter(&mut self, seed: u32, mode: Mode) {
+        self.save();
+        self.install(load_world(seed, self.settings.view_dist, true, mode));
+        self.save_player();
+        self.goto(Screen::Play);
+    }
+
+    /// Removes a saved world from the disk.
+    fn delete_world(&mut self, seed: u32) {
+        if seed == self.world.seed {
+            // step out of it first: a new world that is not saved yet takes its place
+            self.world.save_all();
+            self.install(load_world(fresh_seed(), self.settings.view_dist, false, Mode::Survival));
+        }
+        if let Some(dir) = user_dir(false).map(|d| d.join(format!("world-{seed}"))) {
+            if let Err(e) = std::fs::remove_dir_all(&dir) {
+                eprintln!("cubewild: cannot delete {}: {e}", dir.display());
+            }
+        }
+        self.worlds = list_worlds();
     }
 
     fn save_player(&self) {
@@ -584,9 +961,12 @@ impl Game {
         s += &format!("\nsel {}\n", self.sel);
         s += &format!("stats {} {} {} {}\n", self.health, self.food, self.air, self.time);
         s += &format!("spawn {} {} {}\n", self.spawn.x, self.spawn.y, self.spawn.z);
+        s += if self.mode == Mode::Creative { "mode creative\n" } else { "mode survival\n" };
         if let Err(e) = std::fs::write(d.join("player.txt"), s) {
             eprintln!("cubewild: failed to save player: {e}");
         }
+        self.pickups.save(&d.join("drops.txt"));
+        loot::save_chests(&self.chests, &d.join("chests.txt"));
     }
 
     fn save(&self) {
@@ -596,6 +976,8 @@ impl Game {
     }
 
     fn goto(&mut self, screen: Screen) {
+        // from the title screen, the other menus lead back to it
+        let screen = if screen == Screen::Pause && self.at_title { Screen::Title } else { screen };
         if screen == Screen::Play {
             let ok = self
                 .window
@@ -607,17 +989,21 @@ impl Game {
             }
             self.window.set_cursor_visible(false);
             self.started = true;
+            self.at_title = false;
             self.auto_t = -3.0;
         } else {
             self.window.set_cursor_grab(CursorGrabMode::None).ok();
             self.window.set_cursor_visible(true);
             self.buttons = [false; 2];
             self.keys.clear();
-            if self.screen == Screen::Inventory {
+            if matches!(self.screen, Screen::Inventory | Screen::Chest) {
+                // what was on the mouse goes back in the pack, or on the ground
                 self.inv.stow_held();
+                let left = std::mem::take(&mut self.inv.held);
+                self.throw(left);
             }
             self.mining = None;
-            if self.screen == Screen::Play {
+            if matches!(self.screen, Screen::Play | Screen::Chest) {
                 self.save_player();
             }
         }
@@ -637,25 +1023,82 @@ impl Game {
         (self.world.get_block(hit.0.x, hit.0.y, hit.0.z) == WATER).then_some(hit.0)
     }
 
+    /// Uses up one of the held item, except in creative.
+    fn spend(&mut self) {
+        if self.mode == Mode::Survival {
+            self.inv.take_slot(self.sel);
+        }
+    }
+
     /// Spends one use of the held tool and reports it if it breaks.
     fn wear_held(&mut self) {
+        if self.mode == Mode::Creative {
+            return;
+        }
         let item = self.inv.hot(self.sel);
         if self.inv.wear_tool(self.sel) {
             self.say(format!("Your {} broke", items::name(item)));
         }
     }
 
-    fn loot(&mut self, drops: mobs::Drops) {
-        let mut got = Vec::new();
+    /// What a slain animal leaves behind, lying where it fell.
+    fn loot(&mut self, drops: mobs::Drops, at: Vec3) {
         for (item, n) in drops {
-            if n > 0 {
-                self.give(item, n);
-                got.push(format!("+{n} {}", items::name(item)));
-            }
+            self.spill(at + Vec3::Y * 0.5, item, n);
         }
-        if !got.is_empty() {
-            self.say(got.join("   "));
+    }
+
+    /// Drops items on the ground at `at` with a small hop.
+    fn spill(&mut self, at: Vec3, item: Item, n: u32) {
+        if self.quiet {
+            return;
         }
+        self.pickups.pop(&mut self.rng, at, Stack::new(item, n));
+    }
+
+    /// Throws a stack out in front of the player.
+    fn throw(&mut self, st: Stack) {
+        let d = self.player.look_dir();
+        self.pickups.spawn(self.player.eye() - Vec3::Y * 0.3 + d * 0.3, d * 6.0 + Vec3::Y * 1.5, st, 1.5);
+    }
+
+    /// Q: drops one of the held item, or the whole stack.
+    fn drop_selected(&mut self, all: bool) {
+        let st = self.inv.slots[self.sel];
+        if st.is_empty() {
+            return;
+        }
+        if all {
+            self.inv.slots[self.sel] = Stack::default();
+            self.throw(st);
+        } else {
+            self.inv.take_slot(self.sel);
+            self.throw(Stack { n: 1, ..st });
+        }
+    }
+
+    /// Everything carried and worn falls to the ground where the player died.
+    fn die(&mut self) {
+        self.health = 0.0;
+        let at = self.player.pos + Vec3::Y * 0.9;
+        let inv = std::mem::replace(&mut self.inv, Inventory::new());
+        for st in inv.slots.into_iter().chain([inv.held]) {
+            self.pickups.pop(&mut self.rng, at, st);
+        }
+        self.goto(Screen::Dead);
+    }
+
+    /// True if block `b` put at `q` would not cut into the player or a mob.
+    fn fits(&self, q: IVec3, b: Block) -> bool {
+        if !is_solid(b) {
+            return true;
+        }
+        let (boxes, n) = self.world.shape_at(b, q.x, q.y, q.z);
+        let (lo, hi) = (self.player.pos - Vec3::new(PLAYER_HW, 0.0, PLAYER_HW), self.player.pos + Vec3::new(PLAYER_HW, PLAYER_H, PLAYER_HW));
+        boxes[..n].iter().all(|bx| {
+            let (min, max) = (Vec3::new(bx[0], bx[1], bx[2]), Vec3::new(bx[3], bx[4], bx[5]));
+            !(hi.cmpgt(min).all() && lo.cmplt(max).all()) && !self.mobs.blocks_box(min, max)
+        })
     }
 
     /// View distance in use: the setting, or less while the frame rate needs help.
@@ -697,13 +1140,16 @@ impl Game {
     }
 
     fn say(&mut self, msg: String) {
+        self.tally.1 = 0.0;
         self.toast = (msg, 2.4);
     }
 
-    /// Adds items to the inventory, warning when it is full.
+    /// Adds items to the inventory; what does not fit lands at the player's feet.
     fn give(&mut self, item: Item, n: u32) {
-        if self.inv.add(item, n) > 0 {
+        let left = self.inv.add(item, n);
+        if left > 0 {
             self.say("Inventory full".into());
+            self.pickups.spawn(self.player.pos + Vec3::Y * 0.5, Vec3::ZERO, Stack::new(item, left), 1.5);
         }
     }
 
@@ -746,6 +1192,12 @@ impl Game {
             let d = (self.player.impact - 13.5) * 0.95;
             self.strike(d);
         }
+        // lava: two hearts every half second, whatever is worn
+        self.lava_t -= dt;
+        if self.player.in_lava && self.lava_t <= 0.0 {
+            self.lava_t = 0.5;
+            self.hurt(4.0);
+        }
         if self.player.eye_in_water(&self.world) {
             self.air -= dt;
             if self.air <= -1.0 {
@@ -785,10 +1237,12 @@ impl Game {
                 if self.primary_cd <= 0.0 {
                     self.primary_cd = 0.4;
                     self.hit_flash = 0.18;
+                    self.swing = SWING;
+                    let at = self.mobs.list[i].pos;
                     let dead = self.mobs.hit(i, self.player.pos, damage);
                     self.wear_held();
                     if let Some(drops) = dead {
-                        self.loot(drops);
+                        self.loot(drops, at);
                     }
                 }
                 return;
@@ -807,43 +1261,82 @@ impl Game {
             Some((mp, t)) if mp == p => t + dt,
             _ => 0.0,
         };
-        if progress >= items::break_time(b, tool) {
+        if self.swing <= 0.0 {
+            self.swing = SWING;
+        }
+        // creative breaks at once, a few blocks a second, and the blocks drop nothing
+        let creative = self.mode == Mode::Creative;
+        if creative && self.primary_cd > 0.0 {
+            return;
+        }
+        if creative || progress >= items::break_time(b, tool) {
             self.mining = None;
+            self.primary_cd = if creative { 0.22 } else { 0.0 };
             if self.world.set_block(&self.gfx, p.x, p.y, p.z, AIR) {
+                self.quiet = creative;
+                // what it gives falls where the block was
                 let drop = items::drop_for(b, tool);
+                let at = p.as_vec3() + 0.5;
                 match b {
-                    GRAVEL if self.rng.f() < 0.25 => self.give(items::FLINT, 1),
+                    GRAVEL if self.rng.f() < 0.25 => self.spill(at, items::FLINT, 1),
                     TALL_GRASS if tool != items::SHEARS => {
                         if self.rng.f() < 0.6 {
-                            self.give(items::FIBER, 1);
+                            self.spill(at, items::FIBER, 1);
                         }
                         if self.rng.f() < 0.3 {
-                            self.give(items::SEEDS, 1);
+                            self.spill(at, items::SEEDS, 1);
                         }
                     }
                     WHEAT_3 => {
-                        self.give(items::WHEAT, 1);
+                        self.spill(at, items::WHEAT, 1);
                         let seeds = 1 + (self.rng.f() < 0.5) as u32;
-                        self.give(items::SEEDS, seeds);
+                        self.spill(at, items::SEEDS, seeds);
                     }
-                    BERRY_BUSH => self.give(drop, 2),
-                    _ => self.give(drop, 1),
+                    BERRY_BUSH => self.spill(at, drop, 2),
+                    _ => self.spill(at, drop, 1),
                 }
                 if is_leaves(b) && self.rng.f() < 0.3 {
-                    self.give(items::STICK, 1);
+                    self.spill(at, items::STICK, 1);
                 }
-                if drop == AIR && items::tier_needed(b) > 0 {
+                if b == CHEST || b == LOOT_CHEST {
+                    // a broken chest spills what it held
+                    let held = if b == LOOT_CHEST { Some(loot::roll_chest(self.world.seed, p)) } else { self.chests.remove(&p) };
+                    for st in held.into_iter().flatten() {
+                        self.pickups.pop(&mut self.rng, at, st);
+                    }
+                }
+                if drop == AIR && items::tier_needed(b) > 0 && !creative {
                     let need = if items::tier_needed(b) >= 3 { "an iron" } else { "a stone" };
                     self.say(format!("{} needs {need} pickaxe or better", items::name(b)));
                 }
                 if !is_plant(b) && b != TORCH {
                     self.wear_held();
                 }
-                // torches and plants standing on the block come loose
-                let above = self.world.get_block(p.x, p.y + 1, p.z);
-                if (above == TORCH || is_plant(above)) && self.world.set_block(&self.gfx, p.x, p.y + 1, p.z, AIR) {
-                    self.give(items::drop_for(above, tool), 1);
+                if is_door(b) {
+                    // the other half goes with it
+                    let y = if door_upper(b) { p.y - 1 } else { p.y + 1 };
+                    if is_door(self.world.get_block(p.x, y, p.z)) {
+                        self.world.set_block(&self.gfx, p.x, y, p.z, AIR);
+                    }
                 }
+                // doors, torches and plants standing on the block come loose
+                let above = self.world.get_block(p.x, p.y + 1, p.z);
+                let up = at + Vec3::Y;
+                if is_door(above) && !door_upper(above) {
+                    if self.world.set_pair(&self.gfx, p.x, p.y + 1, p.z, AIR, AIR) {
+                        self.spill(up, items::door_item(above), 1);
+                    }
+                } else if (above == TORCH || is_plant(above)) && self.world.set_block(&self.gfx, p.x, p.y + 1, p.z, AIR) {
+                    self.spill(up, items::drop_for(above, tool), 1);
+                }
+                // and so do ladders hanging on it
+                for (s, (dx, dz)) in SIDE_DIR.into_iter().enumerate() {
+                    let c = IVec3::new(p.x - dx, p.y, p.z - dz);
+                    if self.world.get_block(c.x, c.y, c.z) == LADDER_BASE + s as u8 && self.world.set_block(&self.gfx, c.x, c.y, c.z, AIR) {
+                        self.spill(c.as_vec3() + 0.5, items::LADDER, 1);
+                    }
+                }
+                self.quiet = false;
             }
         } else {
             self.mining = Some((p, progress));
@@ -853,10 +1346,38 @@ impl Game {
     fn place(&mut self) {
         self.place_cd = 0.2;
         let item = self.inv.hot(self.sel);
+        if item != AIR {
+            self.swing = SWING;
+        }
         let target = self.target();
+        // sneak to place a block against a door, chest or trapdoor instead of using it
+        let sneak = self.keys.contains(&KeyCode::ShiftLeft);
         // use the block you are looking at
         if let Some((p, _, _)) = target {
             match self.world.get_block(p.x, p.y, p.z) {
+                b @ (CHEST | LOOT_CHEST) if !sneak => {
+                    self.chest_at = p;
+                    if b == LOOT_CHEST {
+                        // found in a cave and opened for the first time: from now on an
+                        // ordinary chest holding what was left in it
+                        self.chests.insert(p, loot::roll_chest(self.world.seed, p));
+                        self.world.set_block(&self.gfx, p.x, p.y, p.z, CHEST);
+                        self.say("You found a chest".into());
+                    }
+                    self.chests.entry(p).or_insert([Stack::default(); items::CHEST_SLOTS]);
+                    self.goto(Screen::Chest);
+                    return;
+                }
+                b if is_trapdoor(b) && !sneak => {
+                    self.place_cd = 0.25;
+                    let turned = TRAP_BASE + ((b - TRAP_BASE) ^ TRAP_OPEN);
+                    if !self.fits(p, turned) {
+                        self.say("Something is in the way of the trapdoor".into());
+                    } else {
+                        self.world.set_block(&self.gfx, p.x, p.y, p.z, turned);
+                    }
+                    return;
+                }
                 BED => {
                     self.place_cd = 0.6;
                     self.spawn = p.as_vec3() + Vec3::new(0.5, 1.01, 0.5);
@@ -872,13 +1393,17 @@ impl Game {
                     self.goto(Screen::Inventory);
                     return;
                 }
+                b if is_door(b) && !sneak => {
+                    self.toggle_door(p, b);
+                    return;
+                }
                 _ => {}
             }
         }
         let bite = items::food(item);
         if bite > 0.0 {
             if self.food < MAX_FOOD - 0.5 {
-                self.inv.take_slot(self.sel);
+                self.spend();
                 self.food = (self.food + bite).min(MAX_FOOD);
                 self.place_cd = 0.4;
                 self.say(format!("Ate {}", items::name(item)));
@@ -909,7 +1434,7 @@ impl Game {
                 if let Some((p, n, _)) = target {
                     if n.y == 1 && self.world.get_block(p.x, p.y, p.z) == FARMLAND && self.world.get_block(p.x, p.y + 1, p.z) == AIR {
                         if self.world.set_block(&self.gfx, p.x, p.y + 1, p.z, WHEAT_0) {
-                            self.inv.take_slot(self.sel);
+                            self.spend();
                         }
                     } else {
                         self.say("Seeds need farmland: till grass or dirt with a hoe".into());
@@ -947,27 +1472,191 @@ impl Game {
             }
             _ => {}
         }
-        if !items::is_block(item) {
+        if matches!(item, items::OAK_DOOR | items::BIRCH_DOOR) {
+            self.place_door(target, item);
             return;
         }
+        let Some((p, n, t)) = target else { return };
+        let q = p + n;
+        let clicked = self.world.get_block(p.x, p.y, p.z);
+        let d = self.player.look_dir();
+        // the side of the cell you look towards, and the side the clicked wall is on
+        let facing: u8 = if d.x.abs() > d.z.abs() { (d.x > 0.0) as u8 } else { 2 + (d.z > 0.0) as u8 };
+        let wall: u8 = if n.x == 1 { 0 } else if n.x == -1 { 1 } else if n.z == 1 { 2 } else { 3 };
+        // pointing at the upper half of a side, or at an underside, places the high variant
+        let high = n.y == -1 || (n.y == 0 && (self.player.eye() + d * t).y - p.y as f32 > 0.5);
+        let (at, block): (IVec3, Block) = match item {
+            items::LADDER => {
+                if n.y != 0 || !is_opaque(clicked) {
+                    self.say("A ladder hangs on the side of a solid block".into());
+                    return;
+                }
+                (q, LADDER_BASE + wall)
+            }
+            items::TRAPDOOR => (q, TRAP_BASE + if n.y == 0 { wall } else { facing } + if high { TRAP_TOP } else { 0 }),
+            i if i >= items::STAIRS && i < items::STAIRS + 4 => (q, STAIR_BASE + facing + if high { STAIR_FLIP } else { 0 } + (i - items::STAIRS) * 8),
+            i if (SLAB..SLAB_END).contains(&i) => {
+                // two halves of a kind make a full block again
+                let mat = i - SLAB;
+                let full = SHAPE_FULL[mat as usize];
+                let same = |b: Block| is_slab(b) && slab_mat(b) == mat;
+                if same(clicked) && n.y == if slab_top(clicked) { -1 } else { 1 } {
+                    (p, full)
+                } else if same(self.world.get_block(q.x, q.y, q.z)) {
+                    (q, full)
+                } else {
+                    (q, if high { SLAB_TOP + mat } else { i })
+                }
+            }
+            i if items::is_block(i) => (q, i),
+            _ => return,
+        };
+        let cur = self.world.get_block(at.x, at.y, at.z);
+        // (a slab is only ever replaced by the full block its second half makes)
+        let joins = is_slab(cur) && (SLAB..SLAB_END).contains(&item) && block == SHAPE_FULL[slab_mat(cur) as usize];
+        if !is_replaceable(cur) && !joins {
+            return;
+        }
+        if !self.fits(at, block) {
+            return;
+        }
+        if self.world.set_block(&self.gfx, at.x, at.y, at.z, block) {
+            self.spend();
+        }
+    }
+
+    /// A plank hut around the player: a closed oak door to the west, an open birch door to
+    /// the east, windows north and west, on a levelled yard (CUBEWILD_TEST_HOUSE).
+    /// Returns false while the chunks it stands on are still loading.
+    fn build_test_house(&mut self, inside: bool) -> bool {
+        let c = self.player.pos.floor().as_ivec3();
+        let Some(g) = self.world.surface_y(c.x, c.z) else { return false };
+        if [(-7, -7), (7, -7), (-7, 7), (7, 7)].iter().any(|d| !self.world.is_loaded(c.x + d.0, c.z + d.1)) {
+            return false;
+        }
+        let (ox, oz, y0) = (c.x - 3, c.z - 3, g + 1);
+        for dz in -3..10 {
+            for dx in -3..10 {
+                let hut = (0..7).contains(&dx) && (0..7).contains(&dz);
+                let edge = dx == 0 || dx == 6 || dz == 0 || dz == 6;
+                for y in g - 3..y0 + 12 {
+                    let b = match y - y0 {
+                        i32::MIN..=-1 => COBBLE,
+                        0..=2 if hut && edge => PLANKS,
+                        3 if hut => BIRCH_PLANKS,
+                        _ => AIR,
+                    };
+                    self.world.set_block_bg(ox + dx, y, oz + dz, b);
+                }
+            }
+        }
+        for i in 2..=4 {
+            self.world.set_block_bg(ox + i, y0 + 1, oz + 6, PANE);
+        }
+        self.world.set_block_bg(ox, y0 + 1, oz + 1, PANE);
+        self.world.set_block_bg(ox, y0 + 1, oz + 5, PANE);
+        let (west, east) = (DOOR_BASE, DOOR_BASE + 1 + 32 + DOOR_OPEN);
+        for (x, door) in [(ox, west), (ox + 6, east)] {
+            self.world.set_block_bg(x, y0, oz + 3, door);
+            self.world.set_block_bg(x, y0 + 1, oz + 3, door + DOOR_UPPER);
+        }
+        // one of each new shape: outside along the west wall, and inside by the east door
+        for (dx, dy, dz, b) in [
+            (-1, 0, 5, STAIR_BASE + 1 + 16),
+            (-1, 0, 6, STAIR_BASE + 1 + STAIR_FLIP),
+            (-1, 0, 4, SLAB + 2),
+            // these two turn the stairs by the wall into an inner corner, and the first
+            // of them into an outer one
+            (-2, 0, 5, STAIR_BASE + 3 + 16),
+            (-2, 0, 6, STAIR_BASE + 16),
+            (-1, 2, 3, SLAB_TOP),
+            (-2, 0, 0, FENCE),
+            (-2, 0, 1, FENCE),
+            (-1, 0, 0, FENCE),
+            (-1, 0, 2, LADDER_BASE + 1),
+            (-1, 1, 2, LADDER_BASE + 1),
+            (-1, 2, 2, LADDER_BASE + 1),
+            (5, 0, 1, CHEST),
+            (5, 0, 2, TRAP_BASE),
+            (5, 0, 4, TRAP_BASE + 1 + TRAP_OPEN),
+            (5, 0, 5, SLAB),
+        ] {
+            self.world.set_block_bg(ox + dx, y0 + dy, oz + dz, b);
+        }
+        let chest = IVec3::new(ox + 5, y0, oz + 1);
+        let mut slots = [Stack::default(); items::CHEST_SLOTS];
+        for (i, st) in [Stack::new(COBBLE, 64), Stack::new(items::COAL, 12), Stack { item: items::IRON_PICK, n: 1, wear: 40 }, Stack::new(items::BREAD, 3)].into_iter().enumerate() {
+            slots[i * 4] = st;
+        }
+        self.chests.insert(chest, slots);
+        if std::env::var("CUBEWILD_SCREEN").as_deref() == Ok("chest") {
+            self.chest_at = chest;
+            self.goto(Screen::Chest);
+        }
+        // a few things lying in the yard, out of reach of the starting spot
+        for (i, st) in [Stack::new(COBBLE, 5), Stack::new(PLANKS, 1), Stack::new(items::IRON_PICK, 1), Stack::new(items::STICK, 3), Stack::new(items::STAIRS, 2)].into_iter().enumerate() {
+            self.pickups.spawn(Vec3::new(ox as f32 - 0.6, y0 as f32 + 0.5, oz as f32 + 2.6 + i as f32 * 0.45), Vec3::ZERO, st, 0.0);
+        }
+        self.world.set_block(&self.gfx, ox + 3, y0 + 2, oz + 3, LAMP);
+        let p = &mut self.player;
+        if inside {
+            (p.pos, p.yaw, p.pitch) = (Vec3::new(ox as f32 + 2.5, y0 as f32 + 0.01, oz as f32 + 3.5), 1.2, 0.0);
+        } else {
+            (p.pos, p.yaw, p.pitch) = (Vec3::new(ox as f32 - 2.6, y0 as f32 + 0.01, oz as f32 + 2.2), 1.35, -0.05);
+        }
+        true
+    }
+
+    /// True if the leaf of door block `b`, two cells tall from `p`, would cut into the
+    /// player or a mob.
+    fn door_blocked(&self, p: IVec3, b: Block) -> bool {
+        let q = shape_boxes(b, |_, _| AIR).0[0];
+        let min = p.as_vec3() + Vec3::new(q[0], 0.0, q[2]);
+        let max = p.as_vec3() + Vec3::new(q[3], 2.0, q[5]);
+        let (lo, hi) = (self.player.pos - Vec3::new(PLAYER_HW, 0.0, PLAYER_HW), self.player.pos + Vec3::new(PLAYER_HW, PLAYER_H, PLAYER_HW));
+        (hi.cmpgt(min).all() && lo.cmplt(max).all()) || self.mobs.blocks_box(min, max)
+    }
+
+    /// Opens or closes the door one of whose halves is `b` at `p`.
+    fn toggle_door(&mut self, p: IVec3, b: Block) {
+        self.place_cd = 0.25;
+        let y = if door_upper(b) { p.y - 1 } else { p.y };
+        let (lower, upper) = (self.world.get_block(p.x, y, p.z), self.world.get_block(p.x, y + 1, p.z));
+        if !is_door(lower) || !is_door(upper) {
+            return;
+        }
+        let (lower, upper) = (lower ^ DOOR_OPEN, upper ^ DOOR_OPEN);
+        if self.door_blocked(IVec3::new(p.x, y, p.z), lower) {
+            self.say("Something is in the way of the door".into());
+            return;
+        }
+        self.world.set_pair(&self.gfx, p.x, y, p.z, lower, upper);
+    }
+
+    /// Stands a door on the block you point at, on the edge of its cell nearest to you.
+    fn place_door(&mut self, target: Option<(IVec3, IVec3, f32)>, item: Item) {
         let Some((p, n, _)) = target else { return };
         let q = p + n;
-        let cur = self.world.get_block(q.x, q.y, q.z);
-        if !is_replaceable(cur) {
+        let at = |w: &World, dx: i32, dy: i32, dz: i32| w.get_block(q.x + dx, q.y + dy, q.z + dz);
+        let full = |b: Block| is_solid(b) && !is_shaped(b);
+        let w = &self.world;
+        if !is_replaceable(at(w, 0, 0, 0)) || !is_replaceable(at(w, 0, 1, 0)) || !full(at(w, 0, -1, 0)) {
+            self.say("A door needs firm ground and two blocks of room".into());
             return;
         }
-        let pp = self.player.pos;
-        let overlaps_player = pp.x + PLAYER_HW > q.x as f32
-            && pp.x - PLAYER_HW < q.x as f32 + 1.0
-            && pp.z + PLAYER_HW > q.z as f32
-            && pp.z - PLAYER_HW < q.z as f32 + 1.0
-            && pp.y + PLAYER_H > q.y as f32
-            && pp.y < q.y as f32 + 1.0;
-        if item != TORCH && !is_plant(item) && (overlaps_player || self.mobs.blocks_cell(q.x, q.y, q.z)) {
+        let d = self.player.look_dir();
+        let side = if d.x.abs() > d.z.abs() { (d.x < 0.0) as u8 } else { 2 + (d.z < 0.0) as u8 };
+        // the hinge goes on the left, unless that would leave it hanging in the open
+        // or there is a door there already (so two doors meet in the middle)
+        let beside = |s: u8| at(w, SIDE_DIR[s as usize].0, 0, SIDE_DIR[s as usize].1);
+        let (left, right) = (beside(SIDE_LEFT[side as usize]), beside(SIDE_RIGHT[side as usize]));
+        let hinge_right = !is_door(right) && (is_door(left) || (full(right) && !full(left)));
+        let lower = DOOR_BASE + side + if hinge_right { DOOR_HINGE_RIGHT } else { 0 } + (item - items::OAK_DOOR) * 32;
+        if self.door_blocked(q, lower) {
             return;
         }
-        if self.world.set_block(&self.gfx, q.x, q.y, q.z, item) {
-            self.inv.take_slot(self.sel);
+        if self.world.set_pair(&self.gfx, q.x, q.y, q.z, lower, lower + DOOR_UPPER) {
+            self.spend();
         }
     }
 
@@ -975,16 +1664,32 @@ impl Game {
         match code {
             KeyCode::Escape => match self.screen {
                 Screen::Play => self.goto(Screen::Pause),
-                Screen::Pause | Screen::Inventory => self.goto(Screen::Play),
-                Screen::Dead => {}
+                Screen::Pause | Screen::Inventory | Screen::Chest => self.goto(Screen::Play),
+                Screen::Dead | Screen::Title => {}
                 _ => self.goto(Screen::Pause),
             },
             KeyCode::KeyE | KeyCode::Tab => match self.screen {
                 Screen::Play => self.goto(Screen::Inventory),
-                Screen::Inventory => self.goto(Screen::Play),
+                Screen::Inventory | Screen::Chest => self.goto(Screen::Play),
                 _ => {}
             },
-            KeyCode::KeyF if self.screen == Screen::Play => self.player.flying = !self.player.flying,
+            KeyCode::KeyQ if self.screen == Screen::Play => self.drop_selected(self.keys.contains(&KeyCode::ControlLeft)),
+            KeyCode::KeyF if self.screen == Screen::Play => {
+                if self.mode == Mode::Creative {
+                    self.player.flying = !self.player.flying;
+                } else {
+                    self.say("Flying needs a creative world".into());
+                }
+            }
+            KeyCode::Space if self.screen == Screen::Play && self.mode == Mode::Creative => {
+                // Space twice in a row takes off and lands
+                if self.last_jump < 0.3 {
+                    self.player.flying = !self.player.flying;
+                    self.last_jump = 1.0;
+                } else {
+                    self.last_jump = 0.0;
+                }
+            }
             KeyCode::F3 => self.debug = !self.debug,
             KeyCode::F11 => {
                 self.apply(Action::ToggleFullscreen);
@@ -1061,14 +1766,67 @@ impl Game {
             Action::Slot(i, right) => {
                 if right {
                     self.inv.right_click(i);
-                } else if self.shift {
-                    self.inv.quick_move(i);
-                } else {
+                } else if !self.shift {
                     self.inv.click(i);
+                } else if self.screen == Screen::Chest {
+                    // shift-click sends the stack into the chest
+                    if let Some(chest) = self.chests.get_mut(&self.chest_at) {
+                        self.inv.slots[i] = items::stash_in(chest, self.inv.slots[i]);
+                    }
+                } else {
+                    self.inv.quick_move(i);
                 }
+            }
+            Action::ChestSlot(i, right) => {
+                if let Some(chest) = self.chests.get_mut(&self.chest_at) {
+                    if right {
+                        items::right_click_stack(&mut self.inv.held, &mut chest[i], true);
+                    } else if self.shift {
+                        chest[i] = self.inv.pick_up(chest[i]);
+                    } else {
+                        items::click_stack(&mut self.inv.held, &mut chest[i], true);
+                    }
+                }
+            }
+            Action::DropHeld => {
+                let st = std::mem::take(&mut self.inv.held);
+                self.throw(st);
             }
             Action::Sort => self.inv.sort_bag(),
             Action::Respawn => self.respawn(),
+            Action::NewWorld(mode) => self.enter(fresh_seed(), mode),
+            Action::Open(seed) => {
+                if seed == self.world.seed && self.save_dir.is_some() {
+                    self.goto(Screen::Play);
+                } else {
+                    self.enter(seed, Mode::Survival);
+                }
+            }
+            Action::Delete(seed) => {
+                if self.confirm_delete == Some(seed) {
+                    self.confirm_delete = None;
+                    self.delete_world(seed);
+                } else {
+                    self.confirm_delete = Some(seed);
+                }
+            }
+            Action::ToTitle => {
+                self.save();
+                self.worlds = list_worlds();
+                self.confirm_delete = None;
+                self.at_title = true;
+                self.goto(Screen::Title);
+            }
+            Action::Take(item, to_pack) => {
+                // a stack on the mouse is put away for good, as in a bin
+                if !self.inv.held.is_empty() {
+                    self.inv.held = Stack::default();
+                } else if to_pack {
+                    self.inv.add(item, items::max_stack(item));
+                } else {
+                    self.inv.held = Stack::new(item, items::max_stack(item));
+                }
+            }
         }
         false
     }
@@ -1101,14 +1859,35 @@ impl Game {
         // ---- simulate
         let pc = ((self.player.pos.x.floor() as i32) >> 4, (self.player.pos.z.floor() as i32) >> 4);
         let t0 = Instant::now();
-        self.world.update(&self.gfx, pc);
+        if self.screen != Screen::Title {
+            self.world.update(&self.gfx, pc);
+        }
+        self.last_jump += real_dt;
+        self.swing -= dt;
         let t_world = t0.elapsed().as_secs_f32() * 1000.0;
         self.ready = self.ready
             || self.world.is_loaded(self.player.pos.x.floor() as i32, self.player.pos.z.floor() as i32);
         if self.ready && self.unstick {
             self.unstick = false;
-            while collides(&self.world, self.player.pos, PLAYER_HW, PLAYER_H) && self.player.pos.y < CH as f32 {
-                self.player.pos.y += 1.0;
+            if collides(&self.world, self.player.pos, PLAYER_HW, PLAYER_H) {
+                // buried, most likely in a tree that stands on the spot: step aside to the
+                // nearest open ground, or failing that climb out on top
+                let (px, pz) = (self.player.pos.x.floor() as i32, self.player.pos.z.floor() as i32);
+                let rings = (1..=8i32).flat_map(|r| (-r..=r).flat_map(move |i| [(i, -r), (i, r), (-r, i), (r, i)]));
+                let open = rings.map(|(dx, dz)| (px + dx, pz + dz)).find_map(|(x, z)| {
+                    let h = height_at(self.world.seed, x, z);
+                    let p = Vec3::new(x as f32 + 0.5, h as f32 + 1.0, z as f32 + 0.5);
+                    let ok = h > SEA && self.world.is_loaded(x, z) && is_solid(self.world.get_block(x, h, z)) && !collides(&self.world, p, PLAYER_HW, PLAYER_H);
+                    ok.then_some(p)
+                });
+                match open {
+                    Some(p) => self.player.pos = p,
+                    None => {
+                        while collides(&self.world, self.player.pos, PLAYER_HW, PLAYER_H) && self.player.pos.y < CH as f32 {
+                            self.player.pos.y += 1.0;
+                        }
+                    }
+                }
             }
         }
 
@@ -1156,28 +1935,55 @@ impl Game {
             }
         }
         // the world keeps running while the inventory is open, but pauses in the menus
-        let simulate = self.ready && matches!(self.screen, Screen::Play | Screen::Inventory);
+        let simulate = self.ready && matches!(self.screen, Screen::Play | Screen::Inventory | Screen::Chest);
         if simulate {
             self.time = (self.time + dt / DAY_SECS).rem_euclid(1.0);
             self.player.update(&self.world, &input, dt);
             let night = self.sun().1 < 0.3;
-            if std::mem::take(&mut self.test_mobs) {
+            if self.test_house.is_some_and(|inside| self.build_test_house(inside)) {
+                self.test_house = None;
+            }
+            if self.test_house.is_none() && std::mem::take(&mut self.test_mobs) {
                 self.mobs.spawn_test(&self.world, self.player.pos);
             }
             let bites = self.mobs.update(&self.world, self.player.pos, input.sneak && !self.player.flying, night, dt);
             for (pos, vel) in self.mobs.shots.drain(..) {
                 self.arrows.push(Arrow { pos, vel, life: 5.0, hostile: true });
             }
-            if self.bench.is_none() {
+            if self.mode == Mode::Creative {
+                (self.health, self.food, self.air) = (MAX_HEALTH, MAX_FOOD, MAX_AIR);
+            } else if self.bench.is_none() {
                 if bites > 0.0 {
                     self.strike(bites);
                 }
                 self.survive(&input, dt);
                 if self.health <= 0.0 {
-                    self.health = 0.0;
-                    self.goto(Screen::Dead);
+                    self.die();
                 }
             }
+            // items on the ground settle, and those in reach are gathered
+            let mut got = std::mem::take(&mut self.got);
+            got.clear();
+            let who = (self.bench.is_none() && self.screen != Screen::Dead).then_some(self.player.pos);
+            self.pickups.update(&self.world, who, &mut self.inv, &mut got, dt);
+            if !got.is_empty() {
+                // one line that counts up, the newest kind first, not a message per item
+                if self.tally.1 <= 0.0 {
+                    self.tally.0.clear();
+                }
+                for st in &got {
+                    let n = match self.tally.0.iter().position(|t| t.item == st.item) {
+                        Some(i) => self.tally.0.remove(i).n,
+                        None => 0,
+                    };
+                    self.tally.0.insert(0, Stack::new(st.item, n + st.n));
+                }
+                self.tally.0.truncate(4);
+                self.tally.1 = 2.4;
+                let text: Vec<String> = self.tally.0.iter().map(|st| format!("+{} {}", st.n, items::name(st.item))).collect();
+                self.toast = (text.join("   "), 2.4);
+            }
+            self.got = got;
         }
         let playing = self.screen == Screen::Play;
         let (sun_dir, daylight) = self.sun();
@@ -1200,15 +2006,17 @@ impl Game {
                         return false;
                     }
                 } else if let Some((i, _)) = self.mobs.pick(a.pos, step / len, len) {
+                    let at = self.mobs.list[i].pos;
                     if let Some(drops) = self.mobs.hit(i, a.pos - step, 5) {
-                        self.loot(drops);
+                        self.loot(drops, at);
                     }
                     self.hit_flash = 0.18;
                     return false;
                 }
+                // stopped by blocks, closed doors and window panes, but not by an open doorway
+                let blocked = raycast_with(&self.world, a.pos, step / len, len, is_solid).is_some();
                 a.pos += step;
-                let c = a.pos.floor().as_ivec3();
-                a.life > 0.0 && !is_solid(self.world.get_block(c.x, c.y, c.z))
+                a.life > 0.0 && !blocked
             });
             self.arrows = arrows;
             // crops ripen a stage at a time, at random
@@ -1248,6 +2056,7 @@ impl Game {
         self.hit_flash -= dt;
         self.hurt_flash -= dt;
         self.toast.1 -= dt;
+        self.tally.1 -= dt;
         if playing && self.bench.is_none() {
             if self.buttons[0] {
                 self.primary(dt);
@@ -1270,7 +2079,10 @@ impl Game {
         let (r0, r1, r2, r3) = (vp.row(0), vp.row(1), vp.row(2), vp.row(3));
         let planes: [Vec4; 5] = [r3 + r0, r3 - r0, r3 + r1, r3 - r1, r2];
 
-        let mut chunks: Vec<(&ChunkMesh, [f32; 3], bool)> = Vec::with_capacity(512);
+        // from under a roof of rock every cave wall is drawn; from above ground only those nearby
+        let eye_cell = eye.floor().as_ivec3();
+        let eye_sky = self.world.sky_level(eye_cell.x, eye_cell.y, eye_cell.z).min(2);
+        let mut chunks: Vec<(&ChunkMesh, [f32; 3], bool, bool)> = Vec::with_capacity(512);
         let mut quads = 0;
         for &(dx, dz, inner) in &self.world.spiral {
             if !inner {
@@ -1289,9 +2101,10 @@ impl Game {
                 p.x * v.x + p.y * v.y + p.z * v.z + p.w >= 0.0
             });
             if visible {
-                quads += mesh.quads();
+                let deep = eye_sky == 0 || dx * dx + dz * dz <= 16;
+                quads += mesh.quads(deep);
                 // distant plants are only a few pixels: skip their draw calls
-                chunks.push((mesh, min.into(), dx * dx + dz * dz <= 64));
+                chunks.push((mesh, min.into(), dx * dx + dz * dz <= 64, deep));
             }
         }
         self.drawn = (chunks.len(), quads);
@@ -1321,13 +2134,27 @@ impl Game {
             let rel = q.as_vec3() - eye;
             if lights.len() < gfx::MAX_LIGHTS {
                 let c = rel + Vec3::new(0.5, 0.7, 0.5);
-                lights.push([c.x, c.y, c.z, if b == LAMP { 15.0 } else { 11.0 }]);
+                lights.push([c.x, c.y, c.z, match b {
+                    LAMP => 15.0,
+                    LAVA => 10.0,
+                    _ => 11.0,
+                }]);
             }
             if b == TORCH {
                 let m = Mat4::from_translation(rel);
                 push_box(&mut ents, &m, Vec3::new(0.44, 0.0, 0.44), Vec3::new(0.56, 0.58, 0.56), [150, 106, 58], gfx::EMISSIVE);
                 push_box(&mut ents, &m, Vec3::new(0.41, 0.58, 0.41), Vec3::new(0.59, 0.76, 0.59), [255, 200, 80], gfx::EMISSIVE);
             }
+        }
+        let mut item_verts = std::mem::take(&mut self.item_verts);
+        item_verts.clear();
+        self.pickups.draw(&mut item_verts, eye, view_dist.min(56.0));
+        let hand_from = item_verts.len();
+        if playing && self.bench.is_none() {
+            if self.hand_model.0 != held {
+                self.hand_model = (held, if held == AIR || held_as_cube(held) { Vec::new() } else { icon_model(held) });
+            }
+            push_hand(&mut item_verts, dir, held, &self.hand_model.1, (self.swing / SWING).clamp(0.0, 1.0), [0.2, 0.52, 1.0][eye_sky as usize]);
         }
         let mut sky = std::mem::take(&mut self.sky);
         sky.clear();
@@ -1354,12 +2181,14 @@ impl Game {
         let target = if playing { raycast(&self.world, eye, dir, 6.0) } else { None };
         if let Some((p, _, _)) = target {
             // wireframe around the targeted block
-            let m = Mat4::from_translation(p.as_vec3() - eye);
-            let (a, b, t) = (-0.004f32, 1.004f32, 0.012f32);
-            for (u, v) in [(a, a), (b, a), (a, b), (b, b)] {
-                push_box(&mut ents, &m, Vec3::new(a, u - t, v - t), Vec3::new(b, u + t, v + t), [10, 10, 10], 200);
-                push_box(&mut ents, &m, Vec3::new(u - t, a, v - t), Vec3::new(u + t, b, v + t), [10, 10, 10], 200);
-                push_box(&mut ents, &m, Vec3::new(u - t, v - t, a), Vec3::new(u + t, v + t, b), [10, 10, 10], 200);
+            // (doors and panes get a box as thin as they are)
+            let (lo, hi) = player::block_bounds(&self.world, p);
+            let (a, b, t) = (lo - eye - 0.004, hi - eye + 0.004, Vec3::splat(0.012));
+            let m = Mat4::IDENTITY;
+            for (i, j) in [(a, a), (b, a), (a, b), (b, b)] {
+                for (c0, c1) in [(Vec3::new(a.x, i.y, j.z), Vec3::new(b.x, i.y, j.z)), (Vec3::new(i.x, a.y, j.z), Vec3::new(i.x, b.y, j.z)), (Vec3::new(i.x, j.y, a.z), Vec3::new(i.x, j.y, b.z))] {
+                    push_box(&mut ents, &m, c0 - t, c1 + t, [10, 10, 10], 200);
+                }
             }
         }
 
@@ -1372,6 +2201,9 @@ impl Game {
         let (cx, cy) = ((wf * 0.5).round(), (hf * 0.5).round());
         if underwater {
             ui.rect(0.0, 0.0, wf, hf, [20, 70, 160, 70]);
+        }
+        if self.player.eye_in_lava(&self.world) {
+            ui.rect(0.0, 0.0, wf, hf, [236, 96, 20, 215]);
         }
         if self.hurt_flash > 0.0 {
             ui.rect(0.0, 0.0, wf, hf, [200, 20, 20, (self.hurt_flash / 0.35 * 80.0) as u8]);
@@ -1396,14 +2228,15 @@ impl Game {
         let slot = (58.0 * s).round();
         let hx = (cx - slot * 4.5).round();
         let hy = (hf - slot - 12.0 * s).round();
-        if self.ready && self.screen != Screen::Inventory {
+        if self.ready && !matches!(self.screen, Screen::Inventory | Screen::Chest) {
             for i in 0..9 {
                 draw_slot(&mut ui, hx + i as f32 * slot, hy, slot, self.inv.slots[i], i == self.sel, false);
             }
             // health on the left, hunger on the right, air above hunger while diving
             let isz = (22.0 * s).round();
             let iy = hy - isz - 6.0 * s;
-            for i in 0..10 {
+            // (a creative world has neither)
+            for i in 0..if self.mode == Mode::Survival { 10 } else { 0 } {
                 let x = hx + i as f32 * (isz + 1.0);
                 ui.icon(x, iy, isz, items::ICON_HEART, 45);
                 ui.icon_part(x, iy, isz, items::ICON_HEART, (self.health - i as f32 * 2.0) / 2.0);
@@ -1457,7 +2290,7 @@ impl Game {
             if !info.is_empty() && playing {
                 ui.label_centered(cx, 14.0 * s, BODY, &info.join("      "), TEXT);
             }
-            if self.started && self.inv.is_empty() && playing {
+            if self.started && self.inv.is_empty() && playing && self.mode == Mode::Survival {
                 ui.label_centered(cx, 60.0 * s, BODY, "Hold left click on a tree to gather wood, then press E to craft", TEXT);
             }
         }
@@ -1484,19 +2317,65 @@ impl Game {
             }
         }
 
-        if !self.ready {
+        if self.screen == Screen::Title {
+            ui.rect(0.0, 0.0, wf, hf, [16, 22, 30, 255]);
+            let bh = (50.0 * s).round();
+            let gap = (12.0 * s).round();
+            let rows = self.worlds.len().min(5);
+            let pw = (620.0 * s).round();
+            let list_h = if rows > 0 { 34.0 * s + rows as f32 * (bh + gap) } else { 0.0 };
+            let ph = (150.0 * s + 2.0 * (bh + gap) + list_h + 24.0 * s).round();
+            let (px, py) = ((cx - pw * 0.5).round(), (cy - ph * 0.5).round());
+            ui.rect(px, py, pw, ph, [20, 24, 32, 255]);
+            ui.outline(px, py, pw, ph, (2.0 * s).round().max(1.0), [78, 90, 110, 255]);
+            ui.text_centered(cx, py + 18.0 * s, TITLE, "Cubewild", TEXT);
+            ui.text_centered(cx, py + 18.0 * s + font.height(TITLE), SMALL, "Every new world is a different one", DIM);
+            let bx = px + 40.0 * s;
+            let bw = pw - 80.0 * s;
+            let half = ((bw - gap) * 0.5).round();
+            let mut y = py + 140.0 * s;
+            if ui.button(bx, y, half, bh, "New survival world", true) {
+                actions.push(Action::NewWorld(Mode::Survival));
+            }
+            if ui.button(bx + half + gap, y, half, bh, "New creative world", true) {
+                actions.push(Action::NewWorld(Mode::Creative));
+            }
+            y += bh + gap;
+            if rows > 0 {
+                ui.text(bx, y + 6.0 * s, SMALL, "Your worlds, the latest first", DIM);
+                y += 34.0 * s;
+                let dw = (120.0 * s).round();
+                for w in self.worlds.iter().take(rows) {
+                    let kind = if w.mode == Mode::Creative { "Creative" } else { "Survival" };
+                    if ui.button(bx, y, bw - dw - gap, bh, &format!("World {}  -  {kind}", w.seed), true) {
+                        actions.push(Action::Open(w.seed));
+                    }
+                    let sure = self.confirm_delete == Some(w.seed);
+                    if ui.button(bx + bw - dw, y, dw, bh, if sure { "Sure?" } else { "Delete" }, true) {
+                        actions.push(Action::Delete(w.seed));
+                    }
+                    y += bh + gap;
+                }
+            }
+            if ui.button(bx, y, half, bh, "Settings", true) {
+                actions.push(Action::Goto(Screen::Settings));
+            }
+            if ui.button(bx + half + gap, y, half, bh, "Quit", true) {
+                actions.push(Action::Quit);
+            }
+        } else if !self.ready {
             ui.rect(0.0, 0.0, wf, hf, [16, 22, 30, 255]);
             ui.text_centered(cx, cy - font.height(HEAD), HEAD, "Loading world...", TEXT);
         } else if self.bench.is_none() {
             let bh = (50.0 * s).round();
             let gap = (12.0 * s).round();
             match self.screen {
-                Screen::Play => {}
+                Screen::Play | Screen::Title => {}
                 Screen::Dead => {
                     ui.rect(0.0, 0.0, wf, hf, [70, 8, 8, 150]);
                     let bw = (300.0 * s).round();
                     ui.text_centered(cx, cy - 150.0 * s, TITLE, "You died", TEXT);
-                    ui.text_centered(cx, cy - 150.0 * s + font.height(TITLE) + 4.0 * s, BODY, "You keep your items and wake at your spawn point", DIM);
+                    ui.text_centered(cx, cy - 150.0 * s + font.height(TITLE) + 4.0 * s, BODY, "Your items lie where you fell, and vanish after five minutes there", DIM);
                     if ui.button(cx - bw * 0.5, cy + 10.0 * s, bw, bh, "Respawn", true) {
                         actions.push(Action::Respawn);
                     }
@@ -1507,13 +2386,14 @@ impl Game {
                 Screen::Pause => {
                     ui.rect(0.0, 0.0, wf, hf, [6, 10, 16, 150]);
                     let pw = (440.0 * s).round();
-                    let ph = (4.0 * (bh + gap) + 170.0 * s).round();
+                    let ph = (5.0 * (bh + gap) + 170.0 * s).round();
                     let (px, py) = ((cx - pw * 0.5).round(), (cy - ph * 0.5).round());
                     ui.rect(px, py, pw, ph, [20, 24, 32, 238]);
                     ui.outline(px, py, pw, ph, (2.0 * s).round().max(1.0), [78, 90, 110, 255]);
                     ui.text_centered(cx, py + 18.0 * s, TITLE, "Cubewild", TEXT);
-                    let sub = if self.started { "Game paused" } else { "Gather, craft, build, hunt" };
-                    ui.text_centered(cx, py + 18.0 * s + font.height(TITLE), SMALL, sub, DIM);
+                    let kind = if self.mode == Mode::Creative { "Creative" } else { "Survival" };
+                    let sub = format!("{kind} world {}", self.world.seed);
+                    ui.text_centered(cx, py + 18.0 * s + font.height(TITLE), SMALL, &sub, DIM);
                     let bx = px + 40.0 * s;
                     let bw = pw - 80.0 * s;
                     let mut y = py + 140.0 * s;
@@ -1522,6 +2402,7 @@ impl Game {
                         (first, Action::Goto(Screen::Play)),
                         ("Settings", Action::Goto(Screen::Settings)),
                         ("Controls", Action::Goto(Screen::Controls)),
+                        ("Save and go to title", Action::ToTitle),
                         ("Save and quit", Action::Quit),
                     ] {
                         if ui.button(bx, y, bw, bh, label, true) {
@@ -1601,13 +2482,14 @@ impl Game {
                         ("Ctrl", "Sprint"),
                         ("Shift", "Sneak (animals notice you later)"),
                         ("Hold left click", "Break block / hit animal"),
-                        ("Right click", "Place block / eat / use bed, workbench, furnace"),
+                        ("Right click", "Place block / eat / open door, trapdoor, chest / use bed, workbench"),
+                        ("Q", "Drop the held item (Ctrl+Q drops the whole stack)"),
                         ("Middle click", "Select the block you look at"),
                         ("1 - 9, mouse wheel", "Choose hotbar slot"),
                         ("E or Tab", "Inventory and crafting"),
                         ("In the inventory", "Click moves stacks, right click splits, Shift+click sends across"),
                         ("Right click with a tool", "Hoe tills, bow shoots, rod fishes, bucket scoops"),
-                        ("F", "Toggle flying"),
+                        ("F, or Space twice", "Fly (creative worlds)"),
                         ("F3", "Debug info"),
                         ("F11", "Fullscreen"),
                         ("Esc", "Pause menu"),
@@ -1648,6 +2530,34 @@ impl Game {
                     let stations = [(WORKBENCH, self.near_station(WORKBENCH)), (FURNACE, self.near_station(FURNACE))];
                     let reachable = |b: Block| b == AIR || stations.iter().any(|&(st, near)| st == b && near);
 
+                    if self.mode == Mode::Creative {
+                        // ================= every item, free to take =================
+                        draw_window(&mut ui, bx, wy, bw, mh);
+                        ui.text(bx + pad, wy + 11.0 * s, HEAD, "All items", INK);
+                        let list: Vec<Item> = (1..items::ITEM_END).filter(|&i| items::valid(i)).collect();
+                        let gy = wy + head;
+                        let rows_fit = (((wy + mh - pad - gy) / slot).floor() as usize).max(1);
+                        let total_rows = (list.len() + RECIPE_COLS - 1) / RECIPE_COLS;
+                        let scroll = self.recipe_scroll.min(total_rows.saturating_sub(rows_fit));
+                        ui.rect(bx + pad - 2.0, gy - 2.0, RECIPE_COLS as f32 * slot + 4.0, rows_fit as f32 * slot + 4.0, INSET);
+                        for (k, &item) in list.iter().skip(scroll * RECIPE_COLS).take(RECIPE_COLS * rows_fit).enumerate() {
+                            let (x, y) = (bx + pad + (k % RECIPE_COLS) as f32 * slot, gy + (k / RECIPE_COLS) as f32 * slot);
+                            if draw_slot(&mut ui, x, y, slot, Stack::new(item, 1), false, true) {
+                                tip = Some(Stack::new(item, 1));
+                                if ui.ptr.clicked {
+                                    actions.push(Action::Take(item, self.shift));
+                                }
+                            }
+                        }
+                        if total_rows > rows_fit {
+                            let track_h = rows_fit as f32 * slot;
+                            let bar_h = track_h * rows_fit as f32 / total_rows as f32;
+                            let bar_y = gy + (track_h - bar_h) * scroll as f32 / (total_rows - rows_fit) as f32;
+                            let sx = bx + pad + RECIPE_COLS as f32 * slot + 5.0 * s;
+                            ui.rect(sx, gy, 5.0 * s, track_h, INSET);
+                            ui.rect(sx, bar_y, 5.0 * s, bar_h, PAPER_DARK);
+                        }
+                    } else {
                     // ================= recipe book =================
                     draw_window(&mut ui, bx, wy, bw, mh);
                     ui.text(bx + pad, wy + 11.0 * s, HEAD, "Recipes", INK);
@@ -1739,6 +2649,7 @@ impl Game {
                         ui.rect(sx, bar_y, 5.0 * s, bar_h, PAPER_DARK);
                     }
 
+                    }
                     // ================= inventory window =================
                     draw_window(&mut ui, mx, wy, mw, mh);
                     ui.text(mx + pad, wy + 11.0 * s, HEAD, "Inventory", INK);
@@ -1949,29 +2860,78 @@ impl Game {
                     let (px, py) = (ui.ptr.x, ui.ptr.y);
                     if !held.is_empty() {
                         draw_stack(&mut ui, px - slot * 0.5, py - slot * 0.5, slot, held);
-                    } else if let Some(st) = tip {
-                        let (name, kind, desc, stats) = (items::name(st.item), items::kind(st.item), items::desc(st.item), item_stats(st));
-                        let lines: Vec<(&str, usize, [u8; 4])> = [(name, BODY, ACCENT), (kind, SMALL, DIM), (desc, SMALL, TEXT), (stats.as_str(), SMALL, [150, 210, 255, 255])]
-                            .into_iter()
-                            .filter(|l| !l.0.is_empty())
-                            .collect();
-                        let tw = lines.iter().map(|l| font.width(l.1, l.0)).fold(0.0, f32::max) + 24.0 * s;
-                        let th = lines.iter().map(|l| font.height(l.1) + 3.0 * s).sum::<f32>() + 14.0 * s;
-                        let tx = (px + 18.0 * s).min(wf - tw - 4.0);
-                        let mut ty = (py + 20.0 * s).min(hf - th - 4.0);
-                        ui.rect(tx, ty, tw, th, [16, 14, 22, 246]);
-                        ui.outline(tx, ty, tw, th, 1.0, ACCENT);
-                        ty += 7.0 * s;
-                        for (text, style, col) in lines {
-                            ui.text(tx + 12.0 * s, ty, style, text, col);
-                            ty += font.height(style) + 3.0 * s;
+                        // clicking outside the windows throws it on the ground
+                        if ui.ptr.clicked && !ui.hover(bx, wy, bw + gap + mw, mh) {
+                            actions.push(Action::DropHeld);
                         }
+                    } else if let Some(st) = tip {
+                        draw_tip(&mut ui, st, wf, hf);
                     } else if let Some(text) = tip_text {
                         let tw = font.width(SMALL, text) + 20.0 * s;
                         let th = font.height(SMALL) + 12.0 * s;
                         ui.rect(px + 14.0 * s, py + 18.0 * s, tw, th, [16, 14, 22, 246]);
                         ui.outline(px + 14.0 * s, py + 18.0 * s, tw, th, 1.0, ACCENT);
                         ui.text(px + 24.0 * s, py + 24.0 * s, SMALL, text, TEXT);
+                    }
+                }
+                Screen::Chest => {
+                    ui.rect(0.0, 0.0, wf, hf, [6, 10, 16, 140]);
+                    let slot = (58.0 * s).round();
+                    let pad = (20.0 * s).round();
+                    let head = (46.0 * s).round();
+                    let mw = 9.0 * slot + 2.0 * pad;
+                    let mh = 2.0 * head + 6.0 * slot + 10.0 * s + slot + pad;
+                    let (mx, wy) = ((cx - mw * 0.5).round(), ((hf - mh) * 0.5).round());
+                    draw_window(&mut ui, mx, wy, mw, mh);
+                    ui.text(mx + pad, wy + 11.0 * s, HEAD, "Chest", INK);
+                    ui.text_right(mx + mw - pad, wy + 18.0 * s, SMALL, "Shift+click sends a stack across", INK_DIM);
+                    let mut tip: Option<Stack> = None;
+                    let empty = [Stack::default(); items::CHEST_SLOTS];
+                    let chest = self.chests.get(&self.chest_at).unwrap_or(&empty);
+                    for (i, &st) in chest.iter().enumerate() {
+                        let (x, y) = (mx + pad + (i % 9) as f32 * slot, wy + head + (i / 9) as f32 * slot);
+                        if draw_slot(&mut ui, x, y, slot, st, false, true) {
+                            if !st.is_empty() {
+                                tip = Some(st);
+                            }
+                            if ui.ptr.clicked {
+                                actions.push(Action::ChestSlot(i, false));
+                            } else if ui.ptr.rclicked {
+                                actions.push(Action::ChestSlot(i, true));
+                            }
+                        }
+                    }
+                    let iy = wy + head + 3.0 * slot;
+                    ui.text(mx + pad, iy + 11.0 * s, HEAD, "Inventory", INK);
+                    let gy = iy + head;
+                    for i in 0..items::BAG_END {
+                        let k = i.wrapping_sub(items::HOTBAR);
+                        let (x, y) = if i < items::HOTBAR {
+                            (mx + pad + i as f32 * slot, gy + 3.0 * slot + 10.0 * s)
+                        } else {
+                            (mx + pad + (k % 9) as f32 * slot, gy + (k / 9) as f32 * slot)
+                        };
+                        let st = self.inv.slots[i];
+                        if draw_slot(&mut ui, x, y, slot, st, i == self.sel, true) {
+                            if !st.is_empty() {
+                                tip = Some(st);
+                            }
+                            if ui.ptr.clicked {
+                                actions.push(Action::Slot(i, false));
+                            } else if ui.ptr.rclicked {
+                                actions.push(Action::Slot(i, true));
+                            }
+                        }
+                    }
+                    let held = self.inv.held;
+                    if !held.is_empty() {
+                        let (px, py) = (ui.ptr.x, ui.ptr.y);
+                        draw_stack(&mut ui, px - slot * 0.5, py - slot * 0.5, slot, held);
+                        if ui.ptr.clicked && !ui.hover(mx, wy, mw, mh) {
+                            actions.push(Action::DropHeld);
+                        }
+                    } else if let Some(st) = tip {
+                        draw_tip(&mut ui, st, wf, hf);
                     }
                 }
             }
@@ -1995,13 +2955,19 @@ impl Game {
             chunks: &chunks,
             // a little moonlight so nights stay playable
             daylight: 0.13 + 0.87 * daylight,
+            // (under a roof of rock, animals and monsters are as dim as their surroundings)
+            ent_light: (0.3 + 0.7 * (0.13 + 0.87 * daylight)) * if eye_sky == 0 { 0.22 + 0.78 * smooth(12.0, 44.0, eye.y) } else { 1.0 },
+            eye_y: eye.y,
             lights: &lights,
             sky: &sky,
             ents: &ents,
+            items: &item_verts,
+            hand: item_verts.len() - hand_from,
             ui: &ui.verts,
         });
         drop(chunks);
         self.ents = ents;
+        self.item_verts = item_verts;
         self.sky = sky;
         let t_render = t1.elapsed().as_secs_f32() * 1000.0;
         if std::env::var_os("CUBEWILD_PROF").is_some()
@@ -2100,7 +3066,7 @@ impl ApplicationHandler for App {
                     }
                     MouseButton::Middle if down => {
                         if let Some((p, _, _)) = g.target() {
-                            let b = g.world.get_block(p.x, p.y, p.z);
+                            let b = items::item_of(g.world.get_block(p.x, p.y, p.z));
                             if let Some(slot) = (0..items::HOTBAR).find(|&i| g.inv.hot(i) == b) {
                                 g.sel = slot;
                             } else if let Some(from) = (items::HOTBAR..items::BAG_END).find(|&i| g.inv.slots[i].item == b) {
@@ -2119,7 +3085,7 @@ impl ApplicationHandler for App {
                 if y != 0.0 && g.screen == Screen::Play {
                     g.sel = (g.sel as i32 + if y < 0.0 { 1 } else { -1 }).rem_euclid(9) as usize;
                 } else if y != 0.0 && g.screen == Screen::Inventory {
-                    let max = (RECIPES.len() / RECIPE_COLS) as i32;
+                    let max = if g.mode == Mode::Creative { items::ITEM_END as usize } else { RECIPES.len() } as i32 / RECIPE_COLS as i32;
                     g.recipe_scroll = (g.recipe_scroll as i32 + if y < 0.0 { 1 } else { -1 }).clamp(0, max) as usize;
                 }
             }
