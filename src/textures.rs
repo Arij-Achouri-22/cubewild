@@ -1,8 +1,12 @@
 //! Procedurally generated 16x16 block textures (no asset files).
 
 pub const TEX: usize = 16;
+/// The terrain mesh can only name the first 128 layers (it packs a layer in 7 bits),
+/// so blocks live below 128 and the icons and other textures above.
+/// The blocks of the Emberdeep (see `world::tex_for`).
+pub const DEEP_TEX: usize = 96;
 /// first layer holding item and HUD icons
-pub const ICON_BASE: usize = 96;
+pub const ICON_BASE: usize = 128;
 /// textures added after the icons: chest side, chest top, ladder, trapdoor
 pub const EXTRA_BASE: usize = ICON_BASE + 103;
 /// icons of the four slabs and two fences
@@ -67,6 +71,9 @@ fn pixel(layer: usize, x: i32, y: i32) -> [u8; 4] {
             shade([196.0, 62.0, 18.0], 0.8 + n * 0.2)
         };
     }
+    if (DEEP_TEX..DEEP_TEX + 15).contains(&layer) {
+        return deep_pixel(layer - DEEP_TEX, x, y);
+    }
     if layer >= ARM_TEX {
         let n = h(layer as u32, x, y);
         let c = if layer == ARM_TEX { [226.0, 176.0, 134.0] } else { [176.0, 92.0, 52.0] };
@@ -79,7 +86,7 @@ fn pixel(layer: usize, x: i32, y: i32) -> [u8; 4] {
         let weave = if (x + y) % 2 == 0 { 0.92 } else { 1.0 } * if x % 4 == 0 || y % 4 == 0 { 0.9 } else { 1.0 };
         return shade([c[0] as f32, c[1] as f32, c[2] as f32], weave * (0.94 + n * 0.08));
     }
-    if (57..ICON_BASE).contains(&layer) {
+    if (57..DEEP_TEX).contains(&layer) {
         return biome_pixel(layer, x, y);
     }
     // (doors keep the numbering their drawing code was written for)
@@ -1131,6 +1138,31 @@ fn item_pixel(item: usize, x: i32, y: i32) -> [u8; 4] {
                 NONE
             }
         }
+        93 => {
+            // fire striker: a flint held to a curved steel
+            let steel = (y == 11 || y == 12) && (3..=12).contains(&x) || (x == 3 || x == 4) && (7..=12).contains(&y) || (x == 12 && (9..=12).contains(&y));
+            let flint = (6..=10).contains(&x) && (4..=8).contains(&y) && (x - 8).abs() + (y - 6).abs() <= 3;
+            if flint {
+                shade([70.0, 70.0, 80.0], 0.9 + n * 0.25)
+            } else if steel {
+                shade([200.0, 200.0, 210.0], 0.95 + n * 0.1)
+            } else if (x, y) == (11, 4) || (x, y) == (12, 3) {
+                [255, 190, 70, 255]
+            } else {
+                NONE
+            }
+        }
+        94 => {
+            // ember: a glowing coal
+            let (dx, dy) = (x as f32 - 7.5, y as f32 - 8.0);
+            let d = dx * dx / 30.0 + dy * dy / 22.0;
+            if d < 1.0 {
+                let hot = h(951, x / 2, y / 2);
+                if hot > 0.55 { shade([255.0, 160.0, 50.0], 0.9 + n * 0.2) } else { shade([90.0, 30.0, 20.0], 0.8 + n * 0.3) }
+            } else {
+                NONE
+            }
+        }
         74 => {
             // boat, from the side: a hull narrowing to the keel, a seat, an oar
             let c = [168.0, 124.0, 72.0];
@@ -1243,4 +1275,63 @@ pub fn build() -> Vec<(u32, Vec<u8>)> {
         size = half;
     }
     out
+}
+
+/// The blocks of the Emberdeep.
+fn deep_pixel(i: usize, x: i32, y: i32) -> [u8; 4] {
+    let l = 700 + i as u32;
+    let n = h(l, x, y);
+    let n2 = h(l + 40, x / 2, y / 2);
+    let rgb = |c: [f32; 3], k: f32| shade(c, k);
+    match i {
+        // cinderstone: near-black glassy rock with violet glints
+        0 => {
+            if n > 0.9 { rgb([120.0, 70.0, 150.0], 1.0) } else { rgb([30.0, 22.0, 36.0], 0.8 + n2 * 0.4) }
+        }
+        // ashstone: crumbly reddish rock
+        1 => rgb([118.0, 52.0, 44.0], 0.78 + n * 0.22 + if n2 > 0.75 { -0.15 } else { 0.0 }),
+        // ash: fine pale grey with darker flecks
+        2 => rgb([150.0, 144.0, 138.0], if n > 0.85 { 0.7 } else { 0.92 + n2 * 0.1 }),
+        // scoria: dark porous grey, in vertical grain on its sides
+        3 => rgb([70.0, 66.0, 74.0], if (x + (n2 * 3.0) as i32) % 4 == 0 { 0.7 } else { 0.9 + n * 0.15 }),
+        4 => rgb([78.0, 74.0, 82.0], if (x - 7).abs().max((y - 7).abs()) % 3 == 0 { 0.75 } else { 0.92 + n * 0.12 }),
+        // smoulder: black crust over orange cracks
+        5 => {
+            let crack = ((x as f32 * 0.7 + (y as f32 * 0.9).sin() * 2.0).sin() * (y as f32 * 0.6 + (x as f32 * 0.5).cos()).cos()).abs() < 0.18;
+            if crack { rgb([255.0, 130.0, 30.0], 0.9 + n * 0.15) } else { rgb([50.0, 30.0, 26.0], 0.8 + n * 0.3) }
+        }
+        // ember moss: a red-orange carpet; its side is ashstone with moss creeping over
+        6 => rgb([170.0, 52.0, 30.0], 0.8 + n * 0.3 + if n2 > 0.8 { 0.2 } else { 0.0 }),
+        7 => {
+            let edge = 3 + (h(l + 9, x, 0) * 3.0) as i32;
+            if y < edge { rgb([170.0, 52.0, 30.0], 0.85 + n * 0.2) } else { rgb([118.0, 52.0, 44.0], 0.78 + n * 0.22) }
+        }
+        // cinderwood: violet-grey bark, rings on top
+        8 => rgb([86.0, 62.0, 84.0], if x % 5 == 0 { 0.7 } else { 0.88 + n * 0.15 }),
+        9 => {
+            let r = ((x as f32 - 7.5).powi(2) + (y as f32 - 7.5).powi(2)).sqrt() as i32;
+            rgb([130.0, 96.0, 120.0], if r % 3 == 0 { 0.75 } else { 0.95 + n * 0.08 })
+        }
+        // glowcap: glowing orange flesh with brighter spots
+        10 => {
+            if n > 0.82 { rgb([255.0, 236.0, 150.0], 1.0) } else { rgb([255.0, 140.0, 40.0], 0.85 + n2 * 0.2) }
+        }
+        // cinder planks
+        11 => rgb([118.0, 82.0, 112.0], if y % 4 == 0 { 0.7 } else if (x + (y / 4) * 7) % 16 == 0 { 0.75 } else { 0.9 + n * 0.1 }),
+        // sunshard: pale gold crystal facets
+        12 => {
+            let facet = ((x + y) / 3) % 2 == 0;
+            rgb([255.0, 226.0, 140.0], if facet { 1.0 } else { 0.86 } + n * 0.1)
+        }
+        // ember ore: ashstone with glowing orange nuggets
+        13 => {
+            let nug = h(l + 3, x / 2, y / 2) > 0.72 && n > 0.3;
+            if nug { rgb([255.0, 150.0, 50.0], 0.95 + n * 0.1) } else { rgb([118.0, 52.0, 44.0], 0.78 + n * 0.22) }
+        }
+        // ashstone bricks
+        _ => {
+            let mortar = y % 8 == 0 || (x + if (y / 8) % 2 == 0 { 0 } else { 8 }) % 16 == 0;
+            rgb([110.0, 50.0, 44.0], if mortar { 0.55 } else { 0.85 + n * 0.15 })
+        }
+    }
 }

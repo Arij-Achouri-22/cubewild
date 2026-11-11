@@ -348,6 +348,10 @@ impl Mobs {
     }
 
     fn try_spawn(&mut self, world: &World, player: Vec3, night: bool) {
+        if world.is_deep() {
+            // (the creatures of the Emberdeep come later)
+            return;
+        }
         if world.ver >= 3 {
             self.populate(world, player);
         }

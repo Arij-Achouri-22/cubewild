@@ -39,6 +39,10 @@ pub enum Snd {
     Boom,
     Shear,
     Bark,
+    /// an Ember Gate: lighting it, the hum inside it, the crossing
+    GateOpen,
+    GateHum,
+    Travel,
 }
 
 /// What a block sounds like under a foot or a pick.
@@ -723,6 +727,40 @@ fn build_bank(rate: f32) -> Bank {
         }
         other.push((Snd::Bark, leveled(v, 0.11, 0.7)));
     }
+    {
+        // a gate opening: a rising shimmer over a low swell
+        let mut v = s.tone(1.6, 110.0, 220.0, 0.4, 0.9, 0.4);
+        for (i, f) in [440.0, 554.0, 659.0, 880.0].into_iter().enumerate() {
+            let t = s.tone(1.2, f, f * 1.01, 0.05, 0.5, 0.1);
+            let at = s.len(0.12 * i as f32);
+            mix(&mut v, &t, 0.35, at);
+        }
+        let g = s.grains(40, 1.2, 0.03, 2000.0, 7000.0, 2.0, 1.0);
+        mix(&mut v, &g, 0.4, 0);
+        other.push((Snd::GateOpen, scaled(v, 0.5)));
+        // the hum while standing in one: a beating low chord
+        let mut v = s.tone(1.1, 98.0, 98.0, 0.15, 0.8, 0.5);
+        let b = s.tone(1.1, 101.5, 101.5, 0.15, 0.8, 0.3);
+        mix(&mut v, &b, 0.8, 0);
+        let hi = s.tone(1.1, 392.0, 392.0, 0.3, 0.6, 0.0);
+        mix(&mut v, &hi, 0.2, 0);
+        other.push((Snd::GateHum, scaled(v, 0.35)));
+        // the crossing: a long rushing sweep
+        let n = s.len(2.2);
+        let mut bp = Bq::new(Fk::Band, s.rate, 300.0, 2.0);
+        let rate = s.rate;
+        let mut v = Vec::with_capacity(n);
+        for i in 0..n {
+            let t = i as f32 / n as f32;
+            if i % 32 == 0 {
+                bp.set(Fk::Band, rate, 200.0 + 3800.0 * (t * std::f32::consts::PI).sin(), 2.5);
+            }
+            v.push(bp.run(s.noise()) * (t * 6.0).min(1.0) * (1.0 - t));
+        }
+        let low = s.tone(2.2, 60.0, 140.0, 0.3, 1.2, 0.5);
+        mix(&mut v, &low, 0.5, 0);
+        other.push((Snd::Travel, scaled(v, 0.6)));
+    }
     sounds.extend(other.into_iter().map(|(k, v)| (k, vec![v])));
     Bank { sounds }
 }
@@ -733,6 +771,10 @@ pub fn surface(b: crate::world::Block) -> Surface {
     match b {
         b if is_leaves(b) || is_plant(b) || is_grassy(b) => Surface::Grass,
         GRAVEL => Surface::Gravel,
+        ASH => Surface::Sand,
+        EMBER_MOSS | GLOWCAP => Surface::Grass,
+        CINDERWOOD | CINDER_PLANKS => Surface::Wood,
+        SUNSHARD | CINDERSTONE => Surface::Glass,
         DIRT | FARMLAND | CLAY | MUSHROOM | BERRY_BUSH | CACTUS | THATCH => Surface::Grass,
         SAND | RED_SAND | SANDSTONE => Surface::Sand,
         SNOW => Surface::Snow,
@@ -1188,6 +1230,6 @@ mod tests {
             let peak = s.iter().fold(0.0f32, |m, v| m.max(v.abs()));
             assert!(peak.is_finite() && peak > 0.05 && peak <= 1.0, "sound {i} peak {peak}");
         }
-        assert_eq!(b.sounds.len(), 8 * 4 + 11 * 3 + 20);
+        assert_eq!(b.sounds.len(), 8 * 4 + 11 * 3 + 23);
     }
 }

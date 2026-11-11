@@ -85,7 +85,13 @@ pub const BONE: Item = 155;
 pub const GEM: Item = 156;
 /// dyed wool (+ colour - 1; white wool is `CLOTH`)
 pub const WOOL_ITEM: Item = 157;
-pub const ITEM_END: Item = 172;
+/// the blocks of the Emberdeep (+ n of `world::CINDERSTONE` + n)
+pub const DEEP_ITEM: Item = 172;
+/// lights an Ember Gate
+pub const STRIKER: Item = 184;
+/// from ember ore: a fuel that burns a long time
+pub const EMBER: Item = 185;
+pub const ITEM_END: Item = 186;
 /// slots in a chest
 pub const CHEST_SLOTS: usize = 27;
 /// first texture layer holding item icons
@@ -95,7 +101,7 @@ pub const ICON_FOOD: u32 = ICON_BASE + 101;
 pub const ICON_AIR: u32 = ICON_BASE + 102;
 
 pub fn is_block(i: Item) -> bool {
-    (i != AIR && i < 64) || is_wool_item(i)
+    (i != AIR && i < 64) || is_wool_item(i) || (DEEP_ITEM..DEEP_ITEM + DEEP_BLOCKS).contains(&i)
 }
 
 pub fn is_wool_item(i: Item) -> bool {
@@ -104,7 +110,13 @@ pub fn is_wool_item(i: Item) -> bool {
 
 /// The block an item puts down (most block items are their own block).
 pub fn block_of(i: Item) -> Block {
-    if is_wool_item(i) { WOOL + (i - WOOL_ITEM) } else { i }
+    if is_wool_item(i) {
+        WOOL + (i - WOOL_ITEM)
+    } else if (DEEP_ITEM..DEEP_ITEM + DEEP_BLOCKS).contains(&i) {
+        CINDERSTONE + (i - DEEP_ITEM)
+    } else {
+        i
+    }
 }
 
 /// The colour of a dye item.
@@ -228,6 +240,20 @@ pub fn name(i: Item) -> &'static str {
         WATER_BUCKET => "Water Bucket",
         BOAT => "Boat",
         BONE => "Bone",
+        STRIKER => "Fire Striker",
+        EMBER => "Ember",
+        i if i == DEEP_ITEM => "Cinderstone",
+        i if i == DEEP_ITEM + 1 => "Ashstone",
+        i if i == DEEP_ITEM + 2 => "Ash",
+        i if i == DEEP_ITEM + 3 => "Scoria",
+        i if i == DEEP_ITEM + 4 => "Smoulder Rock",
+        i if i == DEEP_ITEM + 5 => "Ember Moss",
+        i if i == DEEP_ITEM + 6 => "Cinderwood",
+        i if i == DEEP_ITEM + 7 => "Glowcap",
+        i if i == DEEP_ITEM + 8 => "Cinder Planks",
+        i if i == DEEP_ITEM + 9 => "Sunshard",
+        i if i == DEEP_ITEM + 10 => "Ember Ore",
+        i if i == DEEP_ITEM + 11 => "Ashstone Bricks",
         GEM => "Gem",
         i if i == DYE + 0 => "White Dye",
         i if i == DYE + 1 => "Orange Dye",
@@ -297,8 +323,12 @@ pub fn icon(i: Item) -> u32 {
         LADDER_LAYER
     } else if i == TRAPDOOR {
         TRAP_LAYER
-    } else if is_wool_item(i) {
-        tex_for(block_of(i), 0)
+    } else if i == STRIKER {
+        ICON_BASE + 93
+    } else if i == EMBER {
+        ICON_BASE + 94
+    } else if is_wool_item(i) || (DEEP_ITEM..DEEP_ITEM + DEEP_BLOCKS).contains(&i) {
+        tex_for(block_of(i), if block_of(i) == EMBER_MOSS { 2 } else { 0 })
     } else if is_block(i) {
         tex_for(i, if i == FURNACE { 4 } else { 0 })
     } else {
@@ -403,6 +433,9 @@ fn pick_tier(i: Item) -> u8 {
 
 /// How many uses an item survives (0 = never wears out).
 pub fn max_wear(i: Item) -> u16 {
+    if i == STRIKER {
+        return 64;
+    }
     match gear(i) {
         Some((Kind::Pick | Kind::Axe | Kind::Shovel | Kind::Hoe | Kind::Sword, m)) => match m {
             Mat::Wood | Mat::Leather => 60,
@@ -555,6 +588,12 @@ pub fn desc(i: Item) -> &'static str {
         WATER_BUCKET => "Right click to pour the water out.",
         BOAT => "Right click water to put it in. Right click it to get in, Shift to get out.",
         BONE => "Wolves love them. Also grinds into white dye.",
+        STRIKER => "Right click a finished cinderstone frame to open an Ember Gate.",
+        EMBER => "Burns in a furnace for a very long time.",
+        i if i == DEEP_ITEM => "Forms where water meets lava. Build an Ember Gate's frame of it.",
+        i if i == DEEP_ITEM + 9 => "Glowing crystal from the roof of the Emberdeep.",
+        i if i == DEEP_ITEM + 2 => "Soft ash. It slows you down.",
+        i if i == DEEP_ITEM + 4 => "Hot to stand on.",
         GEM => "Villagers trade in these.",
         i if dye_colour(i).is_some() => "Dyes wool and sheep. Mix two to get a new colour.",
         i if is_wool_item(i) => "Soft, coloured building block. Shear sheep or dye white wool.",
@@ -623,6 +662,11 @@ pub const RECIPES: &[Recipe] = &[
     r(Cat::Utility, (TRAPDOOR, 2), &[(PLANKS, 6)], WORKBENCH),
     r(Cat::Utility, (BUCKET, 1), &[(IRON_INGOT, 3)], WORKBENCH),
     r(Cat::Utility, (BOAT, 1), &[(PLANKS, 5)], WORKBENCH),
+    r(Cat::Utility, (STRIKER, 1), &[(FLINT, 1), (IRON_INGOT, 1)], AIR),
+    r(Cat::Materials, (DEEP_ITEM + 8, 4), &[(DEEP_ITEM + 6, 1)], AIR),
+    r(Cat::Materials, (STICK, 4), &[(DEEP_ITEM + 8, 2)], AIR),
+    r(Cat::Building, (DEEP_ITEM + 11, 4), &[(DEEP_ITEM + 1, 4)], WORKBENCH),
+    r(Cat::Utility, (LAMP, 1), &[(DEEP_ITEM + 9, 2), (GLASS, 1)], WORKBENCH),
     r(Cat::Materials, (DYE + 14, 2), &[(FLOWER_RED, 1)], AIR),
     r(Cat::Materials, (DYE + 4, 2), &[(FLOWER_YELLOW, 1)], AIR),
     r(Cat::Materials, (DYE + 11, 2), &[(FLOWER_BLUE, 1)], AIR),
@@ -1064,6 +1108,8 @@ pub fn item_of(b: Block) -> Item {
         b if is_trapdoor(b) => TRAPDOOR,
         b if is_torch(b) => TORCH,
         b if (WOOL..WOOL_END).contains(&b) => WOOL_ITEM + (b - WOOL),
+        b if is_deep_block(b) => DEEP_ITEM + (b - CINDERSTONE),
+        b if is_gate(b) => AIR,
         LOOT_CHEST => CHEST,
         b if is_grassy(b) => GRASS,
         JUNGLE_LEAVES | ACACIA_LEAVES => LEAVES,
@@ -1079,6 +1125,8 @@ pub fn tier_needed(b: Block) -> u8 {
     match b {
         IRON_ORE => 2,
         CRYSTAL_ORE | GOLD_ORE => 3,
+        // (gates are built of something only the best pick cuts)
+        CINDERSTONE => 4,
         _ => 0,
     }
 }
@@ -1094,6 +1142,7 @@ pub fn drop_for(b: Block, tool: Item) -> Item {
         b if is_grassy(b) => DIRT,
         REEDS => FIBER,
         COAL_ORE => COAL,
+        EMBER_ORE => EMBER,
         CRYSTAL_ORE => CRYSTAL,
         BERRY_BUSH => BERRIES,
         DEAD_BUSH => STICK,
@@ -1118,6 +1167,13 @@ pub fn break_time(b: Block, tool: Item) -> f32 {
         None => base,
     };
     match b {
+        CINDERSTONE => with(Kind::Pick, 26.0, 1.0),
+        ASHSTONE | EMBER_MOSS | SMOULDER => with(Kind::Pick, 1.3, 1.0),
+        SCORIA | EMBER_ORE | ASHSTONE_BRICK => with(Kind::Pick, 2.6, 1.0),
+        ASH => with(Kind::Shovel, 0.5, 2.0),
+        CINDERWOOD | CINDER_PLANKS => with(Kind::Axe, 1.1, 2.0),
+        GLOWCAP => 0.4,
+        SUNSHARD => 0.3,
         STONE | COBBLE | BRICK | STONE_BRICK | SANDSTONE | FURNACE | COAL_ORE | IRON_ORE | CRYSTAL_ORE | GOLD_ORE
         | MOSSY_COBBLE | IRON_BLOCK | GOLD_BLOCK => {
             let hard = match b {

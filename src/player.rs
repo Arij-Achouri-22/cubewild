@@ -356,6 +356,9 @@ impl Player {
             } else {
                 4.4
             };
+            // ash is heavy going
+            let feet = world.get_block(b.x, (self.pos.y - 0.1).floor() as i32, b.z);
+            let speed = if feet == crate::world::ASH { speed * 0.6 } else { speed };
             let target = wish * speed;
             let k = 1.0 - (-dt * if self.on_ground { 14.0 } else { 3.5 }).exp();
             self.vel.x += (target.x - self.vel.x) * k;
