@@ -1,12 +1,16 @@
 //! Animals: huntable deer, boar and hare, and wolves that hunt you at night.
 //! Monsters: zombies, skeleton archers, giant spiders and slimes that roam the dark.
+//! Villagers: the peaceful people of the villages, who keep to their paths and houses.
 
 use crate::gfx::{EntVert, EMISSIVE};
 use crate::items::{Item, ARROW, FIBER, FLINT, HIDE, IRON_INGOT, MEAT};
 use crate::path::{settle, walk_line, Body, Finder, Probe};
 use crate::player::{collides, move_step, ray_aabb, raycast_with};
-use crate::world::{is_grassy, is_ladder, is_leaves, is_solid, World, AIR, CLAY, CLOTH, LAVA, SEA, SNOW, WATER};
+use crate::village::{self, Village};
+use crate::world::{hash2, is_grassy, is_ladder, is_leaves, is_solid, World, AIR, CLAY, CLOTH, LAVA, SEA, SNOW, WATER};
 use glam::{IVec3, Mat4, Vec3};
+use std::collections::HashSet;
+use std::sync::Arc;
 
 pub struct Rng(pub u64);
 impl Rng {
@@ -34,6 +38,7 @@ pub enum Kind {
     Skeleton,
     Spider,
     Slime,
+    Villager,
 }
 
 impl Kind {
@@ -77,6 +82,7 @@ fn spec(k: Kind) -> Spec {
         Kind::Skeleton => sp(0.25, 1.8, 7, 1.6, 3.2, 0.0, 0, 0, 20.0, 0.0),
         Kind::Spider => sp(0.4, 0.6, 5, 1.4, 5.6, 0.0, 0, 0, 16.0, 2.0),
         Kind::Slime => sp(0.4, 0.7, 5, 2.2, 3.6, 0.0, 0, 0, 14.0, 2.0),
+        Kind::Villager => sp(0.3, 1.8, 8, 1.5, 4.2, 0.0, 0, 0, 0.0, 0.0),
     }
 }
 
@@ -87,6 +93,7 @@ fn drops(k: Kind, rng: &mut Rng) -> Drops {
         Kind::Skeleton => [(ARROW, 1 + rng.next() % 3), (FLINT, (rng.next() % 3 == 0) as u32)],
         Kind::Spider => [(FIBER, 1 + rng.next() % 2), (0, 0)],
         Kind::Slime => [(CLAY as Item, 1 + rng.next() % 2), (0, 0)],
+        Kind::Villager => [(0, 0), (0, 0)],
         _ => [(MEAT, s.meat), (HIDE, s.hide)],
     }
 }
@@ -138,6 +145,58 @@ pub struct Mob {
     distrust: f32,
     /// a skeleton's line of sight to the player, checked when it plans
     los: bool,
+    /// a villager's village, and which of its homes is this one's
+    village: Option<Arc<Village>>,
+    slot: usize,
+    /// where a villager is walking to
+    goal: Option<Vec3>,
+}
+
+/// Plans a mob's way to `target`: straight if that works, otherwise round the obstacles.
+fn plan(m: &mut Mob, s: &Spec, target: Vec3, drop: i32, probe: &mut Probe<'_>, finder: &mut Finder, searches: &mut i32, rng: &mut Rng) {
+    let body = Body { tall: s.h.ceil() as i32, wide: s.hw * 2.0, drop };
+    let mut get = |x, y, z| probe.get(x, y, z);
+    // (standing on a slab counts as the cell above it)
+    let cell = |p: Vec3| IVec3::new(p.x.floor() as i32, (p.y + 0.55).floor() as i32, p.z.floor() as i32);
+    // (perched in the same cell as a door or window: start from beside it)
+    let from = [(0.0, 0.0), (s.hw, 0.0), (-s.hw, 0.0), (0.0, s.hw), (0.0, -s.hw)]
+        .into_iter()
+        .find_map(|(ox, oz)| settle(&mut get, cell(m.pos + Vec3::new(ox, 0.0, oz)), body));
+    match (from, settle(&mut get, cell(target), body)) {
+        (Some(a), Some(b)) => {
+            if m.distrust <= 0.0 && walk_line(&mut get, a, b, body) {
+                m.direct = true;
+                m.repath = rng.range(0.25, 0.4);
+            } else if *searches > 0 {
+                *searches -= 1;
+                let reached = finder.find(&mut get, a, b, body, PATH_BUDGET, &mut m.path);
+                m.path_i = 0;
+                // a spider that finds no way round goes over instead
+                m.direct = m.path.is_empty() || (!reached && m.kind == Kind::Spider);
+                m.repath = rng.range(0.45, 0.75);
+            }
+        }
+        // mid-air, or the target is: keep going as before
+        _ => m.repath = 0.3,
+    }
+}
+
+/// Turns a mob towards the next cell of its path. False when it has none left to follow
+/// and heads straight for its target.
+fn follow(m: &mut Mob, s: &Spec) -> bool {
+    // wide bodies have to line up with a gap more exactly
+    let near = (0.55 - s.hw).clamp(0.15, 0.3);
+    while !m.direct && m.path_i < m.path.len() {
+        let wp = m.path[m.path_i];
+        let (dx, dz, dy) = (wp.x as f32 + 0.5 - m.pos.x, wp.z as f32 + 0.5 - m.pos.z, m.pos.y - wp.y as f32);
+        if dx * dx + dz * dz < near * near && dy > -0.6 && dy < 1.3 {
+            m.path_i += 1;
+            continue;
+        }
+        m.heading = dx.atan2(dz);
+        return true;
+    }
+    false
 }
 
 pub struct Mobs {
@@ -149,6 +208,8 @@ pub struct Mobs {
     finder: Finder,
     /// the player is left alone (a creative world)
     pub ignore: bool,
+    /// villagers that were killed: (the square of their village, their home in it)
+    gone: HashSet<((i32, i32), usize)>,
 }
 
 /// cells one route search may expand; with one search a frame this bounds the cost
@@ -162,10 +223,36 @@ const SAFE_LIGHT: f32 = 9.0;
 
 impl Mobs {
     pub fn new(seed: u64) -> Mobs {
-        Mobs { list: Vec::new(), shots: Vec::new(), rng: Rng(seed | 1), spawn_timer: 0.0, finder: Finder::default(), ignore: false }
+        Mobs { list: Vec::new(), shots: Vec::new(), rng: Rng(seed | 1), spawn_timer: 0.0, finder: Finder::default(), ignore: false, gone: HashSet::new() }
+    }
+
+    /// Puts the people of the villages round the player into their houses: everyone who
+    /// is not about already, and was not killed.
+    fn populate(&mut self, world: &World, player: Vec3) {
+        let (px, pz) = (player.x.floor() as i32, player.z.floor() as i32);
+        for v in village::near(world.seed, px, pz, px, pz, 96 + village::REACH) {
+            for (slot, &home) in v.homes.iter().enumerate() {
+                let pos = home + Vec3::new(0.0, 0.01, 0.0);
+                if (home - player).length_squared() > 96.0 * 96.0 || !world.is_loaded(home.x.floor() as i32, home.z.floor() as i32) {
+                    continue;
+                }
+                let about = self.list.iter().any(|m| m.slot == slot && m.village.as_ref().is_some_and(|w| w.region == v.region));
+                if about || self.gone.contains(&(v.region, slot)) || collides(world, pos, 0.3, 1.8) {
+                    continue;
+                }
+                self.add(Kind::Villager, pos);
+                if let Some(m) = self.list.last_mut() {
+                    m.village = Some(v.clone());
+                    m.slot = slot;
+                }
+            }
+        }
     }
 
     fn try_spawn(&mut self, world: &World, player: Vec3, night: bool) {
+        if world.ver >= 3 {
+            self.populate(world, player);
+        }
         let ang = self.rng.range(0.0, std::f32::consts::TAU);
         let dist = self.rng.range(26.0, 72.0);
         let (bx, bz) = (player.x + ang.cos() * dist, player.z + ang.sin() * dist);
@@ -173,6 +260,7 @@ impl Mobs {
         for m in &self.list {
             match m.kind {
                 Kind::Wolf => wolves += 1,
+                Kind::Villager => {}
                 k if k.is_monster() => monsters += 1,
                 _ => animals += 1,
             }
@@ -300,6 +388,9 @@ impl Mobs {
                 direct: true,
                 distrust: 0.0,
                 los: true,
+                village: None,
+                slot: 0,
+                goal: None,
             });
         }
     }
@@ -373,7 +464,48 @@ impl Mobs {
                     s.sight
                 };
                 hunting = m.flee <= 0.0 && dist < sight;
-                if hunting {
+                if m.kind == Kind::Villager && m.flee <= 0.0 {
+                    // home for the night; by day, now standing about, now off to another
+                    // part of the village
+                    let home = m.village.as_ref().map_or(m.pos, |v| v.homes[m.slot]);
+                    m.timer -= dt;
+                    if night {
+                        if m.goal != Some(home) {
+                            m.goal = Some(home);
+                            m.repath = 0.0;
+                        }
+                    } else if m.timer <= 0.0 {
+                        m.goal = match &m.village {
+                            Some(v) if rng.f() < 0.7 => Some(v.spots[rng.next() as usize % v.spots.len()]),
+                            _ => None,
+                        };
+                        m.timer = if m.goal.is_some() { rng.range(10.0, 24.0) } else { rng.range(2.0, 7.0) };
+                        m.repath = 0.0;
+                    }
+                    if let Some(g) = m.goal {
+                        let (dx, dz) = (g.x - m.pos.x, g.z - m.pos.z);
+                        if dx * dx + dz * dz < 0.5 {
+                            if !night {
+                                m.goal = None;
+                                m.timer = rng.range(2.0, 7.0);
+                            }
+                        } else {
+                            m.repath -= dt;
+                            m.distrust -= dt;
+                            if m.repath <= 0.0 {
+                                // (aimed a little high: the ground may have been built up)
+                                plan(m, &s, g + Vec3::new(0.0, 1.2, 0.0), 2, &mut probe, finder, &mut searches, rng);
+                            }
+                            m.heading = dx.atan2(dz);
+                            follow(m, &s);
+                            speed = s.walk;
+                        }
+                    }
+                    // turns to whoever comes up to it
+                    if speed == 0.0 && dist < 5.0 {
+                        face = Some(to_player.x.atan2(to_player.z));
+                    }
+                } else if hunting {
                     let toward = to_player.x.atan2(to_player.z);
                     m.grazing = false;
                     let flat = Vec3::new(to_player.x, 0.0, to_player.z).length();
@@ -381,51 +513,14 @@ impl Mobs {
                     m.repath -= dt;
                     m.distrust -= dt;
                     if m.repath <= 0.0 {
-                        let body = Body { tall: s.h.ceil() as i32, wide: s.hw * 2.0, drop: 4 };
-                        let mut get = |x, y, z| probe.get(x, y, z);
-                        // (standing on a slab counts as the cell above it)
-                        let cell = |p: Vec3| IVec3::new(p.x.floor() as i32, (p.y + 0.55).floor() as i32, p.z.floor() as i32);
-                        // (perched in the same cell as a door or window: start from beside it)
-                        let from = [(0.0, 0.0), (s.hw, 0.0), (-s.hw, 0.0), (0.0, s.hw), (0.0, -s.hw)]
-                            .into_iter()
-                            .find_map(|(ox, oz)| settle(&mut get, cell(m.pos + Vec3::new(ox, 0.0, oz)), body));
-                        match (from, settle(&mut get, cell(player), body)) {
-                            (Some(a), Some(b)) => {
-                                if m.distrust <= 0.0 && walk_line(&mut get, a, b, body) {
-                                    m.direct = true;
-                                    m.repath = rng.range(0.25, 0.4);
-                                } else if searches > 0 {
-                                    searches -= 1;
-                                    let reached = finder.find(&mut get, a, b, body, PATH_BUDGET, &mut m.path);
-                                    m.path_i = 0;
-                                    // a spider that finds no way round goes over instead
-                                    m.direct = m.path.is_empty() || (!reached && m.kind == Kind::Spider);
-                                    m.repath = rng.range(0.45, 0.75);
-                                }
-                            }
-                            // mid-air, or the player is: keep going as before
-                            _ => m.repath = 0.3,
-                        }
+                        plan(m, &s, player, 4, &mut probe, finder, &mut searches, rng);
                         if m.kind == Kind::Skeleton {
                             m.los = clear_path(world, m.pos + Vec3::new(0.0, 1.35, 0.0), player + Vec3::new(0.0, 1.2, 0.0));
                         }
                     }
                     // head for the next cell of the path, or straight at the player
-                    let mut pathing = false;
                     m.heading = toward;
-                    // wide bodies have to line up with a gap more exactly
-                    let near = (0.55 - s.hw).clamp(0.15, 0.3);
-                    while !m.direct && m.path_i < m.path.len() {
-                        let wp = m.path[m.path_i];
-                        let (dx, dz, dy) = (wp.x as f32 + 0.5 - m.pos.x, wp.z as f32 + 0.5 - m.pos.z, m.pos.y - wp.y as f32);
-                        if dx * dx + dz * dz < near * near && dy > -0.6 && dy < 1.3 {
-                            m.path_i += 1;
-                            continue;
-                        }
-                        m.heading = dx.atan2(dz);
-                        pathing = true;
-                        break;
-                    }
+                    let pathing = follow(m, &s);
                     // stop at arm's length, but keep coming while the player is on another
                     // level: down in a hole, or where the path still has a way to go
                     let chase = flat > 1.0 || (to_player.y.abs() > 1.5 && (pathing || to_player.y < 0.0));
@@ -569,7 +664,7 @@ impl Mobs {
                 if m.stall > 0.7 {
                     m.stall = 0.0;
                     m.heading += rng.range(1.6, 4.6);
-                    if hunting {
+                    if hunting || m.goal.is_some() {
                         // the straight line snagged on something: search for a way round
                         m.distrust = 4.0;
                         m.repath = 0.0;
@@ -616,6 +711,10 @@ impl Mobs {
     /// Damages an animal or monster. Returns what it drops if it died.
     pub fn hit(&mut self, i: usize, from: Vec3, damage: i32) -> Option<Drops> {
         let m = &mut self.list[i];
+        if let (Some(v), true) = (&m.village, m.hp > 0 && m.hp <= damage) {
+            self.gone.insert((v.region, m.slot));
+        }
+        m.goal = None;
         m.hp -= damage;
         m.hurt = 0.3;
         // prey bolts, a wolf backs off for a moment, monsters just keep coming
@@ -674,7 +773,7 @@ impl Mobs {
                 }
             };
             let swing = m.phase.sin() * if alive { 0.7 * moving } else { 0.0 };
-            if m.kind.is_monster() {
+            if m.kind.is_monster() || m.kind == Kind::Villager {
                 draw_monster(out, m, &base, swing, &tint);
                 continue;
             }
@@ -854,6 +953,41 @@ fn draw_monster(out: &mut Vec<EntVert>, m: &Mob, base: &Mat4, swing: f32, tint: 
             part(&body, [-0.16, 0.14, 0.4], [0.16, 0.2, 0.41], [24, 70, 62], O); // mouth
             for sx in [-1.0f32, 1.0] {
                 part(&body, [sx * 0.17 - 0.07, 0.36, 0.4], [sx * 0.17 + 0.07, 0.52, 0.41], [20, 44, 44], O);
+            }
+        }
+        Kind::Villager => {
+            // dressed each in their own colours, some in a straw hat, some in a cap
+            let look = hash2(m.village.as_ref().map_or(0, |v| v.region.0 as u32 ^ (v.region.1 as u32).rotate_left(16)), m.slot as i32, 7);
+            const TUNICS: [[u8; 3]; 6] = [[156, 62, 52], [58, 92, 150], [84, 124, 62], [190, 140, 56], [112, 70, 120], [200, 188, 160]];
+            const SKINS: [[u8; 3]; 4] = [[232, 190, 152], [204, 156, 112], [160, 112, 76], [116, 78, 54]];
+            const HAIRS: [[u8; 3]; 4] = [[52, 38, 28], [110, 72, 38], [176, 140, 76], [150, 150, 150]];
+            let tunic = TUNICS[(look % 6) as usize];
+            let skin = SKINS[((look >> 4) % 4) as usize];
+            let hair = HAIRS[((look >> 8) % 4) as usize];
+            let shade = |c: [u8; 3]| c.map(|v| (v as u16 * 7 / 10) as u8);
+            let (trousers, straw) = ([92, 72, 54], [216, 188, 112]);
+            part(base, [-0.24, 0.74, -0.14], [0.24, 1.38, 0.14], tunic, O);
+            part(base, [-0.25, 0.56, -0.15], [0.25, 0.76, 0.15], shade(tunic), O); // skirt of the tunic
+            part(base, [-0.255, 0.78, -0.155], [0.255, 0.85, 0.155], [70, 50, 34], O); // belt
+            let nod = if alive { (m.age * 0.9 + m.slot as f32).sin() * 0.04 } else { 0.0 };
+            let head = *base * Mat4::from_translation(Vec3::new(0.0, 1.38, 0.0)) * Mat4::from_rotation_x(nod);
+            part(&head, [-0.19, 0.0, -0.19], [0.19, 0.38, 0.19], skin, O);
+            part(&head, [-0.2, 0.12, -0.2], [0.2, 0.39, -0.06], hair, O); // hair down the back of the head
+            part(&head, [-0.07, 0.07, 0.19], [0.07, 0.1, 0.2], shade(skin), O); // mouth
+            if (look >> 12) & 1 == 0 {
+                part(&head, [-0.36, 0.34, -0.36], [0.36, 0.38, 0.36], straw, O); // brim
+                part(&head, [-0.2, 0.38, -0.2], [0.2, 0.5, 0.2], straw, O);
+                part(&head, [-0.205, 0.38, -0.205], [0.205, 0.42, 0.205], shade(tunic), O); // band
+            } else {
+                part(&head, [-0.2, 0.3, -0.2], [0.2, 0.42, 0.2], shade(tunic), O); // cap
+            }
+            for sx in [-1.0f32, 1.0] {
+                part(&head, [sx * 0.09 - 0.035, 0.19, 0.19], [sx * 0.09 + 0.035, 0.25, 0.2], [40, 32, 30], O); // eyes
+                part(&limb([sx * 0.11, 0.75, 0.0], sx * swing), [-0.1, -0.75, -0.1], [0.1, 0.0, 0.1], trousers, O);
+                // arms at the sides, swinging against the legs: a sleeve, and a hand below it
+                let arm = limb([sx * 0.32, 1.34, 0.0], -sx * swing * 0.8 + sway * 0.3);
+                part(&arm, [-0.08, -0.42, -0.08], [0.08, 0.0, 0.08], tunic, O);
+                part(&arm, [-0.07, -0.62, -0.07], [0.07, -0.42, 0.07], skin, O);
             }
         }
         _ => {}

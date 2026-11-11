@@ -57,9 +57,16 @@ the country changes as you travel (F3 names the biome you stand in).
   undergrowth. **Swamp**: drowned flat land, dark grass, reeds and squat wide oaks.
 - **Mountains** rise inland; it gets colder with height, so their slopes turn to pine
   woods, then bare rock, then snow (hot country keeps bare peaks).
+- **Villages** are rare: you have to go and look for them. About one square of 640 blocks
+  in ten holds one, on level plains, meadows, savanna, desert or snowfields, so the
+  nearest is usually 400 to 1500 blocks from where you start. Each has a roofed well, a
+  few houses built from what the country offers (some with a chest), wheat fields, lamp
+  posts and gravel paths. **Villagers** live there: by day they stroll the paths and turn
+  to look at you, at night they go home. They harm nobody; one that is killed stays gone.
 
-Worlds made before biomes existed keep their old terrain: a world stays with the generator
-it was made with, so nothing already built is disturbed. Start a new world to see the rest.
+Worlds made before biomes or villages existed keep their old terrain: a world stays with
+the generator it was made with, so nothing already built is disturbed. Start a new world
+to see the rest.
 
 ## Controls
 
@@ -212,13 +219,17 @@ CUBEWILD_MAP_DIR=/some/folder cargo test --release worldgen_survey -- --ignored 
 prints land, mountain, desert, ore and cave figures for twenty seeds and writes a
 top-down map of each (`map-<seed>.ppm`).
 
+`cargo test --release village_survey -- --ignored --nocapture` counts the villages of
+twelve seeds and prints where the one nearest the start is (F3 shows your position).
+
 ## Layout
 
 - `src/world.rs` — blocks, terrain, caves and ores, where a new world's player starts, greedy mesher with AO and sky exposure, chunk streaming
 - `src/gfx.rs` — renderer (one draw call per chunk, 4-byte packed vertices; buried cave
   walls of far chunks are skipped while you are above ground)
 - `src/player.rs` — movement, collision, ray casting
-- `src/mobs.rs` — animals, wolves and monsters
+- `src/mobs.rs` — animals, wolves, monsters and villagers
+- `src/village.rs` — villages: where they stand, their layout, building them into chunks
 - `src/path.rs` — path finding for hunting mobs (A* over walkable cells, one search a frame)
 - `src/items.rs` — items, inventory, recipes, mining times
 - `src/loot.rs` — items lying in the world, and what chests hold

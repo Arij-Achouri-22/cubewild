@@ -102,8 +102,9 @@ pub const REEDS: Block = 72;
 pub const DRY_TUFT: Block = 73;
 
 /// The terrain generator a world was made with: 1 the first one, 2 the one with biomes
-/// (`worldgen`). A world keeps its generator for good, or old and new chunks would not fit.
-pub const GEN_LATEST: u8 = 2;
+/// (`worldgen`), 3 the same with villages in it (`village`). A world keeps its generator
+/// for good, or old and new chunks would not fit.
+pub const GEN_LATEST: u8 = 3;
 
 /// Shapes that live only in the world, one id per state (their items are in `items`).
 /// Upper half slabs, same order as `SLAB`.
@@ -828,7 +829,7 @@ pub fn spawn_for(ver: u8, seed: u32) -> (i32, i32, i32) {
     if ver >= 2 { crate::worldgen::spawn_point(seed) } else { spawn_point(seed) }
 }
 fn generate_for(ver: u8, seed: u32, cx: i32, cz: i32) -> ChunkData {
-    if ver >= 2 { crate::worldgen::generate(seed, cx, cz) } else { generate(seed, cx, cz) }
+    if ver >= 2 { crate::worldgen::generate(seed, cx, cz, ver >= 3) } else { generate(seed, cx, cz) }
 }
 
 // ---------------------------------------------------------------- chunk data
