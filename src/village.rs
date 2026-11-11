@@ -95,6 +95,7 @@ fn palette(b: Biome, r: u32) -> Option<Palette> {
 
 /// A house or a field: its outer edge, the level of its floor, and the side its door (or
 /// the end of its path) is on.
+#[derive(Clone)]
 pub struct Lot {
     pub x0: i32,
     pub z0: i32,
@@ -127,6 +128,7 @@ impl Lot {
     }
 }
 
+#[derive(Clone)]
 pub struct Village {
     /// the square of the world it belongs to
     pub region: (i32, i32),
@@ -157,14 +159,14 @@ fn layout(seed: u32, rx: i32, rz: i32) -> Option<Village> {
     let c = worldgen::column(seed, x, z);
     let r = hash2(seed ^ 0x0a11_7a6e, rx, rz);
     let pal = palette(c.biome, r)?;
-    if c.h <= SEA + 1 || c.h > 80 {
+    if c.h <= GSEA + 1 || c.h > 80 {
         return None;
     }
     // a quick look round before the ground is surveyed properly
     for k in 0..8 {
         let a = k as f32 * std::f32::consts::TAU / 8.0;
         let n = worldgen::column(seed, x + (a.cos() * 22.0) as i32, z + (a.sin() * 22.0) as i32);
-        if n.h <= SEA || (n.h - c.h).abs() > 6 {
+        if n.h <= GSEA || (n.h - c.h).abs() > 6 {
             return None;
         }
     }
@@ -176,7 +178,7 @@ fn layout(seed: u32, rx: i32, rz: i32) -> Option<Village> {
         (z0 - 1..=z1 + 1).all(|pz| {
             (x0 - 1..=x1 + 1).all(|px| {
                 let h = hat(px, pz);
-                h > SEA + 1 && (h - g).abs() <= 2
+                h > GSEA + 1 && (h - g).abs() <= 2
             })
         })
     };
@@ -232,7 +234,7 @@ fn layout(seed: u32, rx: i32, rz: i32) -> Option<Village> {
         .iter()
         .take(2 + (r >> 20) as usize % 3)
         .map(|&(dx, dz)| (x + dx, hat(x + dx, z + dz), z + dz))
-        .filter(|&(px, h, pz)| h > SEA && !built(px, pz))
+        .filter(|&(px, h, pz)| h > GSEA && !built(px, pz))
         .collect();
     // a path from every door to the well, two cells wide
     let mut paths: Vec<(i32, i32, i32)> = Vec::new();
@@ -251,7 +253,7 @@ fn layout(seed: u32, rx: i32, rz: i32) -> Option<Village> {
             }
             for (qx, qz) in [(px, pz), (px + wide.0, pz + wide.1)] {
                 let h = hat(qx, qz);
-                if h > SEA && !built(qx, qz) && !lamps.iter().any(|l| l.0 == qx && l.2 == qz) {
+                if h > GSEA && !built(qx, qz) && !lamps.iter().any(|l| l.0 == qx && l.2 == qz) {
                     paths.push((qx, h, qz));
                 }
             }
@@ -290,6 +292,21 @@ fn get(seed: u32, rx: i32, rz: i32) -> Option<Arc<Village>> {
 }
 
 /// The villages whose well lies within `pad` blocks of a rectangle of columns.
+/// The villages near a place, in world heights (the generator builds them `LIFT` lower).
+pub fn near_world(seed: u32, x0: i32, z0: i32, x1: i32, z1: i32, pad: i32) -> Vec<Arc<Village>> {
+    let up = Vec3::Y * LIFT as f32;
+    near(seed, x0, z0, x1, z1, pad)
+        .into_iter()
+        .map(|v| {
+            let mut w = (*v).clone();
+            w.g += LIFT;
+            w.homes.iter_mut().for_each(|h| *h += up);
+            w.spots.iter_mut().for_each(|h| *h += up);
+            Arc::new(w)
+        })
+        .collect()
+}
+
 pub fn near(seed: u32, x0: i32, z0: i32, x1: i32, z1: i32, pad: i32) -> Vec<Arc<Village>> {
     const RS: i32 = SPACING * CW;
     let mut out = Vec::new();
@@ -328,12 +345,12 @@ impl Edit<'_> {
         (self.ox..self.ox + CW).contains(&x) && (self.oz..self.oz + CW).contains(&z)
     }
     fn set(&mut self, x: i32, y: i32, z: i32, b: Block) {
-        if self.inside(x, z) && (1..CH).contains(&y) {
+        if self.inside(x, z) && (1..GH).contains(&y) {
             self.blocks[bidx(x - self.ox, y, z - self.oz)] = b;
         }
     }
     fn get(&self, x: i32, y: i32, z: i32) -> Block {
-        if self.inside(x, z) && (0..CH).contains(&y) { self.blocks[bidx(x - self.ox, y, z - self.oz)] } else { AIR }
+        if self.inside(x, z) && (0..GH).contains(&y) { self.blocks[bidx(x - self.ox, y, z - self.oz)] } else { AIR }
     }
     /// Makes a column end in `top` at level `g`: open above, packed with `fill` below,
     /// down to firm ground.

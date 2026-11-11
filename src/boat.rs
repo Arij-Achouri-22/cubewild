@@ -4,7 +4,7 @@
 use crate::gfx::EntVert;
 use crate::mobs::push_box;
 use crate::player::{move_collide, ray_aabb, Input};
-use crate::world::{World, WATER};
+use crate::world::{is_water, World};
 use glam::{Mat4, Vec3};
 use std::path::Path;
 
@@ -73,8 +73,8 @@ impl Boats {
             }
             b.hurt = (b.hurt - dt).max(0.0);
             let at = |y: f32| world.get_block(b.pos.x.floor() as i32, y.floor() as i32, b.pos.z.floor() as i32);
-            let sunk = at(b.pos.y + 0.05) == WATER;
-            let resting = at(b.pos.y - 0.25) == WATER;
+            let sunk = is_water(at(b.pos.y + 0.05));
+            let resting = is_water(at(b.pos.y - 0.25));
             b.on_water = sunk || resting;
             if sunk {
                 // pushed up to the surface
@@ -173,7 +173,7 @@ mod tests {
     #[test]
     fn a_boat_floats_and_rows_forward() {
         // a lake: water from y 6 to 9 everywhere
-        let w = World::flat(|_, y, _| (6..=9).contains(&y).then_some(WATER));
+        let w = World::flat(|_, y, _| (6..=9).contains(&y).then_some(crate::world::WATER));
         let mut boats = Boats::default();
         boats.place(Vec3::new(0.5, 12.0, 0.5), 0.0);
         let still = Input::default();

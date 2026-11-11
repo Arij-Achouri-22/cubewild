@@ -33,6 +33,7 @@ pub fn smelt(i: Item) -> Option<(Item, u32)> {
     Some(match i {
         IRON_ORE => (items::IRON_INGOT, 1),
         GOLD_ORE => (items::GOLD_INGOT, 1),
+        i if i == items::EXTRA_ITEM + 3 => (items::PYRE_INGOT, 1),
         LOG | BIRCH_LOG => (items::COAL, 1),
         items::MEAT => (items::COOKED_MEAT, 1),
         items::RAW_FISH => (items::COOKED_FISH, 1),
@@ -46,6 +47,7 @@ pub fn smelt(i: Item) -> Option<(Item, u32)> {
 /// Experience a cooked item gives.
 pub fn smelt_xp(i: Item) -> f32 {
     match i {
+        items::PYRE_INGOT => 4.0,
         items::GOLD_INGOT => 1.0,
         items::IRON_INGOT => 0.7,
         items::COOKED_MEAT | items::COOKED_FISH => 0.35,
@@ -58,6 +60,7 @@ pub fn fuel(i: Item) -> f32 {
     match i {
         items::COAL => 80.0,
         items::EMBER => 200.0,
+        items::LAVA_BUCKET => 1000.0,
         i if i == items::DEEP_ITEM + 6 || i == items::DEEP_ITEM + 8 => 15.0,
         LOG | BIRCH_LOG | PLANKS | BIRCH_PLANKS | WORKBENCH | CHEST | FENCE | BIRCH_FENCE => 15.0,
         items::LADDER | items::TRAPDOOR | items::OAK_DOOR | items::BIRCH_DOOR => 12.0,
@@ -97,8 +100,10 @@ impl Furnace {
                     continue;
                 }
                 f.n -= 1;
-                if f.n == 0 {
-                    // a bucket of lava would leave its bucket; nothing here does
+                if f.item == items::LAVA_BUCKET {
+                    // a bucket of lava leaves its bucket behind
+                    *f = Stack::new(items::BUCKET, 1);
+                } else if f.n == 0 {
                     *f = Stack::default();
                 }
                 self.burn = secs;

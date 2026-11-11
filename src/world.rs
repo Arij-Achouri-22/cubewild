@@ -10,9 +10,17 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
 pub const CW: i32 = 16; // chunk width (x and z)
-pub const CH: i32 = 128; // chunk height
-pub const SEA: i32 = 40;
+pub const CH: i32 = 256; // chunk height
+/// The terrain generators build a world `GH` tall with its sea at `GSEA`; it stands on
+/// `LIFT` blocks of deep slate (`under_layer`), so in the world everything they make is
+/// `LIFT` higher. Worlds saved before the slate are moved up by `migrate` (in main).
+pub const GH: i32 = 128;
+pub const LIFT: i32 = 64;
+pub const GSEA: i32 = 40;
+pub const SEA: i32 = GSEA + LIFT;
 pub(crate) const VOL: usize = (CW * CW * CH) as usize;
+/// a chunk as the generators make it, and as worlds before the slate saved it
+pub(crate) const GVOL: usize = (CW * CW * GH) as usize;
 
 pub type Block = u8;
 pub const AIR: Block = 0;
@@ -137,6 +145,89 @@ pub const SUNSHARD: Block = 105;
 pub const EMBER_ORE: Block = 106;
 pub const ASHSTONE_BRICK: Block = 107;
 pub const DEEP_BLOCKS: Block = 12;
+/// Deep slate: the rock under the old bedrock, all the way down to the new bedrock.
+pub const SLATE: Block = 108;
+/// the blackened bricks of the ruined fortresses of the Emberdeep, whole and cracked
+pub const FORT_BRICK: Block = 109;
+pub const FORT_CRACKED: Block = 110;
+/// pyre ore: the rare metal of the Emberdeep, found deep down near the lava sea
+pub const PYRE_ORE: Block = 111;
+/// The blocks above have items (`items::EXTRA_ITEM` + n of `SLATE` + n).
+pub const EXTRA_BLOCKS: Block = 4;
+/// Flowing water, + 0 (strongest, also falling water) .. + 6 (weakest): see `fluid`.
+pub const WATER_FLOW: Block = 112;
+pub const WATER_FLOW_END: Block = 119;
+/// Flowing lava, + 0 .. + 2: lava runs three blocks.
+pub const LAVA_FLOW: Block = 119;
+pub const LAVA_FLOW_END: Block = 122;
+/// Saplings (plants): oak, birch, pine, jungle, acacia. Their items are
+/// `items::SAPLING_ITEM` + n; they fall from leaves and grow into trees.
+pub const SAPLING: Block = 122;
+pub const SAPLING_END: Block = 127;
+#[inline]
+pub fn is_sapling(b: Block) -> bool {
+    (SAPLING..SAPLING_END).contains(&b)
+}
+/// A tree trunk.
+#[inline]
+pub fn is_log(b: Block) -> bool {
+    b == LOG || b == BIRCH_LOG
+}
+/// The sapling that leaves of a kind let fall.
+pub fn sapling_of(leaves: Block) -> Block {
+    match leaves {
+        BIRCH_LEAVES => SAPLING + 1,
+        PINE_LEAVES | SNOWY_LEAVES => SAPLING + 2,
+        JUNGLE_LEAVES => SAPLING + 3,
+        ACACIA_LEAVES => SAPLING + 4,
+        _ => SAPLING,
+    }
+}
+#[inline]
+pub fn is_extra_block(b: Block) -> bool {
+    (SLATE..SLATE + EXTRA_BLOCKS).contains(&b)
+}
+/// Still or flowing water.
+#[inline]
+pub fn is_water(b: Block) -> bool {
+    b == WATER || (WATER_FLOW..WATER_FLOW_END).contains(&b)
+}
+/// Still or flowing lava.
+#[inline]
+pub fn is_lava(b: Block) -> bool {
+    b == LAVA || (LAVA_FLOW..LAVA_FLOW_END).contains(&b)
+}
+#[inline]
+pub fn is_fluid(b: Block) -> bool {
+    is_water(b) || is_lava(b)
+}
+/// How full a fluid cell is: 1 for still water and lava, less for flowing blocks, the
+/// weaker the lower (0 for anything else).
+#[inline]
+pub fn fluid_height(b: Block) -> f32 {
+    if b == WATER || b == LAVA {
+        1.0
+    } else if (WATER_FLOW..WATER_FLOW_END).contains(&b) {
+        (7 - (b - WATER_FLOW)) as f32 / 8.0
+    } else if (LAVA_FLOW..LAVA_FLOW_END).contains(&b) {
+        (3 - (b - LAVA_FLOW)) as f32 / 4.0
+    } else {
+        0.0
+    }
+}
+
+/// Which fluid a block holds: 0 none, 1 water, 2 lava (so a face between still and
+/// flowing water is not drawn).
+#[inline]
+pub fn fluid_kind(b: Block) -> u8 {
+    if is_water(b) {
+        1
+    } else if is_lava(b) {
+        2
+    } else {
+        0
+    }
+}
 #[inline]
 pub fn is_gate(b: Block) -> bool {
     b == GATE || b == GATE + 1
@@ -427,7 +518,7 @@ fn draw_boxes(b: Block, at: impl Fn(i32, i32) -> Block) -> Boxes {
 /// Small plants drawn as two crossed planes; you walk through them.
 #[inline]
 pub fn is_plant(b: Block) -> bool {
-    (TALL_GRASS..=DEAD_BUSH).contains(&b) || (WHEAT_0..=WHEAT_3).contains(&b) || b == FLOWER_BLUE || (FERN..=DRY_TUFT).contains(&b)
+    (TALL_GRASS..=DEAD_BUSH).contains(&b) || (WHEAT_0..=WHEAT_3).contains(&b) || b == FLOWER_BLUE || (FERN..=DRY_TUFT).contains(&b) || is_sapling(b)
 }
 /// Grass tufts and their kin: cut for fibre and seeds.
 #[inline]
@@ -446,22 +537,22 @@ pub fn is_leaves(b: Block) -> bool {
 /// Blocks a new block may be placed into.
 #[inline]
 pub fn is_replaceable(b: Block) -> bool {
-    b == AIR || b == WATER || b == LAVA || is_tuft(b) || b == DEAD_BUSH
+    b == AIR || is_fluid(b) || is_tuft(b) || b == DEAD_BUSH
 }
 
 #[inline]
 pub fn is_opaque(b: Block) -> bool {
-    b != AIR && b != WATER && b != GLASS && !is_torch(b) && !is_plant(b) && !is_shaped(b) && !is_gate(b)
+    b != AIR && !is_water(b) && b != GLASS && !is_torch(b) && !is_plant(b) && !is_shaped(b) && !is_gate(b) && !(LAVA_FLOW..LAVA_FLOW_END).contains(&b)
 }
 /// Blocks you collide with / can target.
 #[inline]
 pub fn is_solid(b: Block) -> bool {
-    b != AIR && b != WATER && b != LAVA && !is_torch(b) && !is_plant(b) && !is_ladder(b) && !is_gate(b)
+    b != AIR && !is_fluid(b) && !is_torch(b) && !is_plant(b) && !is_ladder(b) && !is_gate(b)
 }
 /// Blocks the crosshair can select (torches are walk-through but breakable).
 #[inline]
 pub fn is_target(b: Block) -> bool {
-    b != AIR && b != WATER && b != LAVA && !is_gate(b)
+    b != AIR && !is_fluid(b) && !is_gate(b)
 }
 /// Blocks that light their surroundings.
 #[inline]
@@ -493,7 +584,7 @@ pub fn tex_for(b: Block, face: usize) -> u32 {
         COBBLE => 9,
         BRICK => 10,
         SNOW => 11,
-        WATER => 12,
+        b if is_water(b) => 12,
         GLASS => 13,
         STONE_BRICK => 15,
         LEATHER => 16,
@@ -560,7 +651,7 @@ pub fn tex_for(b: Block, face: usize) -> u32 {
         PANE => PANE_LAYER,
         FENCE => 8,
         BIRCH_FENCE => 44,
-        LAVA => LAVA_LAYER,
+        b if is_lava(b) => LAVA_LAYER,
         CHEST | LOOT_CHEST => {
             if face == 2 || face == 3 {
                 CHEST_TOP_LAYER
@@ -613,6 +704,8 @@ pub fn tex_for(b: Block, face: usize) -> u32 {
                 _ => 14,
             }
         }
+        b if is_extra_block(b) => crate::textures::EXTRA_TEX as u32 + (b - SLATE) as u32,
+        b if is_sapling(b) => crate::textures::sapling_layer((b - SAPLING) as usize) as u32,
         b if is_slab(b) => tex_for(SHAPE_FULL[slab_mat(b) as usize], face),
         b if is_ladder(b) => LADDER_LAYER,
         b if is_trapdoor(b) => TRAP_LAYER,
@@ -737,7 +830,7 @@ pub fn height_at(seed: u32, x: i32, z: i32) -> i32 {
     if h > 96.0 {
         h = 96.0 + 20.0 * (1.0 - (-(h - 96.0) / 20.0).exp());
     }
-    (h as i32).clamp(3, CH - 12)
+    (h as i32).clamp(3, GH - 12)
 }
 
 /// Where a new world's player starts: the nearest spot to the origin on fairly level
@@ -745,7 +838,7 @@ pub fn height_at(seed: u32, x: i32, z: i32) -> i32 {
 pub fn spawn_point(seed: u32) -> (i32, i32, i32) {
     let ok = |x: i32, z: i32, strict: bool| -> Option<i32> {
         let h = height_at(seed, x, z);
-        if h <= SEA + 2 || h >= 78 {
+        if h <= GSEA + 2 || h >= 78 {
             return None;
         }
         if strict {
@@ -768,7 +861,7 @@ pub fn spawn_point(seed: u32) -> (i32, i32, i32) {
             }
         }
     }
-    (0, height_at(seed, 0, 0).max(SEA), 0)
+    (0, height_at(seed, 0, 0).max(GSEA), 0)
 }
 
 #[inline]
@@ -910,17 +1003,122 @@ pub fn is_desert(seed: u32, x: i32, z: i32) -> bool {
 
 /// Surface height of a column in a world made by generator `ver`.
 pub fn ground_height(ver: u8, seed: u32, x: i32, z: i32) -> i32 {
-    if ver >= 2 { crate::worldgen::height_at(seed, x, z) } else { height_at(seed, x, z) }
+    LIFT + if ver >= 2 { crate::worldgen::height_at(seed, x, z) } else { height_at(seed, x, z) }
 }
 /// Where a new player starts in a world made by generator `ver`.
 pub fn spawn_for(ver: u8, seed: u32) -> (i32, i32, i32) {
-    if ver >= 2 { crate::worldgen::spawn_point(seed) } else { spawn_point(seed) }
+    let (x, y, z) = if ver >= 2 { crate::worldgen::spawn_point(seed) } else { spawn_point(seed) };
+    (x, y + LIFT, z)
 }
 fn generate_for(ver: u8, seed: u32, cx: i32, cz: i32) -> ChunkData {
+    let made = if ver == crate::deep::DEEP_VER {
+        crate::deep::generate(seed, cx, cz)
+    } else if ver >= 2 {
+        crate::worldgen::generate(seed, cx, cz, ver >= 3)
+    } else {
+        generate(seed, cx, cz)
+    };
     if ver == crate::deep::DEEP_VER {
-        return crate::deep::generate(seed, cx, cz);
+        // the Emberdeep keeps its height: a roof of bedrock, then nothing
+        return grow(&made.blocks, 0);
     }
-    if ver >= 2 { crate::worldgen::generate(seed, cx, cz, ver >= 3) } else { generate(seed, cx, cz) }
+    let mut c = grow(&made.blocks, LIFT);
+    under_layer(seed, cx, cz, &mut c, true);
+    c
+}
+
+/// A chunk `GH` tall (as generated, or saved before the slate) placed `lift` blocks up
+/// in a full-height chunk, with nothing under or over it.
+pub(crate) fn grow(old: &[u8], lift: i32) -> ChunkData {
+    let mut blocks = vec![AIR; VOL].into_boxed_slice();
+    let at = bidx(0, lift, 0);
+    blocks[at..at + GVOL].copy_from_slice(&old[..GVOL]);
+    ChunkData { blocks }
+}
+
+/// A chunk of a world saved before the slate, moved up onto it.
+pub(crate) fn lift_saved(seed: u32, cx: i32, cz: i32, old: &[u8]) -> ChunkData {
+    let mut c = grow(old, LIFT);
+    under_layer(seed, cx, cz, &mut c, false);
+    c
+}
+
+/// The deep slate under the old world, from the new bedrock up to where the old
+/// bedrock was (which becomes slate): tunnels and wide halls of its own, richer ore,
+/// and lava pooled at the bottom. With `fresh`, the old world's lowest caves (where
+/// lava used to stand) are opened down into it.
+fn under_layer(seed: u32, cx: i32, cz: i32, c: &mut ChunkData, fresh: bool) {
+    let s2 = seed.wrapping_add(0x51a7e);
+    for z in 0..CW {
+        for x in 0..CW {
+            let (wx, wz) = (cx * CW + x, cz * CW + z);
+            // (fields sampled every other level, as in `generate`)
+            let mut fields = [(0.0f32, 0.0f32); (LIFT / 2 + 4) as usize];
+            for (k, v) in fields.iter_mut().enumerate() {
+                *v = tunnel_fields(s2, wx, k as i32 * 2, wz);
+            }
+            let mut halls = [0.0f32; (LIFT / 4 + 3) as usize];
+            for (k, v) in halls.iter_mut().enumerate() {
+                *v = cavern_field(s2, wx, k as i32 * 4 - 8, wz);
+            }
+            // the old world's lowest caves held lava, which now drains into the slate
+            // (in new chunks: saved ones keep what they had)
+            if fresh {
+                for y in LIFT + 1..=LIFT + LAVA_LEVEL {
+                    if c.blocks[bidx(x, y, z)] == LAVA {
+                        c.blocks[bidx(x, y, z)] = AIR;
+                    }
+                }
+            }
+            for y in 0..=LIFT + 2 {
+                let i = bidx(x, y, z);
+                let h = hash2(seed ^ 0xbed, wx, wz ^ (y * 7919));
+                if y == 0 || (y <= 3 && h % 4 < 4 - y as u32) {
+                    c.blocks[i] = BEDROCK;
+                    continue;
+                }
+                let (p, q) = (fields[(y / 2) as usize], fields[(y / 2 + y % 2) as usize]);
+                let tunnel = in_tunnel(s2, wx, y, wz, (p.0 + q.0) * 0.5, (p.1 + q.1) * 0.5);
+                if y >= LIFT {
+                    // where the old bedrock was: slate, holed by the slate's tunnels so
+                    // they meet the caves above (never under water)
+                    let here = c.blocks[i];
+                    let dry = !is_fluid(c.blocks[bidx(x, y + 1, z)]) && !is_fluid(c.blocks[bidx(x, y + 2, z)]);
+                    if fresh && tunnel && dry && (here == BEDROCK || here == STONE || here == SLATE || here == AIR) {
+                        c.blocks[i] = AIR;
+                    } else if here == BEDROCK || (y == LIFT && here == AIR) {
+                        c.blocks[i] = SLATE;
+                    }
+                    continue;
+                }
+                let (k, t) = (((y + 8) / 4) as usize, ((y + 8) % 4) as f32 * 0.25);
+                let hall = halls[k] + (halls[k + 1] - halls[k]) * t;
+                // (the halls are big down here: the field is read at its deepest)
+                let cavern = y > 3 && y < LIFT - 4 && in_cavern(s2, wx, y - 6, wz, hall);
+                c.blocks[i] = if tunnel || cavern {
+                    if y <= 10 { LAVA } else { AIR }
+                } else {
+                    deep_ore(seed, wx, y, wz)
+                };
+            }
+        }
+    }
+}
+
+/// Ore in the deep slate: the better kinds are commoner here than anywhere above.
+fn deep_ore(seed: u32, x: i32, y: i32, z: i32) -> Block {
+    let (xf, yf, zf) = (x as f32, y as f32, z as f32);
+    let n = perlin3(seed.wrapping_add(9100), xf / 5.0, yf / 5.0, zf / 5.0);
+    if n < 0.55 {
+        return SLATE;
+    }
+    let pick = hash2(seed ^ 0x0de_e9 ^ ((y + 4) as u32 >> 3).wrapping_mul(0x9e37), (x + 4) >> 3, (z + 4) >> 3) % 100;
+    match pick {
+        0..=21 => CRYSTAL_ORE,
+        22..=43 => GOLD_ORE,
+        44..=79 => IRON_ORE,
+        _ => COAL_ORE,
+    }
 }
 
 // ---------------------------------------------------------------- chunk data
@@ -943,7 +1141,7 @@ impl ChunkData {
 }
 
 pub fn generate(seed: u32, cx: i32, cz: i32) -> ChunkData {
-    let mut blocks = vec![AIR; VOL].into_boxed_slice();
+    let mut blocks = vec![AIR; GVOL].into_boxed_slice();
     // heights for the chunk plus a 2-block apron (needed for trees crossing borders)
     const A: i32 = 2;
     const HW: i32 = CW + 2 * A;
@@ -959,15 +1157,15 @@ pub fn generate(seed: u32, cx: i32, cz: i32) -> ChunkData {
         for x in 0..CW {
             let h = hget(x, z);
             let (wx, wz) = (cx * CW + x, cz * CW + z);
-            let desert = h > SEA + 1 && h < 82 && is_desert(seed, wx, wz);
+            let desert = h > GSEA + 1 && h < 82 && is_desert(seed, wx, wz);
             // lowest neighbouring surface: caves stay clear of sea and lake beds
-            let seabed = if h > SEA + 1 {
+            let seabed = if h > GSEA + 1 {
                 SAND
             } else {
                 let g = fbm(seed.wrapping_add(11000), wx as f32 / 38.0, wz as f32 / 38.0, 2);
                 if g > 0.3 {
                     GRAVEL
-                } else if g < -0.36 && h < SEA {
+                } else if g < -0.36 && h < GSEA {
                     CLAY
                 } else {
                     SAND
@@ -980,7 +1178,7 @@ pub fn generate(seed: u32, cx: i32, cz: i32) -> ChunkData {
                 *v = cavern_field(seed, wx, k as i32 * 4, wz);
             }
             // and the tunnel fields at y = 0, 2, 4, ...
-            let mut fields = [(0.0f32, 0.0f32); (CH / 2 + 1) as usize];
+            let mut fields = [(0.0f32, 0.0f32); (GH / 2 + 1) as usize];
             for (k, v) in fields.iter_mut().enumerate().take((h / 2 + 2) as usize) {
                 *v = tunnel_fields(seed, wx, k as i32 * 2, wz);
             }
@@ -995,7 +1193,7 @@ pub fn generate(seed: u32, cx: i32, cz: i32) -> ChunkData {
             for y in 0..=h {
                 let mut b = if y == 0 {
                     BEDROCK
-                } else if h <= SEA + 1 {
+                } else if h <= GSEA + 1 {
                     if y > h - 3 {
                         seabed
                     } else {
@@ -1025,7 +1223,7 @@ pub fn generate(seed: u32, cx: i32, cz: i32) -> ChunkData {
                     STONE
                 };
                 // caves; the caverns keep a roof of rock under the land and the sea bed
-                if b != BEDROCK && !(y <= SEA + 1 && y >= low - 4) && (tunnel(y) || cavern(y)) {
+                if b != BEDROCK && !(y <= GSEA + 1 && y >= low - 4) && (tunnel(y) || cavern(y)) {
                     if y <= LAVA_LEVEL {
                         blocks[bidx(x, y, z)] = LAVA;
                     }
@@ -1036,10 +1234,10 @@ pub fn generate(seed: u32, cx: i32, cz: i32) -> ChunkData {
                 }
                 blocks[bidx(x, y, z)] = b;
             }
-            for y in (h + 1)..=SEA {
+            for y in (h + 1)..=GSEA {
                 blocks[bidx(x, y, z)] = WATER;
             }
-            if desert && h + 4 < CH {
+            if desert && h + 4 < GH {
                 let r = hash2(seed ^ 0x0cac_7005, wx, wz);
                 if r % 230 == 0 && blocks[bidx(x, h, z)] == SAND {
                     for dy in 1..=(2 + (r >> 9) % 2) as i32 {
@@ -1058,7 +1256,7 @@ pub fn generate(seed: u32, cx: i32, cz: i32) -> ChunkData {
     for tz in -A..CW + A {
         for tx in -A..CW + A {
             let h = hget(tx, tz);
-            if h <= SEA + 1 || h >= 86 {
+            if h <= GSEA + 1 || h >= 86 {
                 continue;
             }
             let (wx, wz) = (cx * CW + tx, cz * CW + tz);
@@ -1072,7 +1270,7 @@ pub fn generate(seed: u32, cx: i32, cz: i32) -> ChunkData {
                 continue;
             }
             let mut put = |x: i32, y: i32, z: i32, b: Block, force: bool| {
-                if x >= 0 && x < CW && z >= 0 && z < CW && y > 0 && y < CH {
+                if x >= 0 && x < CW && z >= 0 && z < CW && y > 0 && y < GH {
                     let i = bidx(x, y, z);
                     if force || blocks[i] == AIR {
                         blocks[i] = b;
@@ -1133,7 +1331,7 @@ pub fn generate(seed: u32, cx: i32, cz: i32) -> ChunkData {
     for z in 0..CW {
         for x in 0..CW {
             let h = hget(x, z);
-            if h <= SEA + 1 || h >= 86 || blocks[bidx(x, h + 1, z)] != AIR {
+            if h <= GSEA + 1 || h >= 86 || blocks[bidx(x, h + 1, z)] != AIR {
                 continue;
             }
             let (wx, wz) = (cx * CW + x, cz * CW + z);
@@ -1157,7 +1355,7 @@ pub fn generate(seed: u32, cx: i32, cz: i32) -> ChunkData {
                         AIR
                     }
                 }
-                SAND if h > SEA + 2 && roll < 9 => DEAD_BUSH,
+                SAND if h > GSEA + 2 && roll < 9 => DEAD_BUSH,
                 _ => AIR,
             };
             if plant != AIR {
@@ -1182,7 +1380,7 @@ pub struct MeshData {
     pub cut_quads: u32,
     pub trans_quads: u32,
     /// shaped blocks (stairs, slabs, fences, doors...): quads of two words per vertex,
-    /// x 9 bits | y 12 | z 9 in sixteenths of a block | sky 2, then face 3 | layer 8
+    /// x 9 bits | y 13 | z 9 in sixteenths of a block, then face 3 | layer 8 | sky 2
     pub detail: Vec<u32>,
     /// highest y used by any vertex (for tight frustum culling)
     pub top: f32,
@@ -1192,6 +1390,13 @@ const PW: usize = (CW + 2) as usize;
 const PH: usize = (CH + 2) as usize;
 
 /// Greedy mesher with ambient occlusion. `n` is the 3x3 neighbourhood, index (dz+1)*3+(dx+1).
+/// A terrain vertex's corner: x and z (0..=16) share 9 bits, y (0..=256) has the next 9.
+/// The shader (`vs_chunk`) undoes this.
+#[inline]
+fn pack_xyz(x: u32, y: u32, z: u32) -> u32 {
+    (x + z * 17) | y << 9
+}
+
 pub fn mesh(n: &[Arc<ChunkData>; 9]) -> MeshData {
     // padded copy so neighbour lookups never branch
     let mut pad = vec![AIR; PW * PW * PH];
@@ -1248,11 +1453,37 @@ pub fn mesh(n: &[Arc<ChunkData>; 9]) -> MeshData {
         }
     };
     let stride: [isize; 3] = [1, (PW * PW) as isize, PW as isize]; // x, y, z
-    let dims: [i32; 3] = [CW, CH, CW];
+    // nothing above the chunk's highest block has a face: the empty sky is skipped
+    let layer = (CW * CW) as usize;
+    let ylim = (0..CH as usize).rev().find(|&y| n[4].blocks[y * layer..(y + 1) * layer].iter().any(|&b| b != AIR)).map_or(1, |y| y as i32 + 1);
+    let dims: [i32; 3] = [CW, ylim, CW];
     let pidx = |p: [i32; 3]| -> isize {
         (((p[1] + 1) as usize * PW + (p[2] + 1) as usize) * PW + (p[0] + 1) as usize) as isize
     };
     let at = |i: isize| -> Block { pad[i as usize] };
+    // The surface of a fluid at the corner (x, z) of the grid on level y, as a code for
+    // the vertex (3 = full height .. 0 = a quarter): full where it touches a still block
+    // or fluid falling from above, otherwise the mean of the flowing cells round the
+    // corner. Cells that share a corner share its height, so the surface is unbroken.
+    let corner = |x: i32, y: i32, z: i32, kind: u8| -> u32 {
+        let (mut sum, mut n) = (0.0f32, 0u32);
+        for (dx, dz) in [(-1, -1), (0, -1), (-1, 0), (0, 0)] {
+            let c = at(pidx([x + dx, y, z + dz]));
+            if fluid_kind(c) != kind {
+                continue;
+            }
+            let h = fluid_height(c);
+            if h >= 1.0 || fluid_kind(at(pidx([x + dx, y + 1, z + dz]))) == kind {
+                return 3;
+            }
+            sum += h;
+            n += 1;
+        }
+        if n == 0 {
+            return 3;
+        }
+        3 - ((1.0 - sum / n as f32) * 4.0).round().clamp(0.0, 3.0) as u32
+    };
 
     let mut opaque: Vec<u32> = Vec::with_capacity(4096);
     let mut trans: Vec<u32> = Vec::new();
@@ -1287,12 +1518,37 @@ pub fn mesh(n: &[Arc<ChunkData>; 9]) -> MeshData {
                     let q = i + sa;
                     let nb = at(q);
                     let op = is_opaque(b);
-                    let visible = if op { !is_opaque(nb) } else { nb != b && !is_opaque(nb) };
+                    let fk = fluid_kind(b);
+                    let mut visible = if op {
+                        !is_opaque(nb) && !(fk != 0 && fluid_kind(nb) == fk)
+                    } else {
+                        nb != b && !is_opaque(nb) && !(fk != 0 && fluid_kind(nb) == fk)
+                    };
+                    // a fluid's corners stand lower the weaker it runs: the two bits of
+                    // shading each vertex has carry that instead (see `vs_chunk`)
+                    let mut heights = None;
+                    if fk != 0 && (visible || (face == 2 && fluid_kind(nb) != fk)) {
+                        let mut codes = [3u32; 4];
+                        for (ci, (cu, cv)) in [(0, 0), (1, 0), (1, 1), (0, 1)].into_iter().enumerate() {
+                            let mut c = p;
+                            c[a] += positive as i32;
+                            c[u] += cu;
+                            c[v] += cv;
+                            if c[1] == p[1] + 1 {
+                                codes[ci] = corner(c[0], p[1], c[2], fk);
+                            }
+                        }
+                        // a lowered surface shows under whatever is above it
+                        visible |= face == 2 && codes.iter().any(|&c| c < 3);
+                        heights = Some(codes[0] | codes[1] << 2 | codes[2] << 4 | codes[3] << 6);
+                    }
                     if !visible {
                         continue;
                     }
                     let mut ao = 0xffu32;
-                    if op {
+                    if let Some(h) = heights {
+                        ao = h;
+                    } else if op {
                         let o = |i: isize| is_opaque(at(i)) as u32;
                         let (um, up, vm, vp) = (o(q - su), o(q + su), o(q - sv), o(q + sv));
                         let c = |s1: u32, s2: u32, ci: isize| -> u32 {
@@ -1310,7 +1566,9 @@ pub fn mesh(n: &[Arc<ChunkData>; 9]) -> MeshData {
                     let mut qp = p;
                     qp[a] += if positive { 1 } else { -1 };
                     let sky = sky_at(qp[0], qp[1], qp[2]);
-                    *m = 1 << 31 | (!op as u32) << 30 | sky << 16 | ao << 8 | tex_for(b, face);
+                    // (flowing lava hides nothing beside it, but is drawn with the solid blocks)
+                    let solid = op || fk == 2;
+                    *m = 1 << 31 | (!solid as u32) << 30 | sky << 16 | ao << 8 | tex_for(b, face);
                     any = true;
                 }
             }
@@ -1372,8 +1630,7 @@ pub fn mesh(n: &[Arc<ChunkData>; 9]) -> MeshData {
                         p[u] = corners[ci].0 as u32;
                         p[v] = corners[ci].1 as u32;
                         high = high.max(p[1] as i32);
-                        quad[i] = p[0] | p[1] << 5
-                            | p[2] << 13
+                        quad[i] = pack_xyz(p[0], p[1], p[2])
                             | (face as u32) << 18
                             | (k & 127) << 21
                             | aoc[ci] << 28
@@ -1395,7 +1652,7 @@ pub fn mesh(n: &[Arc<ChunkData>; 9]) -> MeshData {
     // plants: two crossed diagonal planes per block (face code 6)
     let mut cut: Vec<u32> = Vec::new();
     let mut detail: Vec<u32> = Vec::new();
-    for y in 1..CH {
+    for y in 1..ylim {
         for z in 0..CW {
             for x in 0..CW {
                 let i = pidx([x, y, z]);
@@ -1413,7 +1670,7 @@ pub fn mesh(n: &[Arc<ChunkData>; 9]) -> MeshData {
                             [(x, y, z), (x + 1, y, z), (x + 1, y + 1, z), (x, y + 1, z)]
                         };
                         for (px, py, pz) in corners {
-                            out.push(px | py << 5 | pz << 13 | tail);
+                            out.push(pack_xyz(px, py, pz) | tail);
                         }
                     };
                     let j = |d: isize| pane_joins(at(i + d));
@@ -1460,9 +1717,9 @@ pub fn mesh(n: &[Arc<ChunkData>; 9]) -> MeshData {
                                 if outer && hidden[f] {
                                     continue;
                                 }
-                                let tail = f as u32 | tex_for(b, f) << 3;
+                                let tail = f as u32 | tex_for(b, f) << 3 | sky[f] << 11;
                                 for (px, py, pz) in corners {
-                                    detail.push(px | py << 9 | pz << 21 | sky[f] << 30);
+                                    detail.push(px | py << 9 | pz << 22);
                                     detail.push(tail);
                                 }
                             }
@@ -1477,7 +1734,7 @@ pub fn mesh(n: &[Arc<ChunkData>; 9]) -> MeshData {
                 let (x, y, z) = (x as u32, y as u32, z as u32);
                 for (z0, z1) in [(z, z + 1), (z + 1, z)] {
                     for (px, py, pz) in [(x, y, z0), (x + 1, y, z1), (x + 1, y + 1, z1), (x, y + 1, z0)] {
-                        cut.push(px | py << 5 | pz << 13 | tail);
+                        cut.push(pack_xyz(px, py, pz) | tail);
                     }
                 }
             }
@@ -1488,8 +1745,8 @@ pub fn mesh(n: &[Arc<ChunkData>; 9]) -> MeshData {
     let (oq, cq, tq) = ((opaque.len() / 4) as u32, (cut.len() / 4) as u32, (trans.len() / 4) as u32);
     opaque.extend_from_slice(&cut);
     opaque.extend_from_slice(&trans);
-    let top = opaque.iter().map(|v| (v >> 5) & 255).max().unwrap_or(0);
-    let top = top.max(detail.chunks_exact(2).map(|v| (((v[0] >> 9) & 4095) + 15) / 16).max().unwrap_or(0)) as f32;
+    let top = opaque.iter().map(|v| (v >> 9) & 511).max().unwrap_or(0);
+    let top = top.max(detail.chunks_exact(2).map(|v| (((v[0] >> 9) & 8191) + 15) / 16).max().unwrap_or(0)) as f32;
     MeshData { verts: opaque, opaque_quads: oq, deep_quads: dq, cut_quads: cq, trans_quads: tq, detail, top }
 }
 
@@ -1544,6 +1801,9 @@ pub struct Slot {
 }
 
 pub struct World {
+    /// places edited since the game last looked, and what stood there before: fluids
+    /// run into them, loose blocks fall, leaves round a felled trunk wilt
+    pub touched: Vec<(IVec3, Block)>,
     pub seed: u32,
     /// the generator this world's terrain comes from (see `GEN_LATEST`)
     pub ver: u8,
@@ -1597,12 +1857,16 @@ impl World {
                         let saved = dir
                             .as_ref()
                             .and_then(|d| std::fs::read(chunk_path(d, k)).ok())
-                            .filter(|b| b.len() == VOL);
+                            .filter(|b| b.len() == VOL || b.len() == GVOL);
                         match saved {
-                            Some(b) => {
+                            Some(b) if b.len() == VOL => {
                                 JobResult::Gen(k, ChunkData { blocks: b.into_boxed_slice() }, true)
                             }
-                            None => JobResult::Gen(k, generate_for(ver, seed, k.0, k.1), false),
+                            // saved before the world grew: lifted onto the slate (and
+                            // marked changed, so it is saved full height)
+                            Some(b) if ver == crate::deep::DEEP_VER => JobResult::Gen(k, grow(&b, 0), true),
+                            Some(b) => JobResult::Gen(k, lift_saved(seed, k.0, k.1, &b), true),
+                            _ => JobResult::Gen(k, generate_for(ver, seed, k.0, k.1), false),
                         }
                     }
                     Job::Mesh(k, ver, n) => JobResult::Mesh(k, ver, mesh(&n)),
@@ -1621,6 +1885,7 @@ impl World {
             });
         }
         let mut w = World {
+            touched: Vec::new(),
             seed,
             ver,
             chunks: HashMap::default(),
@@ -1903,9 +2168,13 @@ impl World {
         if s.data.get(lx, y, lz) == BEDROCK {
             return false;
         }
+        let was = s.data.get(lx, y, lz);
         Arc::make_mut(&mut s.data).blocks[bidx(lx, y, lz)] = b;
         s.modified = true;
         let wp = IVec3::new(x, y, z);
+        if self.touched.len() < 4096 {
+            self.touched.push((wp, was));
+        }
         s.lights.retain(|l| l.0 != wp);
         if is_light(b) {
             s.lights.push((wp, b));
@@ -2030,6 +2299,96 @@ impl World {
 mod tests {
     use super::*;
 
+    /// An open hall in the slate near the middle of world 4242 (for screenshots).
+    #[test]
+    #[ignore]
+    fn find_slate_hall() {
+        for (cx, cz) in (0..400).map(|i| (i % 20 - 10, i / 20 - 10)) {
+            let c = generate_for(3, 4242, cx, cz);
+            let open = |x: i32, y: i32, z: i32| c.get(x, y, z) == AIR;
+            for y in 14..LIFT - 6 {
+                if (0..6).all(|k| open(8, y + k, 8)) && open(3, y + 2, 8) && open(13, y + 2, 8) && open(8, y + 2, 3) && open(8, y + 2, 13) && c.get(8, y - 1, 8) != AIR {
+                    println!("HALL {} {} {}", cx * CW + 8, y, cz * CW + 8);
+                    return;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_world_stands_on_deep_slate() {
+        let (mut slate, mut open, mut lava, mut ore, mut total) = (0, 0, 0, 0, 0);
+        for (cx, cz) in [(0, 0), (5, -3), (-7, 2), (11, 9), (-4, -12), (20, 1)] {
+            let c = generate_for(3, 4242, cx, cz);
+            assert_eq!(c.blocks.len(), VOL);
+            for z in 0..CW {
+                for x in 0..CW {
+                    assert_eq!(c.get(x, 0, z), BEDROCK);
+                    let h = ground_height(3, 4242, cx * CW + x, cz * CW + z);
+                    assert!(h > LIFT + 2 && h < CH - 10, "{h}");
+                    for y in 1..LIFT {
+                        total += 1;
+                        match c.get(x, y, z) {
+                            SLATE => slate += 1,
+                            AIR => open += 1,
+                            LAVA => {
+                                lava += 1;
+                                assert!(y <= 10);
+                            }
+                            BEDROCK => assert!(y <= 3),
+                            _ => ore += 1,
+                        }
+                    }
+                    // no bedrock left where the old world's floor was
+                    assert!(c.get(x, LIFT, z) != BEDROCK);
+                }
+            }
+        }
+        let f = |n: u32| n as f32 / total as f32;
+        assert!(f(slate) > 0.5 && f(open) > 0.02 && f(open) < 0.4 && f(ore) > 0.01 && lava > 0, "slate {} open {} ore {} lava {lava}", f(slate), f(open), f(ore));
+        // a chunk saved before the slate is lifted onto it
+        let mut old = vec![STONE; GVOL];
+        old[bidx(3, 0, 3)] = BEDROCK;
+        old[bidx(3, 50, 3)] = PLANKS;
+        let c = lift_saved(1, 0, 0, &old);
+        assert_eq!((c.get(3, LIFT + 50, 3), c.get(3, LIFT, 3), c.get(3, 0, 3)), (PLANKS, SLATE, BEDROCK));
+        // a vertex can name the top of the world
+        let v = pack_xyz(16, 256, 16);
+        assert_eq!(((v & 511) % 17, (v & 511) / 17, (v >> 9) & 511), (16, 16, 256));
+    }
+
+    /// The water faces of a mesh: (face, y of each corner as it is drawn).
+    fn water_faces(m: &MeshData) -> Vec<(u32, [f32; 4])> {
+        let first = (m.opaque_quads + m.cut_quads) as usize * 4;
+        m.verts[first..first + m.trans_quads as usize * 4]
+            .chunks_exact(4)
+            .filter(|q| (q[0] >> 21) & 127 == 12)
+            .map(|q| ((q[0] >> 18) & 7, std::array::from_fn(|i| ((q[i] >> 9) & 511) as f32 - (3 - ((q[i] >> 28) & 3)) as f32 * 0.25)))
+            .collect()
+    }
+
+    #[test]
+    fn running_water_slopes_and_still_water_stays_flat() {
+        // a still pool at y 10 on the -x side, running water out along +x, weaker
+        // each step, under a stone roof at the far end
+        let w = World::flat(|x, y, z| match (x, y) {
+            (-3..=0, 10) if (-2..=2).contains(&z) => Some(WATER),
+            (1..=6, 10) if z == 0 => Some(WATER_FLOW + (x - 1) as u8),
+            (6, 11) if z == 0 => Some(STONE),
+            _ => None,
+        });
+        let m = mesh(&w.neighbours((0, 0)).unwrap());
+        let faces = water_faces(&m);
+        let tops: Vec<[f32; 4]> = faces.iter().filter(|f| f.0 == 2).map(|f| f.1).collect();
+        // the pool's surface is level, at the top of its cells
+        assert!(tops.iter().any(|t| t.iter().all(|&y| y == 11.0)));
+        // the run sinks as it goes: some corner sits low, none above the pool
+        let low = tops.iter().flat_map(|t| t.iter()).fold(11.0f32, |a, &b| a.min(b));
+        assert!(low <= 10.5 && tops.iter().flat_map(|t| t.iter()).all(|&y| y <= 11.0 && y > 10.0), "{tops:?}");
+        // the weakest cell still shows its surface under the stone over it
+        assert!(tops.len() >= 6, "{} tops", tops.len());
+    }
+
     #[test]
     fn shaped_blocks_mesh_into_boxes() {
         // one of each shape standing on a stone floor in the middle chunk
@@ -2043,9 +2402,9 @@ mod tests {
         assert!(m.top >= 11.0);
         // every vertex stays inside the chunk and names a real texture
         for v in m.detail.chunks_exact(2) {
-            let (x, y, z) = (v[0] & 511, (v[0] >> 9) & 4095, (v[0] >> 21) & 511);
+            let (x, y, z) = (v[0] & 511, (v[0] >> 9) & 8191, (v[0] >> 22) & 511);
             assert!(x <= 256 && z <= 256 && (160..=184).contains(&y), "{x} {y} {z}");
-            assert!((v[1] & 7) < 6 && ((v[1] >> 3) as usize) < crate::textures::LAYERS);
+            assert!((v[1] & 7) < 6 && (((v[1] >> 3) & 255) as usize) < crate::textures::LAYERS);
         }
         // the collision boxes: a fence is one and a half blocks high, a ladder is no obstacle
         assert_eq!(shape_boxes(FENCE, |_, _| AIR).0[0][4], 1.5);
@@ -2085,7 +2444,7 @@ mod tests {
             const STEP: i32 = 4;
             let n = (2 * R / STEP) as usize;
             let (mut land, mut high, mut snow, mut desert, mut total) = (0, 0, 0, 0, 0);
-            let (mut lo, mut hi) = (CH, 0);
+            let (mut lo, mut hi) = (GH, 0);
             let mut img = vec![0u8; n * n * 3];
             for (j, z) in (-R..R).step_by(STEP as usize).enumerate() {
                 for (i, x) in (-R..R).step_by(STEP as usize).enumerate() {
@@ -2093,22 +2452,22 @@ mod tests {
                     total += 1;
                     lo = lo.min(h);
                     hi = hi.max(h);
-                    let d = h > SEA + 1 && h < 82 && is_desert(seed, x, z);
-                    let c: [u8; 3] = if h <= SEA {
+                    let d = h > GSEA + 1 && h < 82 && is_desert(seed, x, z);
+                    let c: [u8; 3] = if h <= GSEA {
                         let k = (h - 3).clamp(0, 40) as u8;
                         [20, 40 + k * 2, 110 + k * 3]
-                    } else if h <= SEA + 1 || d {
+                    } else if h <= GSEA + 1 || d {
                         [222, 206, 150]
                     } else if h >= 98 {
                         [245, 245, 250]
                     } else if h >= 86 {
                         [128, 128, 132]
                     } else {
-                        let k = ((h - SEA) * 2).clamp(0, 90) as u8;
+                        let k = ((h - GSEA) * 2).clamp(0, 90) as u8;
                         [60 + k / 2, 150 - k, 50]
                     };
                     img[(j * n + i) * 3..][..3].copy_from_slice(&c);
-                    land += (h > SEA) as u32;
+                    land += (h > GSEA) as u32;
                     high += (h >= 86) as u32;
                     snow += (h >= 98) as u32;
                     desert += d as u32;
@@ -2124,7 +2483,7 @@ mod tests {
                     for z in 0..CW {
                         for x in 0..CW {
                             let h = height_at(seed, cx * CW + x, cz * CW + z);
-                            for y in 1..CH - 1 {
+                            for y in 1..GH - 1 {
                                 let b = c.get(x, y, z);
                                 let under = c.get(x, y - 1, z);
                                 if y <= h {
@@ -2147,7 +2506,7 @@ mod tests {
                                     CRYSTAL_ORE => ore[3] += 1,
                                     WATER => {
                                         // water with nothing to hold it in
-                                        let open = under == AIR || (x > 0 && c.get(x - 1, y, z) == AIR && y < SEA) || (x < CW - 1 && c.get(x + 1, y, z) == AIR && y < SEA);
+                                        let open = under == AIR || (x > 0 && c.get(x - 1, y, z) == AIR && y < GSEA) || (x < CW - 1 && c.get(x + 1, y, z) == AIR && y < GSEA);
                                         wet_holes += open as u32;
                                     }
                                     b if is_plant(b) || b == CACTUS => floating += (under == AIR || under == WATER) as u32,
@@ -2181,11 +2540,11 @@ mod tests {
             for z in (-512..512).step_by(16) {
                 for x in (-512..512).step_by(16) {
                     let h = height_at(seed, x, z);
-                    assert!((3..=CH - 12).contains(&h));
+                    assert!((3..=GH - 12).contains(&h));
                     total += 1;
-                    land += (h > SEA) as u32;
+                    land += (h > GSEA) as u32;
                     snow += (h >= 98) as u32;
-                    flat_top += (h == CH - 12) as u32;
+                    flat_top += (h == GH - 12) as u32;
                 }
             }
             // no world is all sea or all land
@@ -2195,7 +2554,7 @@ mod tests {
             // the start is on level green land, not far from the middle
             let (x, h, z) = spawn_point(seed);
             assert_eq!(h, height_at(seed, x, z));
-            assert!(h > SEA + 2 && h < 78 && !is_desert(seed, x, z), "seed {seed}: spawn {x} {h} {z}");
+            assert!(h > GSEA + 2 && h < 78 && !is_desert(seed, x, z), "seed {seed}: spawn {x} {h} {z}");
             assert!(x.abs().max(z.abs()) <= 400, "seed {seed}: spawn {x} {z}");
         }
         // peaks are not sliced off at the build limit, and the middle of the world varies
@@ -2219,13 +2578,13 @@ mod tests {
                     for x in 0..CW {
                         let h = height_at(seed, cx * CW + x, cz * CW + z);
                         assert_eq!(c.get(x, 0, z), BEDROCK);
-                        for y in 1..CH - 1 {
+                        for y in 1..GH - 1 {
                             let (b, under) = (c.get(x, y, z), c.get(x, y - 1, z));
                             if is_plant(b) || b == CACTUS {
                                 assert!(is_opaque(under) || under == CACTUS, "seed {seed}: block {b} on {under} at {x} {y} {z}");
                             }
                             if b == WATER {
-                                assert!(y <= SEA && under != AIR, "seed {seed}: water at {x} {y} {z}");
+                                assert!(y <= GSEA && under != AIR, "seed {seed}: water at {x} {y} {z}");
                             }
                             // lava lies only in the deepest caves, and cave chests stand on rock
                             if b == LAVA {

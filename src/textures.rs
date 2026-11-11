@@ -5,6 +5,8 @@ pub const TEX: usize = 16;
 /// so blocks live below 128 and the icons and other textures above.
 /// The blocks of the Emberdeep (see `world::tex_for`).
 pub const DEEP_TEX: usize = 96;
+/// slate, fortress bricks (whole, cracked), pyre ore: `world::SLATE` + n
+pub const EXTRA_TEX: usize = 111;
 /// first layer holding item and HUD icons
 pub const ICON_BASE: usize = 128;
 /// textures added after the icons: chest side, chest top, ladder, trapdoor
@@ -17,6 +19,17 @@ pub const DOOR_TEX: usize = SHAPE_ICONS + 6;
 /// the player's arm in first person: skin, then sleeve
 pub const ARM_TEX: usize = DOOR_TEX + 8;
 pub const LAYERS: usize = ARM_TEX + 2;
+/// icons of the pyre ingot and the eight pieces of pyre gear (`items::PYRE_INGOT` + n),
+/// in spare layers under the item icons (the array holds no more than 256)
+pub const PYRE_ICONS: usize = EXTRA_TEX + 4;
+/// the lava bucket's icon, after the pyre icons
+pub const LAVA_BUCKET_ICON: usize = PYRE_ICONS + 10;
+
+/// The texture of a sapling (oak, birch, pine, jungle, acacia): four in the spare layers
+/// after the wool, the fifth after the pyre icons.
+pub const fn sapling_layer(k: usize) -> usize {
+    if k < 4 { 92 + k } else { PYRE_ICONS + 9 }
+}
 /// lava, in the slot the doors used to start at
 const LAVA_TEX: usize = 56;
 /// block textures the slab / stair / fence icons are cut from
@@ -71,8 +84,15 @@ fn pixel(layer: usize, x: i32, y: i32) -> [u8; 4] {
             shade([196.0, 62.0, 18.0], 0.8 + n * 0.2)
         };
     }
+    if (EXTRA_TEX..EXTRA_TEX + 4).contains(&layer) {
+        return slate_pixel(layer - EXTRA_TEX, x, y);
+    }
     if (DEEP_TEX..DEEP_TEX + 15).contains(&layer) {
         return deep_pixel(layer - DEEP_TEX, x, y);
+    }
+    if (PYRE_ICONS..PYRE_ICONS + 9).contains(&layer) {
+        // (drawn as made-up item numbers past the others: see `item_pixel`)
+        return item_pixel(200 + layer - PYRE_ICONS, x, y);
     }
     if layer >= ARM_TEX {
         let n = h(layer as u32, x, y);
@@ -85,6 +105,12 @@ fn pixel(layer: usize, x: i32, y: i32) -> [u8; 4] {
         let n = h(48, x, y);
         let weave = if (x + y) % 2 == 0 { 0.92 } else { 1.0 } * if x % 4 == 0 || y % 4 == 0 { 0.9 } else { 1.0 };
         return shade([c[0] as f32, c[1] as f32, c[2] as f32], weave * (0.94 + n * 0.08));
+    }
+    if (92..96).contains(&layer) || layer == sapling_layer(4) {
+        return sapling_pixel(if layer < 96 { layer - 92 } else { 4 }, x, y);
+    }
+    if layer == LAVA_BUCKET_ICON {
+        return item_pixel(210, x, y);
     }
     if (57..DEEP_TEX).contains(&layer) {
         return biome_pixel(layer, x, y);
@@ -697,8 +723,13 @@ fn item_pixel(item: usize, x: i32, y: i32) -> [u8; 4] {
             2 => [216.0, 216.0, 222.0],
             3 => [250.0, 208.0, 66.0],
             4 => [104.0, 222.0, 232.0],
+            6 => [196.0, 30.0, 52.0],
             _ => [150.0, 98.0, 58.0],
         };
+        if m == 6 && n > 0.9 {
+            // pyre metal glints white-hot
+            return shade([255.0, 226.0, 210.0], k);
+        }
         shade(c, k + n * 0.1)
     };
     // (shape, material): 0 pick 1 axe 2 shovel 3 hoe 4 sword 5 helmet 6 chest 7 legs 8 boots
@@ -721,6 +752,10 @@ fn item_pixel(item: usize, x: i32, y: i32) -> [u8; 4] {
         57 => Some((8, 2)),
         58..=61 => Some((5 + (item - 58) as u8, 3)),
         62..=65 => Some((5 + (item - 62) as u8, 4)),
+        // pyre gear: pick, axe, shovel, sword, then the armour
+        201..=203 => Some(((item - 201) as u8, 6)),
+        204 => Some((4, 6)),
+        205..=208 => Some((5 + (item - 205) as u8, 6)),
         _ => None,
     };
     if let Some((shape, m)) = gear {
@@ -807,13 +842,14 @@ fn item_pixel(item: usize, x: i32, y: i32) -> [u8; 4] {
                 NONE
             }
         }
-        40 | 41 => {
-            // bucket, empty or full of water
+        40 | 41 | 210 => {
+            // bucket, empty or full of water (or lava)
             let w = if y <= 5 { 5 } else { 5 - (y - 5) / 3 };
             let inside = (4..=13).contains(&y) && (x as f32 - 7.5).abs() <= w as f32;
             if inside {
                 if y == 4 || y == 5 {
-                    if item == 41 && (x as f32 - 7.5).abs() < w as f32 - 0.6 { shade([56.0, 120.0, 214.0], 0.95 + n * 0.1) } else if (x as f32 - 7.5).abs() < w as f32 - 0.6 { shade([70.0, 72.0, 80.0], 1.0) } else { iron(1.05) }
+                    if item == 210 && (x as f32 - 7.5).abs() < w as f32 - 0.6 { if n > 0.7 { shade([255.0, 214.0, 90.0], 1.0) } else { shade([236.0, 100.0, 24.0], 0.9 + n * 0.15) } }
+                    else if item == 41 && (x as f32 - 7.5).abs() < w as f32 - 0.6 { shade([56.0, 120.0, 214.0], 0.95 + n * 0.1) } else if (x as f32 - 7.5).abs() < w as f32 - 0.6 { shade([70.0, 72.0, 80.0], 1.0) } else { iron(1.05) }
                 } else {
                     iron(if x <= 4 { 1.05 } else if x >= 11 { 0.7 } else { 0.88 })
                 }
@@ -996,8 +1032,13 @@ fn item_pixel(item: usize, x: i32, y: i32) -> [u8; 4] {
                 NONE
             }
         }
-        8 | 16 => {
-            let iron = |k: f32| if item == 16 { shade([250.0, 206.0, 64.0], k + n * 0.08) } else { iron(k) };
+        8 | 16 | 200 => {
+            let iron = |k: f32| match item {
+                16 => shade([250.0, 206.0, 64.0], k + n * 0.08),
+                200 if n > 0.88 => shade([255.0, 226.0, 210.0], k),
+                200 => shade([196.0, 30.0, 52.0], k + n * 0.1),
+                _ => iron(k),
+            };
             // ingot
             let inside = (5..=11).contains(&y) && x >= 2 + (11 - y) / 3 && x <= 13 - (11 - y) / 3;
             if inside {
@@ -1333,5 +1374,73 @@ fn deep_pixel(i: usize, x: i32, y: i32) -> [u8; 4] {
             let mortar = y % 8 == 0 || (x + if (y / 8) % 2 == 0 { 0 } else { 8 }) % 16 == 0;
             rgb([110.0, 50.0, 44.0], if mortar { 0.55 } else { 0.85 + n * 0.15 })
         }
+    }
+}
+
+/// The deep slate, the fortress bricks and pyre ore.
+fn slate_pixel(i: usize, x: i32, y: i32) -> [u8; 4] {
+    let l = 760 + i as u32;
+    let n = h(l, x, y);
+    let n2 = h(l + 40, x / 2, y / 3);
+    match i {
+        // slate: cold blue-grey in thin layers
+        0 => {
+            let band = h(l + 7, 0, y / 2);
+            shade([84.0, 88.0, 100.0], 0.78 + band * 0.18 + n * 0.08 + if n2 > 0.86 { -0.14 } else { 0.0 })
+        }
+        // fortress bricks: blackened, with a red glow in the mortar
+        1 | 2 => {
+            let row = y / 4;
+            let mortar = y % 4 == 3 || (x + if row % 2 == 0 { 0 } else { 4 }) % 8 == 7;
+            let crack = i == 2 && {
+                // a crack running down the face
+                let cx = 7 + ((y as f32 * 0.8).sin() * 2.5) as i32 + (h(l, 0, y / 3) * 2.0) as i32;
+                (x - cx).abs() <= (n > 0.6) as i32 && y > 1 && y < 15
+            };
+            if crack {
+                shade([20.0, 12.0, 12.0], 1.0)
+            } else if mortar {
+                shade([92.0, 30.0, 24.0], 0.8 + n * 0.3)
+            } else {
+                shade([46.0, 38.0, 40.0], 0.82 + n2 * 0.2 + n * 0.08)
+            }
+        }
+        // pyre ore: dark scoria with white-hot crimson grains
+        _ => {
+            let grain = h(l + 3, x / 2, y / 2) > 0.74 && n > 0.25;
+            if grain {
+                if n > 0.8 { shade([255.0, 236.0, 220.0], 1.0) } else { shade([222.0, 34.0, 60.0], 0.9 + n * 0.15) }
+            } else {
+                shade([62.0, 56.0, 66.0], 0.8 + n * 0.25)
+            }
+        }
+    }
+}
+
+/// A sapling: a thin stem with a few tufts of its tree's leaves (transparent round it).
+fn sapling_pixel(k: usize, x: i32, y: i32) -> [u8; 4] {
+    let n = h(780 + k as u32, x, y);
+    let (leaf, bark): ([f32; 3], [f32; 3]) = match k {
+        1 => ([112.0, 164.0, 72.0], [220.0, 218.0, 206.0]),
+        2 => ([48.0, 96.0, 64.0], [96.0, 70.0, 44.0]),
+        3 => ([44.0, 146.0, 44.0], [112.0, 84.0, 50.0]),
+        4 => ([128.0, 146.0, 52.0], [120.0, 100.0, 80.0]),
+        _ => ([72.0, 136.0, 52.0], [104.0, 78.0, 46.0]),
+    };
+    // the stem, leaning a little
+    let stem = y >= 7 && (x == 7 + (y >= 12) as i32 || (x == 8 && y >= 13));
+    // leaves: a pine is a narrow cone, the rest a ragged blob
+    let (dx, dy) = (x as f32 - 7.5, y as f32 - 5.5);
+    let leafy = if k == 2 {
+        y >= 1 && y <= 11 && dx.abs() <= (y as f32 - 1.0) * 0.45 + 0.5 && !(y % 3 == 0 && dx.abs() > 1.5)
+    } else {
+        (dx * dx) / 30.0 + (dy * dy) / 18.0 < 1.0 && n > 0.18 && !(y > 8 && dx.abs() < 1.0)
+    };
+    if leafy {
+        shade(leaf, 0.78 + n * 0.35 + if (x + y) % 4 == 0 { 0.12 } else { 0.0 })
+    } else if stem {
+        shade(bark, 0.85 + n * 0.15)
+    } else {
+        [0, 0, 0, 0]
     }
 }

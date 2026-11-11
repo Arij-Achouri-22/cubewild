@@ -81,21 +81,24 @@ impl Pickups {
                 p.check -= dt;
                 if p.check <= 0.0 {
                     p.check = 0.4;
-                    p.rest = collides(world, p.pos - Vec3::Y * 0.05, HW, H);
+                    // (running water picks it up again)
+                    let wet = crate::fluid::current(world, cell) != Vec3::ZERO;
+                    p.rest = collides(world, p.pos - Vec3::Y * 0.05, HW, H) && !wet;
                 }
             } else {
                 let around = world.get_block(c.x, (p.pos.y + 0.1).floor() as i32, c.z);
-                if around == LAVA {
+                if is_lava(around) {
                     // lava destroys what falls into it
                     p.stack = Stack::default();
                     continue;
                 }
-                if around == WATER {
-                    // floats up and drifts to a stop
+                if is_water(around) {
+                    // floats up and drifts with the water: to a stop in still water
+                    let flow = crate::fluid::current(world, IVec3::new(c.x, (p.pos.y + 0.1).floor() as i32, c.z)) * 2.2;
                     p.vel.y = (p.vel.y + 9.0 * dt).min(1.0);
-                    let k = (-dt * 3.0).exp();
-                    p.vel.x *= k;
-                    p.vel.z *= k;
+                    let k = 1.0 - (-dt * 3.0).exp();
+                    p.vel.x += (flow.x - p.vel.x) * k;
+                    p.vel.z += (flow.z - p.vel.z) * k;
                 } else {
                     p.vel.y = (p.vel.y - 22.0 * dt).max(-30.0);
                 }
@@ -104,7 +107,7 @@ impl Pickups {
                     let k = (-dt * 10.0).exp();
                     p.vel.x *= k;
                     p.vel.z *= k;
-                    if p.vel.x * p.vel.x + p.vel.z * p.vel.z < 0.01 {
+                    if p.vel.x * p.vel.x + p.vel.z * p.vel.z < 0.01 && !is_water(around) {
                         p.vel = Vec3::ZERO;
                         p.rest = true;
                         p.check = 0.4;
@@ -227,14 +230,17 @@ pub type Chests = HashMap<IVec3, [Stack; CHEST_SLOTS]>;
 /// What a chest found in a cave holds: always the same for a world and a place, and
 /// better the deeper it stands (torches and food near the surface; iron, gold, crystal
 /// and finished gear near the lava).
-pub fn roll_chest(seed: u32, at: IVec3) -> [Stack; CHEST_SLOTS] {
+pub fn roll_chest(seed: u32, at: IVec3, emberdeep: bool) -> [Stack; CHEST_SLOTS] {
     use items::*;
     let mut rng = Rng(((seed as u64) << 32 | (at.x as u32 as u64) << 8) ^ (at.z as u32 as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ ((at.y as u64) << 52) | 1);
     for _ in 0..6 {
         rng.next();
     }
+    if emberdeep {
+        return fortress_chest(&mut rng);
+    }
     // 0 = just under the surface .. 1 = at the lava
-    let deep = ((40 - at.y) as f32 / (40 - LAVA_LEVEL) as f32).clamp(0.0, 1.0);
+    let deep = ((SEA - at.y) as f32 / (SEA - LIFT) as f32).clamp(0.0, 1.0);
     // (item, most at once, chance at the top, chance at the bottom)
     let table: [(Item, u32, f32, f32); 17] = [
         (TORCH, 8, 0.9, 0.7),
@@ -260,6 +266,38 @@ pub fn roll_chest(seed: u32, at: IVec3) -> [Stack; CHEST_SLOTS] {
         if rng.f() < top + (bottom - top) * deep {
             // more of it the deeper, in a slot of its own somewhere in the chest
             let n = (1 + (rng.f() * (most as f32 - 1.0) * (0.4 + 0.6 * deep)).round() as u32).min(max_stack(item));
+            let free: Vec<usize> = (0..CHEST_SLOTS).filter(|&i| slots[i].is_empty()).collect();
+            slots[free[rng.next() as usize % free.len()]] = Stack::new(item, n);
+        }
+    }
+    slots
+}
+
+/// The hoard of a ruined fortress in the Emberdeep: gold and embers, and the only pyre
+/// metal that is not dug out by the lava.
+fn fortress_chest(rng: &mut Rng) -> [Stack; CHEST_SLOTS] {
+    use items::*;
+    // (item, most at once, chance)
+    let table: [(Item, u32, f32); 14] = [
+        (GOLD_INGOT, 6, 0.75),
+        (EMBER, 5, 0.6),
+        (IRON_INGOT, 6, 0.5),
+        (CRYSTAL, 4, 0.45),
+        (PYRE_INGOT, 2, 0.35),
+        (GEM, 5, 0.4),
+        (COOKED_MEAT, 4, 0.4),
+        (ARROW, 16, 0.35),
+        (STRIKER, 1, 0.2),
+        (EXTRA_ITEM + 3, 2, 0.2),
+        (GOLD_SWORD, 1, 0.15),
+        (CRYSTAL_HELMET, 1, 0.1),
+        (CRYSTAL_SWORD, 1, 0.1),
+        (PYRE_BOOTS, 1, 0.03),
+    ];
+    let mut slots = [Stack::default(); CHEST_SLOTS];
+    for (item, most, chance) in table {
+        if rng.f() < chance {
+            let n = (1 + (rng.f() * (most as f32 - 1.0)).round() as u32).min(max_stack(item));
             let free: Vec<usize> = (0..CHEST_SLOTS).filter(|&i| slots[i].is_empty()).collect();
             slots[free[rng.next() as usize % free.len()]] = Stack::new(item, n);
         }
@@ -323,10 +361,10 @@ mod tests {
         };
         let (mut top, mut bottom) = (0, 0);
         for i in 0..200 {
-            let (high, low) = (IVec3::new(i * 7, 40, -i * 3), IVec3::new(i * 7, 8, -i * 3));
+            let (high, low) = (IVec3::new(i * 7, SEA, -i * 3), IVec3::new(i * 7, LIFT + 8, -i * 3));
             // the same chest always holds the same things
-            assert!(roll_chest(77, high) == roll_chest(77, high));
-            let (a, b) = (roll_chest(77, high), roll_chest(77, low));
+            assert!(roll_chest(77, high, false) == roll_chest(77, high, false));
+            let (a, b) = (roll_chest(77, high, false), roll_chest(77, low, false));
             for st in a.iter().chain(b.iter()).filter(|st| !st.is_empty()) {
                 assert!(items::valid(st.item) && st.n >= 1 && st.n <= items::max_stack(st.item));
             }
@@ -335,7 +373,7 @@ mod tests {
             bottom += b.iter().map(worth).sum::<u32>();
         }
         assert!(top > 0 && bottom > top * 3, "{top} {bottom}");
-        assert!(roll_chest(77, IVec3::new(1, 20, 1)) != roll_chest(78, IVec3::new(1, 20, 1)));
+        assert!(roll_chest(77, IVec3::new(1, 20, 1), false) != roll_chest(78, IVec3::new(1, 20, 1), false));
     }
 
     #[test]

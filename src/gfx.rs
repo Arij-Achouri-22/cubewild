@@ -124,12 +124,18 @@ struct COut {
 };
 
 @vertex fn vs_chunk(@location(0) v: u32, @location(1) off: vec4<f32>) -> COut {
-  let x = f32(v & 31u); let y = f32((v >> 5u) & 255u); let z = f32((v >> 13u) & 31u);
+  let xz = v & 511u;
+  let x = f32(xz % 17u); let y = f32((v >> 9u) & 511u); let z = f32(xz / 17u);
   let face = (v >> 18u) & 7u;
   var ao = f32((v >> 28u) & 3u);
   var p = vec3<f32>(x, y, z) + off.xyz;
   var o: COut;
   o.layer = (v >> 21u) & 127u;
+  if (o.layer == 12u || o.layer == 56u) {
+    // water and lava: the shading bits say how far this corner of the surface sinks
+    p.y -= (3.0 - ao) * 0.25;
+    ao = 3.0;
+  }
   if (face == 7u) {
     // window panes: an upright quad moved from the cell boundary to the middle of the cell
     var dirs = array<vec3<f32>, 4>(vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(-1.0, 0.0, 0.0), vec3<f32>(0.0, 0.0, 1.0), vec3<f32>(0.0, 0.0, -1.0));
@@ -153,7 +159,7 @@ struct COut {
 
 // shaped blocks: positions in sixteenths of a block, textures laid out by world position
 @vertex fn vs_detail(@location(0) v: vec2<u32>, @location(1) off: vec4<f32>) -> COut {
-  let q = vec3<f32>(f32(v.x & 511u), f32((v.x >> 9u) & 4095u), f32((v.x >> 21u) & 511u)) / 16.0;
+  let q = vec3<f32>(f32(v.x & 511u), f32((v.x >> 9u) & 8191u), f32((v.x >> 22u) & 511u)) / 16.0;
   let face = v.y & 7u;
   let p = q + off.xyz;
   var o: COut;
@@ -166,7 +172,7 @@ struct COut {
   o.light = shade[face];
   o.p = p;
   var skyl = array<f32, 4>(0.2, 0.52, 1.0, 1.0);
-  o.sky = skyl[(v.x >> 30u) & 3u];
+  o.sky = skyl[(v.y >> 11u) & 3u];
   return o;
 }
 @vertex fn vs_item(@location(0) p: vec3<f32>, @location(1) uv: vec2<f32>, @location(2) layer: u32, @location(3) light: f32, @location(4) sky: f32) -> COut {
@@ -202,7 +208,8 @@ fn chunk_color(i: COut, c: vec4<f32>) -> vec4<f32> {
   }
   glow = glow * glow * 1.15;
   // what daylight seeps into enclosed places fades out on the way down
-  let dim = mix(0.1, 1.0, smoothstep(12.0, 44.0, i.p.y + g.misc.w));
+  // (world heights: the old y 12..44, lifted onto the deep slate by 64)
+  let dim = mix(0.1, 1.0, smoothstep(76.0, 108.0, i.p.y + g.misc.w));
   var sky = i.sky;
   if (sky < 0.6) { sky = sky * dim; }
   // (the Emberdeep has no daylight: a warm glow fills it instead, fog.z strong)
@@ -212,6 +219,8 @@ fn chunk_color(i: COut, c: vec4<f32>) -> vec4<f32> {
   // sunshard and glowcap shine; smouldering rock glows dimly
   if (i.layer == 106u || i.layer == 108u) { lit = vec3<f32>(1.05, 0.98, 0.9); }
   if (i.layer == 101u) { lit = max(lit, vec3<f32>(0.75, 0.6, 0.5)); }
+  // pyre ore smoulders faintly, so it can be found in the dark
+  if (i.layer == 114u) { lit = max(lit, vec3<f32>(0.62, 0.42, 0.42)); }
   if (i.layer == 56u) { lit = vec3<f32>(1.0, 0.92, 0.85); }
   return vec4<f32>(mix(c.rgb * lit, g.fog_color.rgb, fogf(length(i.p))), c.a);
 }
