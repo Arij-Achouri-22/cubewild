@@ -100,6 +100,26 @@ pub const FERN: Block = 71;
 pub const REEDS: Block = 72;
 /// the tall yellow grass of the savanna
 pub const DRY_TUFT: Block = 73;
+/// A torch fixed to a wall: + the side of the cell the wall is on (see `SIDE_DIR`). It
+/// leans out of the wall and is the `TORCH` item again when broken.
+pub const WALL_TORCH: Block = 74;
+pub const WALL_TORCH_END: Block = 78;
+/// A torch, standing or on a wall.
+#[inline]
+pub fn is_torch(b: Block) -> bool {
+    b == TORCH || (WALL_TORCH..WALL_TORCH_END).contains(&b)
+}
+/// The small box a torch is aimed at by (it is never collided with).
+pub fn torch_box(b: Block) -> [f32; 6] {
+    match b {
+        TORCH => [0.4, 0.0, 0.4, 0.6, 0.65, 0.6],
+        _ => {
+            let (dx, dz) = SIDE_DIR[(b - WALL_TORCH) as usize];
+            let (cx, cz) = (0.5 + dx as f32 * 0.29, 0.5 + dz as f32 * 0.29);
+            [cx - 0.16, 0.2, cz - 0.16, cx + 0.16, 0.96, cz + 0.16]
+        }
+    }
+}
 
 /// The terrain generator a world was made with: 1 the first one, 2 the one with biomes
 /// (`worldgen`), 3 the same with villages in it (`village`). A world keeps its generator
@@ -386,12 +406,12 @@ pub fn is_replaceable(b: Block) -> bool {
 
 #[inline]
 pub fn is_opaque(b: Block) -> bool {
-    b != AIR && b != WATER && b != GLASS && b != TORCH && !is_plant(b) && !is_shaped(b)
+    b != AIR && b != WATER && b != GLASS && !is_torch(b) && !is_plant(b) && !is_shaped(b)
 }
 /// Blocks you collide with / can target.
 #[inline]
 pub fn is_solid(b: Block) -> bool {
-    b != AIR && b != WATER && b != LAVA && b != TORCH && !is_plant(b) && !is_ladder(b)
+    b != AIR && b != WATER && b != LAVA && !is_torch(b) && !is_plant(b) && !is_ladder(b)
 }
 /// Blocks the crosshair can select (torches are walk-through but breakable).
 #[inline]
@@ -401,7 +421,7 @@ pub fn is_target(b: Block) -> bool {
 /// Blocks that light their surroundings.
 #[inline]
 pub fn is_light(b: Block) -> bool {
-    b == TORCH || b == LAMP
+    is_torch(b) || b == LAMP
 }
 
 /// Texture layer for a block face (face: 0 +X, 1 -X, 2 +Y, 3 -Y, 4 +Z, 5 -Z).
@@ -1190,7 +1210,7 @@ pub fn mesh(n: &[Arc<ChunkData>; 9]) -> MeshData {
                     let b = at(i);
                     let m = &mut mask[vv * nu + uu];
                     *m = 0;
-                    if b == AIR || b == TORCH || is_plant(b) || is_shaped(b) {
+                    if b == AIR || is_torch(b) || is_plant(b) || is_shaped(b) {
                         continue;
                     }
                     let q = i + sa;
@@ -1765,7 +1785,7 @@ impl World {
         let s = self.chunks.get(&(x >> 4, z >> 4))?;
         (0..CH).rev().find(|&y| {
             let b = s.data.get(x & 15, y, z & 15);
-            b != AIR && b != TORCH && !is_plant(b) && !is_ladder(b)
+            b != AIR && !is_torch(b) && !is_plant(b) && !is_ladder(b)
         })
     }
 
@@ -1885,7 +1905,13 @@ impl World {
 
     /// Boxes of the shaped block `b` at a cell, in world coordinates.
     pub fn shape_at(&self, b: Block, x: i32, y: i32, z: i32) -> Boxes {
-        let (mut v, n) = shape_boxes(b, |dx, dz| self.get_block(x + dx, y, z + dz));
+        let (mut v, n) = if is_torch(b) {
+            let mut v = [[0.0f32; 6]; 5];
+            v[0] = torch_box(b);
+            (v, 1)
+        } else {
+            shape_boxes(b, |dx, dz| self.get_block(x + dx, y, z + dz))
+        };
         let o = [x as f32, y as f32, z as f32];
         for bx in &mut v[..n] {
             for i in 0..6 {
