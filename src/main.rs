@@ -7,12 +7,14 @@ mod furnace;
 mod fluid;
 mod fx;
 mod settle;
+mod save;
 mod gfx;
 mod items;
 mod loot;
 mod mobs;
 mod path;
 mod player;
+mod projectile;
 mod textures;
 mod trade;
 mod ui;
@@ -454,6 +456,9 @@ struct Game {
     ready: bool,
     drawn: (usize, u32),
     save_dir: Option<PathBuf>,
+    last_checkpoint: Instant,
+    save_error: Option<String>,
+    load_notice: Option<String>,
     bench: Option<Bench>,
     ents: Vec<EntVert>,
     sky: Vec<EntVert>,
@@ -545,7 +550,7 @@ struct Game {
     /// the villager being traded with (their village square and home)
     trading: Option<((i32, i32), usize)>,
     /// offers used up today: (villager, offer) -> times made
-    trade_uses: std::collections::HashMap<(((i32, i32), usize), usize), u32>,
+    trade_uses: trade::Uses,
     /// the generator of the world above
     over_ver: u8,
     /// every Ember Gate there is, in both worlds
@@ -569,13 +574,10 @@ struct Game {
     cactus_t: f32,
 }
 
-fn data_dir(seed: u32) -> Option<PathBuf> {
-    let dir = user_dir(false)?.join(format!("world-{seed}"));
-    if let Err(e) = std::fs::create_dir_all(&dir) {
-        eprintln!("cubewild: cannot create {}: {e} - the world will not be saved", dir.display());
-        return None;
-    }
-    Some(dir)
+fn data_dir(seed: u32) -> std::io::Result<PathBuf> {
+    let dir = user_dir(false).ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "cannot find the save folder"))?.join(format!("world-{seed}"));
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
 }
 
 /// Moves a world saved before the deep slate up by `LIFT`, once, after copying the
@@ -654,9 +656,7 @@ fn dim_dir(save_dir: &Option<PathBuf>, deep: bool) -> Option<PathBuf> {
     if !deep {
         return Some(d.clone());
     }
-    let d = d.join("deep");
-    std::fs::create_dir_all(&d).ok()?;
-    Some(d)
+    Some(d.join("deep"))
 }
 
 /// The open space of a frame of cinderstone, in the plane of `axis` (0 = the frame
@@ -738,8 +738,16 @@ fn list_worlds() -> Vec<WorldInfo> {
     for e in entries.into_iter().flatten().flatten() {
         let name = e.file_name();
         let Some(seed) = name.to_str().and_then(|n| n.strip_prefix("world-")).and_then(|n| n.parse::<u32>().ok()) else { continue };
+        if let Err(e) = save::recover(&e.path()) {
+            eprintln!("cubewild: cannot recover world {seed}: {e}");
+        }
         let file = e.path().join("player.txt");
-        let Ok(text) = std::fs::read_to_string(&file) else { continue };
+        let text = match std::fs::read_to_string(&file) {
+            Ok(text) => text,
+            // An interrupted first checkpoint still needs to appear in the list.
+            Err(_) if e.path().join(".checkpoint-pending").exists() => String::new(),
+            Err(_) => continue,
+        };
         let mode = if text.lines().any(|l| l.trim() == "mode creative") { Mode::Creative } else { Mode::Survival };
         let when = std::fs::metadata(&file).and_then(|m| m.modified()).unwrap_or(UNIX_EPOCH);
         v.push(WorldInfo { seed, mode, when });
@@ -767,6 +775,10 @@ fn fresh_seed() -> u32 {
 /// Everything that belongs to one world and its player.
 struct Loaded {
     world: World,
+    mobs: Mobs,
+    fluids: fluid::Fluids,
+    settle: settle::Settle,
+    trade_uses: trade::Uses,
     player: Player,
     inv: Inventory,
     sel: usize,
@@ -790,12 +802,22 @@ struct Loaded {
 
 /// Opens the world of a seed: from its save if there is one (which also decides the
 /// mode), otherwise new in `mode`. With `save` off nothing is read or written.
-fn load_world(seed: u32, view_dist: i32, save: bool, mode: Mode) -> Loaded {
-    let save_dir = if save { data_dir(seed) } else { None };
+fn load_world(seed: u32, view_dist: i32, save: bool, mode: Mode) -> std::io::Result<Loaded> {
+    let save_dir = if save { Some(data_dir(seed)?) } else { None };
+    load_world_at(seed, view_dist, save_dir, mode)
+}
+
+fn load_world_at(seed: u32, view_dist: i32, save_dir: Option<PathBuf>, mode: Mode) -> std::io::Result<Loaded> {
     if let Some(d) = &save_dir {
+        save::recover(d)?;
         migrate(d);
     }
-    let saved = save_dir.as_ref().and_then(|d| std::fs::read_to_string(d.join("player.txt")).ok());
+    let saved = match save_dir.as_ref().map(|d| std::fs::read_to_string(d.join("player.txt"))) {
+        Some(Ok(text)) => Some(text),
+        None => None,
+        Some(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Some(Err(e)) => return Err(e),
+    };
     // a world keeps the terrain generator it was made with: saves from before there
     // were two do not name one, and are of the first
     let ver = match &saved {
@@ -806,6 +828,9 @@ fn load_world(seed: u32, view_dist: i32, save: bool, mode: Mode) -> Loaded {
     let in_deep = saved.as_ref().is_some_and(|t| t.lines().any(|l| l.trim() == "dim deep"));
     let dim_dir = dim_dir(&save_dir, in_deep);
     let world = if in_deep { World::new(seed, deep::DEEP_VER, view_dist.min(DEEP_DIST), dim_dir.clone()) } else { World::new(seed, ver, view_dist, save_dir.clone()) };
+    if let Some(error) = &world.load_error {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, error.clone()));
+    }
     let mut spawn = find_spawn(ver, seed);
     let mut player = Player::new(spawn);
     let mut inv = Inventory::new();
@@ -860,6 +885,12 @@ fn load_world(seed: u32, view_dist: i32, save: bool, mode: Mode) -> Loaded {
                         }
                     }
                 }
+                Some("held") => {
+                    let v: Vec<u32> = parts.filter_map(|t| t.parse().ok()).collect();
+                    if v.len() == 3 {
+                        inv.held = loot::parse_stack(v[0], v[1], v[2]).unwrap_or_default();
+                    }
+                }
                 Some("sel") => {
                     if let Some(v) = parts.next().and_then(|t| t.parse::<usize>().ok()) {
                         sel = v.min(8);
@@ -906,7 +937,16 @@ fn load_world(seed: u32, view_dist: i32, save: bool, mode: Mode) -> Loaded {
     let chests = dim_dir.as_ref().map_or_else(Chests::default, |d| loot::load_chests(&d.join("chests.txt")));
     let furnaces = dim_dir.as_ref().map_or_else(Furnaces::default, |d| furnace::load(&d.join("furnaces.txt")));
     let boats = dim_dir.as_ref().map_or_else(boat::Boats::default, |d| boat::Boats::load(&d.join("boats.txt")));
-    Loaded { world, player, inv, sel, health, food, air, time, spawn, pickups, chests, furnaces, mode, save_dir, level, xp, weather, boats, over_ver: ver }
+    let (mobs, fluids, settle) = load_simulation(seed, in_deep, &dim_dir)?;
+    let trade_uses = save_dir.as_ref().map(|d| trade::load_uses(&d.join("trades.txt"))).transpose()?.unwrap_or_default();
+    Ok(Loaded { world, mobs, fluids, settle, trade_uses, player, inv, sel, health, food, air, time, spawn, pickups, chests, furnaces, mode, save_dir, level, xp, weather, boats, over_ver: ver })
+}
+
+fn load_simulation(seed: u32, deep: bool, dir: &Option<PathBuf>) -> std::io::Result<(Mobs, fluid::Fluids, settle::Settle)> {
+    let mut mobs = Mobs::new(seed as u64 * 7919 + if deep { 31 } else { 17 });
+    let Some(dir) = dir else { return Ok((mobs, fluid::Fluids::default(), settle::Settle::default())) };
+    mobs.load(&dir.join("animals.txt"))?;
+    Ok((mobs, fluid::Fluids::load(&dir.join("fluids.txt"))?, settle::Settle::load(&dir.join("settle.txt"))?))
 }
 
 /// One face of a held item's model: corners in the model's own space, texture
@@ -1116,7 +1156,12 @@ impl Game {
         let (font, atlas) = Font::bake(ui_scale(gfx.size().1));
         gfx.upload_font(&atlas);
 
-        let Loaded { world, mut player, mut inv, sel, health, food, air, mut time, spawn, pickups, chests, furnaces, mut mode, save_dir, level, xp, mut weather, boats, over_ver } = load_world(seed, settings.view_dist, save, Mode::Survival);
+        let mut startup_error = None;
+        let loaded = load_world(seed, settings.view_dist, save, Mode::Survival).unwrap_or_else(|e| {
+            startup_error = Some(format!("Could not open world {seed}: {e}"));
+            load_world(seed, settings.view_dist, false, Mode::Survival).expect("an unsaved world needs no disk access")
+        });
+        let Loaded { world, mut mobs, fluids, settle, trade_uses, mut player, mut inv, sel, health, food, air, mut time, spawn, pickups, chests, furnaces, mut mode, save_dir, level, xp, mut weather, boats, over_ver } = loaded;
         // CUBEWILD_RAIN=rain|storm|clear sets the weather (for testing)
         match env("CUBEWILD_RAIN").as_deref() {
             Some("clear") => (weather.want, weather.rain, weather.storm) = (0.0, 0.0, false),
@@ -1153,6 +1198,7 @@ impl Game {
             inv.slots[sel] = Stack::new(item, 1);
         }
         let first_screen = match env("CUBEWILD_SCREEN").as_deref() {
+            _ if startup_error.is_some() => Screen::Title,
             Some("settings") => Screen::Settings,
             Some("controls") => Screen::Controls,
             Some("inventory") => Screen::Inventory,
@@ -1161,11 +1207,7 @@ impl Game {
             _ if titled => Screen::Title,
             _ => Screen::Pause,
         };
-        let mut mobs = Mobs::new(seed as u64 * 7919 + 17);
         mobs.ignore = mode == Mode::Creative;
-        if let Some(d) = dim_dir(&save_dir, world.is_deep()) {
-            mobs.load(&d.join("animals.txt"));
-        }
         let mut game = Game {
             window,
             gfx,
@@ -1205,6 +1247,9 @@ impl Game {
             ready: false,
             drawn: (0, 0),
             save_dir,
+            last_checkpoint: Instant::now(),
+            save_error: None,
+            load_notice: startup_error,
             bench,
             ents: Vec::new(),
             sky: Vec::new(),
@@ -1272,11 +1317,11 @@ impl Game {
             bob: (0.0, 0.0),
             riding: None,
             boats,
-            fluids: fluid::Fluids::default(),
-            settle: settle::Settle::default(),
+            fluids,
+            settle,
             paddle_t: 0.0,
             trading: None,
-            trade_uses: Default::default(),
+            trade_uses,
             over_ver,
             gates: Vec::new(),
             gate_t: 0.0,
@@ -1311,7 +1356,6 @@ impl Game {
 
     /// Puts a loaded world in place of the current one.
     fn install(&mut self, l: Loaded) {
-        let seed = l.world.seed;
         self.world = l.world;
         self.player = l.player;
         self.inv = l.inv;
@@ -1324,18 +1368,19 @@ impl Game {
         (self.level, self.xp) = (l.level, l.xp);
         self.weather = l.weather;
         self.boats = l.boats;
-        self.fluids.clear();
-        self.settle.clear();
+        self.fluids = l.fluids;
+        self.settle = l.settle;
+        self.trade_uses = l.trade_uses;
         self.riding = None;
         self.orbs = Orbs::default();
         self.particles = Particles::default();
         self.mode = l.mode;
         self.save_dir = l.save_dir;
-        self.mobs = Mobs::new(seed as u64 * 7919 + 17);
+        self.last_checkpoint = Instant::now();
+        self.save_error = None;
+        self.load_notice = None;
+        self.mobs = l.mobs;
         self.mobs.ignore = self.mode == Mode::Creative;
-        if let Some(d) = dim_dir(&self.save_dir, self.world.is_deep()) {
-            self.mobs.load(&d.join("animals.txt"));
-        }
         self.trading = None;
         self.over_ver = l.over_ver;
         self.gates = load_gates(&self.save_dir);
@@ -1359,9 +1404,18 @@ impl Game {
     /// Saves the current world and enters another: the saved one of that seed, or a
     /// new one in `mode`.
     fn enter(&mut self, seed: u32, mode: Mode) {
-        self.save();
-        self.install(load_world(seed, self.settings.view_dist, true, mode));
-        self.save_player();
+        if !self.save() {
+            return;
+        }
+        let loaded = match load_world(seed, self.settings.view_dist, true, mode) {
+            Ok(loaded) => loaded,
+            Err(e) => {
+                self.load_notice = Some(format!("Could not open world {seed}: {e}"));
+                return;
+            }
+        };
+        self.install(loaded);
+        self.checkpoint();
         self.goto(Screen::Play);
     }
 
@@ -1369,8 +1423,7 @@ impl Game {
     fn delete_world(&mut self, seed: u32) {
         if seed == self.world.seed {
             // step out of it first: a new world that is not saved yet takes its place
-            self.world.save_all();
-            self.install(load_world(fresh_seed(), self.settings.view_dist, false, Mode::Survival));
+            self.install(load_world(fresh_seed(), self.settings.view_dist, false, Mode::Survival).expect("an unsaved world needs no disk access"));
         }
         if let Some(dir) = user_dir(false).map(|d| d.join(format!("world-{seed}"))) {
             if let Err(e) = std::fs::remove_dir_all(&dir) {
@@ -1380,20 +1433,12 @@ impl Game {
         self.worlds = list_worlds();
     }
 
-    fn save_player(&self) {
-        let Some(d) = &self.save_dir else { return };
+    fn write_checkpoint(&mut self) -> std::io::Result<()> {
+        let Some(d) = &self.save_dir else { return Ok(()) };
+        let checkpoint = save::Checkpoint::begin(d)?;
+        let d = checkpoint.dir();
         let p = &self.player;
-        let mut s = format!("{} {} {} {} {}\nslots", p.pos.x, p.pos.y, p.pos.z, p.yaw, p.pitch);
-        let mut inv_slots = self.inv.slots.to_vec();
-        if !self.inv.held.is_empty() {
-            // a stack still on the mouse is saved in the first free slot
-            if let Some(free) = inv_slots[..items::BAG_END].iter_mut().find(|s| s.is_empty()) {
-                *free = self.inv.held;
-            }
-        }
-        for (i, st) in inv_slots.iter().enumerate().filter(|(_, st)| !st.is_empty()) {
-            s += &format!(" {}:{}:{}:{}", i, st.item, st.n, st.wear);
-        }
+        let mut s = format!("{} {} {} {} {}\n{}", p.pos.x, p.pos.y, p.pos.z, p.yaw, p.pitch, self.inv.save_stacks());
         s += &format!("\nsel {}\n", self.sel);
         s += &format!("stats {} {} {} {}\n", self.health, self.food, self.air, self.time);
         s += &format!("spawn {} {} {}\n", self.spawn.x, self.spawn.y, self.spawn.z);
@@ -1404,26 +1449,45 @@ impl Game {
         }
         s += &format!("xp {} {}\n", self.level, self.xp);
         s += &format!("weather {} {} {}\n", self.weather.want, self.weather.timer, self.weather.storm as u8);
-        if let Err(e) = std::fs::write(d.join("player.txt"), s) {
-            eprintln!("cubewild: failed to save player: {e}");
-        }
+        std::fs::write(d.join("player.txt"), s)?;
         let gates: String = self.gates.iter().map(|g| format!("{} {} {} {} {}\n", g.deep as u8, g.at.x, g.at.y, g.at.z, g.axis)).collect();
-        if let Err(e) = std::fs::write(d.join("gates.txt"), gates) {
-            eprintln!("cubewild: failed to save gates: {e}");
-        }
+        std::fs::write(d.join("gates.txt"), gates)?;
+        trade::save_uses(&self.trade_uses, &d.join("trades.txt"))?;
         // the rest belongs to the world the player is in
-        let Some(d) = dim_dir(&self.save_dir, self.world.is_deep()) else { return };
-        self.pickups.save(&d.join("drops.txt"));
-        loot::save_chests(&self.chests, &d.join("chests.txt"));
-        furnace::save(&self.furnaces, &d.join("furnaces.txt"));
-        self.boats.save(&d.join("boats.txt"));
-        self.mobs.save(&d.join("animals.txt"));
+        let d = if self.world.is_deep() { d.join("deep") } else { d };
+        self.world.stage_chunks(&d)?;
+        self.pickups.save(&d.join("drops.txt"))?;
+        loot::save_chests(&self.chests, &d.join("chests.txt"))?;
+        furnace::save(&self.furnaces, &d.join("furnaces.txt"))?;
+        self.boats.save(&d.join("boats.txt"))?;
+        self.mobs.save(&d.join("animals.txt"))?;
+        self.fluids.save(&d.join("fluids.txt"))?;
+        self.settle.save(&d.join("settle.txt"))?;
+        checkpoint.commit()?;
+        self.world.checkpoint_committed();
+        Ok(())
     }
 
-    fn save(&self) {
-        self.world.save_all();
-        self.save_player();
+    fn checkpoint(&mut self) -> bool {
+        let result = self.write_checkpoint();
+        self.last_checkpoint = Instant::now();
+        match result {
+            Ok(()) => {
+                self.save_error = None;
+                true
+            }
+            Err(e) => {
+                let message = format!("Save failed: {e}. Your world is still open; retry saving before leaving.");
+                eprintln!("cubewild: {message}");
+                self.save_error = Some(message);
+                false
+            }
+        }
+    }
+
+    fn save(&mut self) -> bool {
         self.settings.save();
+        self.checkpoint()
     }
 
     fn goto(&mut self, screen: Screen) {
@@ -1434,6 +1498,9 @@ impl Game {
             self.search_on = false;
         }
         if screen == Screen::Play {
+            if self.world.load_error.is_some() || (self.save_error.is_some() && !self.checkpoint()) {
+                return;
+            }
             let ok = self
                 .window
                 .set_cursor_grab(CursorGrabMode::Locked)
@@ -1451,16 +1518,16 @@ impl Game {
             self.window.set_cursor_visible(true);
             self.buttons = [false; 2];
             self.keys.clear();
-            if matches!(self.screen, Screen::Inventory | Screen::Chest | Screen::Furnace | Screen::Trade) {
-                // what was on the mouse goes back in the pack, or on the ground
-                self.inv.stow_held();
-                let left = std::mem::take(&mut self.inv.held);
-                self.throw(left);
-            }
             self.mining = None;
-            if matches!(self.screen, Screen::Play | Screen::Chest | Screen::Furnace) {
-                self.save_player();
-            }
+        }
+        if self.screen != screen && matches!(self.screen, Screen::Inventory | Screen::Chest | Screen::Furnace | Screen::Trade) {
+            // Leaving any item screen returns the mouse stack, including to Play.
+            self.inv.stow_held();
+            let left = std::mem::take(&mut self.inv.held);
+            self.throw(left);
+        }
+        if screen != Screen::Play && matches!(self.screen, Screen::Play | Screen::Inventory | Screen::Chest | Screen::Furnace | Screen::Trade) {
+            self.checkpoint();
         }
         if self.screen == Screen::Settings && screen != Screen::Settings {
             self.settings.save();
@@ -1720,7 +1787,9 @@ impl Game {
         self.riding = None;
         if self.world.is_deep() {
             // whoever dies below wakes up at home
-            self.switch_world(false);
+            if !self.switch_world(false) {
+                return;
+            }
             self.arrival = None;
         }
         self.player.pos = self.spawn;
@@ -1812,29 +1881,38 @@ impl Game {
 
     /// Puts the player in the other world: saves this one, opens that one with its own
     /// dropped items, chests, furnaces, boats and animals.
-    fn switch_world(&mut self, deep: bool) {
-        self.save_player();
-        self.world.save_all();
+    fn switch_world(&mut self, deep: bool) -> bool {
+        if !self.checkpoint() {
+            return false;
+        }
         let ver = if deep { deep::DEEP_VER } else { self.over_ver };
         let dir = dim_dir(&self.save_dir, deep);
         let seed = self.world.seed;
         let radius = if deep { self.settings.view_dist.min(DEEP_DIST) } else { self.settings.view_dist };
-        self.world = World::new(seed, ver, radius, if deep { dir.clone() } else { self.save_dir.clone() });
+        let world = World::new(seed, ver, radius, dir.clone());
+        if let Some(error) = &world.load_error {
+            self.load_notice = Some(format!("Could not open the destination world: {error}"));
+            return false;
+        }
+        let simulation = match load_simulation(seed, deep, &dir) {
+            Ok(simulation) => simulation,
+            Err(error) => {
+                self.load_notice = Some(format!("Could not open the destination world: {error}"));
+                return false;
+            }
+        };
+        self.world = world;
+        self.load_notice = None;
         self.pickups = dir.as_ref().map_or_else(Pickups::default, |d| Pickups::load(&d.join("drops.txt")));
         self.chests = dir.as_ref().map_or_else(Chests::default, |d| loot::load_chests(&d.join("chests.txt")));
         self.furnaces = dir.as_ref().map_or_else(Furnaces::default, |d| furnace::load(&d.join("furnaces.txt")));
         self.boats = dir.as_ref().map_or_else(boat::Boats::default, |d| boat::Boats::load(&d.join("boats.txt")));
-        self.mobs = Mobs::new(seed as u64 * 7919 + if deep { 31 } else { 17 });
+        (self.mobs, self.fluids, self.settle) = simulation;
         self.mobs.ignore = self.mode == Mode::Creative;
-        if let Some(d) = &dir {
-            self.mobs.load(&d.join("animals.txt"));
-        }
         self.riding = None;
         self.trading = None;
         self.fishing = None;
         self.mining = None;
-        self.fluids.clear();
-        self.settle.clear();
         self.arrows.clear();
         self.orbs = Orbs::default();
         self.particles = Particles::default();
@@ -1843,6 +1921,7 @@ impl Game {
         self.unstick = false;
         self.auto_cur = 20;
         self.apply_dist();
+        true
     }
 
     /// Steps through a gate into the other world: to the nearest gate on the other side,
@@ -1863,7 +1942,10 @@ impl Game {
             .min_by_key(|g| (g.at - target).length_squared())
             .copied();
         self.audio.play(Snd::Travel, 1.0, 1.0);
-        self.switch_world(deep);
+        if !self.switch_world(deep) {
+            self.goto(Screen::Pause);
+            return;
+        }
         self.player.pos = target.as_vec3() + Vec3::new(0.5, 0.0, 0.5);
         self.player.vel = Vec3::ZERO;
         self.arrival = Some((target, known));
@@ -2605,6 +2687,7 @@ impl Game {
                     self.spawn = p.as_vec3() + Vec3::new(0.5, 1.01, 0.5);
                     if self.sun().1 < 0.35 {
                         self.time = 0.015;
+                        self.trade_uses.clear();
                         self.say("You slept until morning. Spawn point set".into());
                     } else {
                         self.say("Spawn point set. You can only sleep at night".into());
@@ -3277,7 +3360,7 @@ impl Game {
             Action::Respawn => self.respawn(),
             Action::NewWorld(mode) => self.enter(fresh_seed(), mode),
             Action::Open(seed) => {
-                if seed == self.world.seed && self.save_dir.is_some() {
+                if seed == self.world.seed && self.save_dir.is_some() && self.world.load_error.is_none() {
                     self.goto(Screen::Play);
                 } else {
                     self.enter(seed, Mode::Survival);
@@ -3292,7 +3375,9 @@ impl Game {
                 }
             }
             Action::ToTitle => {
-                self.save();
+                if !self.save() {
+                    return false;
+                }
                 self.worlds = list_worlds();
                 self.confirm_delete = None;
                 self.at_title = true;
@@ -3344,6 +3429,12 @@ impl Game {
         if self.screen != Screen::Title {
             self.world.update(&self.gfx, pc);
         }
+        for (key, saved) in std::mem::take(&mut self.world.activated) {
+            self.fluids.chunk_loaded(&self.world, key, saved);
+        }
+        if self.world.load_error.is_some() && matches!(self.screen, Screen::Play | Screen::Inventory | Screen::Chest | Screen::Furnace | Screen::Trade) {
+            self.goto(Screen::Pause);
+        }
         self.last_jump += real_dt;
         self.swing -= dt;
         let t_world = t0.elapsed().as_secs_f32() * 1000.0;
@@ -3351,7 +3442,7 @@ impl Game {
             self.arrive();
         }
         self.ready = self.arrival.is_none()
-            && (self.ready || self.world.is_loaded(self.player.pos.x.floor() as i32, self.player.pos.z.floor() as i32));
+            && self.world.area_loaded(self.player.pos.x, self.player.pos.z, PLAYER_HW);
         if self.ready && self.unstick {
             self.unstick = false;
             if collides(&self.world, self.player.pos, PLAYER_HW, PLAYER_H) {
@@ -3431,7 +3522,7 @@ impl Game {
             }
             // what the edits since the last frame set going: running water and lava,
             // falling sand and gravel, wilting leaves
-            let touched = std::mem::take(&mut self.world.touched);
+            let touched = self.world.take_ready_updates();
             let creative = self.mode == Mode::Creative;
             for (p, b) in self.fluids.update(&mut self.world, &self.gfx, dt, &touched) {
                 // (running water carries off torches and plants, which drop)
@@ -3642,43 +3733,41 @@ impl Game {
                 }
                 a.life -= dt;
                 let step = a.vel * dt;
-                let len = step.length().max(1e-4);
-                if a.hostile {
-                    // a skeleton's arrow: only the player is in danger
-                    let p = self.player.pos;
-                    let (min, max) = (p - Vec3::new(PLAYER_HW, 0.0, PLAYER_HW), p + Vec3::new(PLAYER_HW, self.player.height(), PLAYER_HW));
-                    if player::ray_aabb(a.pos, step / len, min, max).is_some_and(|t| t <= len) {
-                        if self.bench.is_none() {
-                            self.strike(if a.fire { 4.0 } else { 3.0 });
+                if let Some((hit, impact)) = projectile::trace(&self.world, &self.mobs, &self.player, a.hostile, a.pos, step) {
+                    match hit {
+                        projectile::Hit::Player => {
+                            if self.bench.is_none() {
+                                self.strike(if a.fire { 4.0 } else { 3.0 });
+                            }
+                            if a.fire {
+                                bursts.push(impact);
+                            }
                         }
-                        if a.fire {
-                            bursts.push(a.pos);
+                        projectile::Hit::Mob(i) => {
+                            let at = self.mobs.list[i].pos;
+                            let kind = self.mobs.list[i].kind;
+                            self.mob_struck(i, at);
+                            if let Some(drops) = self.mobs.hit(i, a.pos, 5) {
+                                self.loot(drops, at);
+                                self.kill_xp(kind, at);
+                            }
+                            self.hit_flash = 0.18;
                         }
-                        return false;
+                        projectile::Hit::Block => {
+                            if a.fire {
+                                bursts.push(impact);
+                            } else {
+                                self.audio.play_var(Snd::ArrowHit, impact, 0.6);
+                            }
+                        }
                     }
-                } else if let Some((i, _)) = self.mobs.pick(a.pos, step / len, len) {
-                    let at = self.mobs.list[i].pos;
-                    let kind = self.mobs.list[i].kind;
-                    self.mob_struck(i, at);
-                    if let Some(drops) = self.mobs.hit(i, a.pos - step, 5) {
-                        self.loot(drops, at);
-                        self.kill_xp(kind, at);
-                    }
-                    self.hit_flash = 0.18;
                     return false;
-                }
-                // stopped by blocks, closed doors and window panes, but not by an open doorway
-                let blocked = raycast_with(&self.world, a.pos, step / len, len, is_solid).is_some();
-                if blocked && a.fire {
-                    bursts.push(a.pos);
-                } else if blocked {
-                    self.audio.play_var(Snd::ArrowHit, a.pos, 0.6);
                 }
                 a.pos += step;
                 if a.fire && a.life <= 0.0 {
                     bursts.push(a.pos);
                 }
-                a.life > 0.0 && !blocked
+                a.life > 0.0
             });
             self.arrows = arrows;
             for at in bursts {
@@ -3741,6 +3830,12 @@ impl Game {
             if self.buttons[1] && self.place_cd <= 0.0 {
                 self.place();
             }
+        }
+
+        if simulate && self.arrival.is_none() && self.save_dir.is_some()
+            && self.last_checkpoint.elapsed().as_secs() >= 30 && !self.checkpoint()
+        {
+            self.goto(Screen::Pause);
         }
 
         // ---- build the frame
@@ -4984,6 +5079,25 @@ impl Game {
             }
         }
 
+        if let Some(message) = self.save_error.as_deref().or(self.world.load_error.as_deref()).or(self.load_notice.as_deref()) {
+            let mut lines = vec![String::new()];
+            for word in message.split_whitespace() {
+                let line = lines.last_mut().unwrap();
+                if !line.is_empty() && font.width(SMALL, &format!("{line} {word}")) > wf - 40.0 * s {
+                    lines.push(word.to_string());
+                } else {
+                    if !line.is_empty() { line.push(' '); }
+                    line.push_str(word);
+                }
+            }
+            let line_h = font.height(SMALL) + 4.0 * s;
+            let top = hf - lines.len() as f32 * line_h - 20.0 * s;
+            ui.rect(0.0, top, wf, hf - top, [31, 8, 8, 245]);
+            for (i, line) in lines.iter().enumerate() {
+                ui.label_centered(cx, top + 10.0 * s + i as f32 * line_h, SMALL, line, [255, 184, 158, 255]);
+            }
+        }
+
         // the Emberdeep's haze takes the colour of the region
         let want = srgb(self.region.fog());
         let k = 1.0 - (-dt * 1.5).exp();
@@ -5046,8 +5160,9 @@ impl Game {
         self.ptr.rclicked = false;
         for a in actions {
             if self.apply(a) {
-                self.save();
-                el.exit();
+                if self.save() {
+                    el.exit();
+                }
                 return;
             }
         }
@@ -5075,8 +5190,11 @@ impl ApplicationHandler for App {
         let Some(g) = &mut self.game else { return };
         match event {
             WindowEvent::CloseRequested => {
-                g.save();
-                el.exit();
+                if g.save() {
+                    el.exit();
+                } else {
+                    g.goto(Screen::Pause);
+                }
             }
             WindowEvent::Resized(sz) => g.resize(sz.width, sz.height),
             WindowEvent::Focused(false) => {
@@ -5205,6 +5323,80 @@ fn main() {
 #[cfg(test)]
 mod gate_tests {
     use super::*;
+
+    #[test]
+    fn a_full_inventory_and_cursor_stack_survive_a_checkpoint_and_reload() {
+        let root = save::tests::TestDir::new("held-stack");
+        std::fs::write(root.0.join("height.txt"), "256\n").unwrap();
+        for held in [Stack::new(PLANKS, 99), Stack { item: items::IRON_PICK, n: 1, wear: 37 }] {
+            let mut inv = Inventory::new();
+            inv.slots[..items::BAG_END].fill(Stack::new(DIRT, 99));
+            inv.held = held;
+            let checkpoint = save::Checkpoint::begin(&root.0).unwrap();
+            std::fs::write(checkpoint.dir().join("player.txt"), format!("0.5 150 0.5 0 0\n{}gen 3\n", inv.save_stacks())).unwrap();
+            checkpoint.commit().unwrap();
+            let loaded = load_world_at(1, 3, Some(root.0.clone()), Mode::Survival).unwrap();
+            assert_eq!(loaded.inv.slots, inv.slots);
+            assert_eq!(loaded.inv.held, held);
+        }
+    }
+
+    #[test]
+    fn player_saves_without_a_cursor_record_still_load() {
+        let root = save::tests::TestDir::new("old-inventory");
+        std::fs::write(root.0.join("height.txt"), "256\n").unwrap();
+        std::fs::write(root.0.join("player.txt"), "0.5 150 0.5 0 0\nslots 0:7:12:0\ngen 3\n").unwrap();
+        let loaded = load_world_at(1, 3, Some(root.0.clone()), Mode::Survival).unwrap();
+        assert_eq!(loaded.inv.slots[0], Stack::new(PLANKS, 12));
+        assert!(loaded.inv.held.is_empty());
+    }
+
+    #[test]
+    fn dimension_simulation_and_world_trade_limits_survive_checkpoints() {
+        let root = save::tests::TestDir::new("dimension-state");
+        std::fs::write(root.0.join("height.txt"), "256\n").unwrap();
+        let uses = trade::Uses::from([((((-4, 7), 2), 0), 12)]);
+        for (deep, block, y) in [(false, SAND, 20.0), (true, GRAVEL, 45.0)] {
+            let checkpoint = save::Checkpoint::begin(&root.0).unwrap();
+            let d = checkpoint.dir();
+            trade::save_uses(&uses, &d.join("trades.txt")).unwrap();
+            let dim = if deep { "dim deep\n" } else { "" };
+            std::fs::write(d.join("player.txt"), format!("0.5 {y} 0.5 0 0\ngen 3\n{dim}")).unwrap();
+            let d = if deep { d.join("deep") } else { d };
+            let mut world = World::flat(|_, _, _| None);
+            world.touched.push((IVec3::new(1, y as i32, 1), LOG));
+            world.stage_chunks(&d).unwrap();
+            std::fs::write(d.join("fluids.txt"), "timers 0.12 0.4\nwater 1 10 1\nlava 3 11 3\n").unwrap();
+            let mut settle = settle::Settle::default();
+            settle.falling.push(settle::Falling { pos: Vec3::new(1.5, y, 1.5), vy: -5.0, block });
+            settle.save(&d.join("settle.txt")).unwrap();
+            checkpoint.commit().unwrap();
+            let loaded = load_world_at(1, 3, Some(root.0.clone()), Mode::Survival).unwrap();
+            assert_eq!(loaded.world.is_deep(), deep);
+            assert_eq!(loaded.settle.falling.len(), 1);
+            assert_eq!(loaded.settle.falling[0].block, block);
+            assert_eq!(loaded.trade_uses, uses);
+            assert_eq!(loaded.world.touched, vec![(IVec3::new(1, y as i32, 1), LOG)]);
+            let copy = root.0.join("loaded-fluids.txt");
+            loaded.fluids.save(&copy).unwrap();
+            assert_eq!(std::fs::read_to_string(copy).unwrap(), "timers 0.12 0.4\nwater 1 10 1\nlava 3 11 3\n");
+        }
+        let (_, _, above) = load_simulation(1, false, &Some(root.0.clone())).unwrap();
+        assert_eq!(above.falling[0].block, SAND, "the other dimension keeps its own simulation");
+        let other = load_world_at(2, 3, None, Mode::Survival).unwrap();
+        assert!(other.trade_uses.is_empty(), "trade limits belong to their world");
+    }
+
+    #[test]
+    fn damaged_simulation_state_prevents_loading_and_is_kept_for_recovery() {
+        let root = save::tests::TestDir::new("damaged-simulation");
+        std::fs::write(root.0.join("height.txt"), "256\n").unwrap();
+        std::fs::write(root.0.join("player.txt"), "0.5 150 0.5 0 0\ngen 3\n").unwrap();
+        let text = "timers NaN 0\nwater 1 10 1\n";
+        std::fs::write(root.0.join("fluids.txt"), text).unwrap();
+        assert!(load_world_at(1, 3, Some(root.0.clone()), Mode::Survival).is_err());
+        assert_eq!(std::fs::read_to_string(root.0.join("fluids.txt")).unwrap(), text);
+    }
 
     /// A cinderstone frame in the x-y plane at z = 0, its opening `w` wide and `h` high
     /// from (0, 10); `gap` leaves one block of a side out.

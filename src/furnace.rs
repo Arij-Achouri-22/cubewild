@@ -140,7 +140,7 @@ impl Furnace {
     }
 }
 
-pub fn save(furnaces: &Furnaces, path: &Path) {
+pub fn save(furnaces: &Furnaces, path: &Path) -> std::io::Result<()> {
     let mut s = String::new();
     for (p, f) in furnaces {
         if f.slots.iter().all(|st| st.is_empty()) && f.burn <= 0.0 {
@@ -152,9 +152,7 @@ pub fn save(furnaces: &Furnaces, path: &Path) {
         }
         s.push('\n');
     }
-    if let Err(e) = std::fs::write(path, s) {
-        eprintln!("cubewild: failed to save furnaces: {e}");
-    }
+    std::fs::write(path, s)
 }
 
 pub fn load(path: &Path) -> Furnaces {

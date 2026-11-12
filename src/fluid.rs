@@ -10,6 +10,7 @@ use crate::gfx::Gfx;
 use crate::world::*;
 use glam::IVec3;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::Path;
 
 /// how far each runs from its source
 const WATER_RUN: u8 = 7;
@@ -75,13 +76,65 @@ pub struct Fluids {
 }
 
 impl Fluids {
-    pub fn clear(&mut self) {
-        *self = Fluids::default();
-    }
-
     fn push(&mut self, p: IVec3, lava: bool) {
+        if !(1..CH).contains(&p.y) { return; }
         if self.queued.insert((p, lava)) {
             if lava { self.lava.push_back(p) } else { self.water.push_back(p) }
+        }
+    }
+
+    pub fn save(&self, path: &Path) -> std::io::Result<()> {
+        let mut text = format!("timers {} {}\n", self.water_t, self.lava_t);
+        for (name, queue) in [("water", &self.water), ("lava", &self.lava)] {
+            for p in queue {
+                text += &format!("{name} {} {} {}\n", p.x, p.y, p.z);
+            }
+        }
+        std::fs::write(path, text)
+    }
+
+    pub fn load(path: &Path) -> std::io::Result<Self> {
+        let mut fluids = Self::default();
+        let invalid = || std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid saved fluid state");
+        for line in crate::save::read_optional(path)?.lines() {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            match parts.as_slice() {
+                [] => {}
+                ["timers", water, lava] => {
+                    let water: f32 = water.parse().map_err(|_| invalid())?;
+                    let lava: f32 = lava.parse().map_err(|_| invalid())?;
+                    if !water.is_finite() || !lava.is_finite() || !(0.0..=1.0).contains(&water) || !(0.0..=1.0).contains(&lava) {
+                        return Err(invalid());
+                    }
+                    (fluids.water_t, fluids.lava_t) = (water, lava);
+                }
+                [kind @ ("water" | "lava"), x, y, z] => {
+                    let p = IVec3::new(x.parse().map_err(|_| invalid())?, y.parse().map_err(|_| invalid())?, z.parse().map_err(|_| invalid())?);
+                    if !(1..CH).contains(&p.y) { return Err(invalid()); }
+                    fluids.push(p, *kind == "lava");
+                }
+                _ => return Err(invalid()),
+            }
+        }
+        Ok(fluids)
+    }
+
+    /// Older saves have no queue. Resume flows and exposed sources in saved chunks;
+    /// untouched generated lakes do not need a simulation job for every water cell.
+    pub fn chunk_loaded(&mut self, world: &World, key: Key, saved: bool) {
+        if !saved { return; }
+        let Some(chunk) = world.chunks.get(&key) else { return };
+        let mut plan = Vec::new();
+        for (i, &b) in chunk.data.blocks.iter().enumerate() {
+            let kind = if is_water(b) { Kind::Water } else if is_lava(b) { Kind::Lava } else { continue };
+            let p = IVec3::new(key.0 * CW + (i as i32 & 15), i as i32 >> 8, key.1 * CW + ((i as i32 >> 4) & 15));
+            let source = b == WATER || b == LAVA;
+            plan.clear();
+            if source && world.area_loaded(p.x as f32 + 0.5, p.z as f32 + 0.5, 1.0) {
+                think(&|c| world.get_block(c.x, c.y, c.z), kind, p, &mut plan);
+                if plan.is_empty() { continue; }
+            }
+            self.push(p, kind == Kind::Lava);
         }
     }
 
@@ -151,7 +204,8 @@ impl Fluids {
             let p = if lava { self.lava.pop_front() } else { self.water.pop_front() };
             let Some(p) = p else { break };
             self.queued.remove(&(p, lava));
-            if !world.is_loaded(p.x, p.z) {
+            if !world.area_loaded(p.x as f32 + 0.5, p.z as f32 + 0.5, 1.0) {
+                self.push(p, lava);
                 continue;
             }
             think(&|c: IVec3| world.get_block(c.x, c.y, c.z), kind, p, &mut plan);
@@ -317,6 +371,57 @@ fn meet(kind: Kind, other: Block) -> Option<Block> {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn saved_fluid_work_keeps_its_timing_and_resumes_after_chunks_load() {
+        let root = crate::save::tests::TestDir::new("fluid-resume");
+        let path = root.0.join("fluids.txt");
+        for (kind, block) in [(Kind::Water, WATER), (Kind::Lava, LAVA)] {
+            let mut world = World::flat(|x, y, z| (x == 0 && y == 10 && z == 0).then_some(block));
+            let mut fluids = Fluids { water_t: 0.12, lava_t: 0.42, ..Default::default() };
+            fluids.gather(&world, &[(IVec3::new(0, 10, 0), AIR)]);
+            fluids.save(&path).unwrap();
+            let mut resumed = Fluids::load(&path).unwrap();
+            assert_eq!(resumed.water, fluids.water);
+            assert_eq!(resumed.lava, fluids.lava);
+            assert_eq!((resumed.water_t, resumed.lava_t), (0.12, 0.42));
+            let unloaded = std::mem::take(&mut world.chunks);
+            let mut edits = HashMap::new();
+            resumed.step(&world, kind, &mut edits);
+            assert!(edits.is_empty());
+            assert!(!resumed.queued.is_empty(), "work waits instead of being discarded");
+            world.chunks = unloaded;
+            resumed.step(&world, kind, &mut edits);
+            assert_eq!(edits[&IVec3::new(1, 10, 0)], kind.flow(kind.run()));
+        }
+    }
+
+    #[test]
+    fn old_saved_flows_and_exposed_sources_wake_on_chunk_load() {
+        let world = World::flat(|x, y, z| {
+            if y == 10 && z == 0 { match x { 2 => Some(WATER), 3 => Some(WATER_FLOW), 6 => Some(LAVA), _ => None } } else { None }
+        });
+        let mut fluids = Fluids::default();
+        fluids.chunk_loaded(&world, (0, 0), false);
+        assert!(fluids.queued.is_empty(), "generated lakes need no full scan");
+        fluids.chunk_loaded(&world, (0, 0), true);
+        let mut edits = HashMap::new();
+        fluids.step(&world, Kind::Water, &mut edits);
+        fluids.step(&world, Kind::Lava, &mut edits);
+        assert!(is_water(edits[&IVec3::new(4, 10, 0)]));
+        assert!(is_lava(edits[&IVec3::new(7, 10, 0)]));
+    }
+
+    #[test]
+    fn invalid_fluid_state_is_reported_instead_of_reset() {
+        let root = crate::save::tests::TestDir::new("invalid-fluids");
+        let path = root.0.join("fluids.txt");
+        assert!(Fluids::load(&path).unwrap().queued.is_empty());
+        for text in ["timers NaN 0\n", "water 0 256 0\n", "lava 0 10\n"] {
+            std::fs::write(&path, text).unwrap();
+            assert!(Fluids::load(&path).is_err());
+        }
+    }
 
     /// Runs the rules on a world-free overlay of `base` for a number of steps, starting
     /// from `todo` (as `Fluids::step` does on the real world).

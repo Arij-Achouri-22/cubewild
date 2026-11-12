@@ -7,6 +7,7 @@ use crate::mobs::Rng;
 use crate::world::*;
 use glam::{IVec3, Vec3};
 use std::collections::{HashSet, VecDeque};
+use std::path::Path;
 
 /// Loose blocks: they fall when nothing holds them up.
 pub fn loose(b: Block) -> bool {
@@ -49,14 +50,59 @@ pub struct Settle {
 const REACH: i32 = 6;
 
 impl Settle {
-    pub fn clear(&mut self) {
-        *self = Settle::default();
+    pub fn save(&self, path: &Path) -> std::io::Result<()> {
+        let mut text = String::new();
+        for f in &self.falling {
+            text += &format!("fall {} {} {} {} {}\n", f.pos.x, f.pos.y, f.pos.z, f.vy, f.block);
+        }
+        for (p, timer) in &self.wilt {
+            text += &format!("leaf {} {} {} {}\n", p.x, p.y, p.z, timer);
+        }
+        std::fs::write(path, text)
+    }
+
+    pub fn load(path: &Path) -> std::io::Result<Self> {
+        let mut settle = Self::default();
+        let invalid = || std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid saved falling block or leaf decay");
+        for line in crate::save::read_optional(path)?.lines() {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            match parts.as_slice() {
+                [] => {}
+                ["fall", x, y, z, vy, block] => {
+                    let pos = Vec3::new(x.parse().map_err(|_| invalid())?, y.parse().map_err(|_| invalid())?, z.parse().map_err(|_| invalid())?);
+                    let vy: f32 = vy.parse().map_err(|_| invalid())?;
+                    let block = block.parse::<u8>().map_err(|_| invalid())?;
+                    if !pos.is_finite() || !(1.0..=CH as f32).contains(&pos.y) || !vy.is_finite() || !(-40.0..=0.0).contains(&vy) || !loose(block) {
+                        return Err(invalid());
+                    }
+                    settle.falling.push(Falling { pos, vy, block });
+                }
+                ["leaf", x, y, z, timer] => {
+                    let p = IVec3::new(x.parse().map_err(|_| invalid())?, y.parse().map_err(|_| invalid())?, z.parse().map_err(|_| invalid())?);
+                    let timer: f32 = timer.parse().map_err(|_| invalid())?;
+                    if !(1..CH).contains(&p.y) || !timer.is_finite() || !(0.0..=7.0).contains(&timer) { return Err(invalid()); }
+                    if settle.waiting.insert(p) {
+                        settle.wilt.push_back((p, timer));
+                    }
+                }
+                _ => return Err(invalid()),
+            }
+        }
+        Ok(settle)
     }
 
     /// Runs the settling on: `touched` are the places edited since the last call, with
     /// what stood there before. `body` is where the player stands and how tall they are:
     /// a block coming down on them breaks rather than burying them.
     pub fn update(&mut self, world: &mut World, gfx: &Gfx, rng: &mut Rng, dt: f32, touched: &[(IVec3, Block)], body: (Vec3, f32)) -> Settled {
+        let (out, edits) = self.advance(world, rng, dt, touched, body);
+        if !edits.is_empty() {
+            world.set_many(gfx, &edits);
+        }
+        out
+    }
+
+    fn advance(&mut self, world: &World, rng: &mut Rng, dt: f32, touched: &[(IVec3, Block)], body: (Vec3, f32)) -> (Settled, Vec<(IVec3, Block)>) {
         let mut out = Settled::default();
         let mut edits: Vec<(IVec3, Block)> = Vec::new();
         let get = |w: &World, c: IVec3| w.get_block(c.x, c.y, c.z);
@@ -91,10 +137,11 @@ impl Settle {
         // falling blocks come down where something holds them, or break if what they
         // land in cannot be filled (a torch, a slab)
         self.falling.retain_mut(|f| {
+            let (x, z) = (f.pos.x.floor() as i32, f.pos.z.floor() as i32);
+            if !world.is_loaded(x, z) { return true; }
             f.vy = (f.vy - 30.0 * dt).max(-40.0);
             let from = f.pos.y;
             let to = from + f.vy * dt;
-            let (x, z) = (f.pos.x.floor() as i32, f.pos.z.floor() as i32);
             if to < 1.0 {
                 return false;
             }
@@ -125,6 +172,10 @@ impl Settle {
         let n = self.wilt.len();
         for _ in 0..n {
             let Some((c, t)) = self.wilt.pop_front() else { break };
+            if !world.area_loaded(c.x as f32 + 0.5, c.z as f32 + 0.5, REACH as f32 + 0.5) {
+                self.wilt.push_back((c, t));
+                continue;
+            }
             let t = t - dt;
             if t > 0.0 || gone >= 24 {
                 self.wilt.push_back((c, t.max(0.0)));
@@ -138,10 +189,7 @@ impl Settle {
                 gone += 1;
             }
         }
-        if !edits.is_empty() {
-            world.set_many(gfx, &edits);
-        }
-        out
+        (out, edits)
     }
 
     /// The falling blocks, as textured cubes.
@@ -295,6 +343,60 @@ fn tree(get: &dyn Fn(IVec3) -> Block, at: IVec3, sapling: Block, rng: &mut Rng) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn falling_blocks_and_leaf_decay_resume_from_their_saved_state() {
+        let root = crate::save::tests::TestDir::new("settle-resume");
+        let path = root.0.join("settle.txt");
+        let leaf = IVec3::new(2, 14, 2);
+        let mut world = World::flat(|x, y, z| (IVec3::new(x, y, z) == leaf).then_some(LEAVES));
+        let mut settle = Settle::default();
+        settle.falling.push(Falling { pos: Vec3::new(1.5, 12.5, 1.5), vy: -8.0, block: GRAVEL });
+        settle.waiting.insert(leaf);
+        settle.wilt.push_back((leaf, 0.12));
+        settle.save(&path).unwrap();
+        let mut resumed = Settle::load(&path).unwrap();
+        let mut rng = Rng(1);
+        let body = (Vec3::new(20.0, 10.0, 20.0), 1.8);
+        let unloaded = std::mem::take(&mut world.chunks);
+        let (_, edits) = resumed.advance(&world, &mut rng, 1.0, &[], body);
+        assert!(edits.is_empty());
+        assert_eq!(resumed.falling[0].pos.y, 12.5);
+        assert_eq!(resumed.falling[0].vy, -8.0);
+        assert_eq!(resumed.wilt.front(), Some(&(leaf, 0.12)));
+        world.chunks = unloaded;
+        let mut landed = 0;
+        let mut wilted = 0;
+        for _ in 0..20 {
+            let (out, edits) = resumed.advance(&world, &mut rng, 0.05, &[], body);
+            landed += out.landed.len();
+            wilted += out.wilted.len();
+            for (p, b) in edits { world.set_block_bg(p.x, p.y, p.z, b); }
+        }
+        assert_eq!((landed, wilted), (1, 1));
+        assert!(resumed.falling.is_empty() && resumed.wilt.is_empty());
+        assert_eq!(world.get_block(1, 10, 1), GRAVEL);
+        assert_eq!(world.get_block(leaf.x, leaf.y, leaf.z), AIR);
+    }
+
+    #[test]
+    fn leaves_wait_for_a_trunk_across_an_unloaded_boundary() {
+        let mut world = World::flat(|x, y, z| {
+            if y == 12 && z == 0 { match x { 15 => Some(LEAVES), 16 => Some(LOG), _ => None } } else { None }
+        });
+        let leaf = IVec3::new(15, 12, 0);
+        let mut settle = Settle::default();
+        settle.waiting.insert(leaf);
+        settle.wilt.push_back((leaf, 0.0));
+        let chunk = world.chunks.remove(&(1, 0)).unwrap();
+        let body = (Vec3::splat(25.0), 1.8);
+        let (out, _) = settle.advance(&world, &mut Rng(1), 1.0, &[], body);
+        assert!(out.wilted.is_empty() && settle.waiting.contains(&leaf));
+        world.chunks.insert((1, 0), chunk);
+        let (out, _) = settle.advance(&world, &mut Rng(1), 0.05, &[], body);
+        assert!(out.wilted.is_empty());
+        assert!(settle.waiting.is_empty(), "the loaded trunk keeps the leaf alive");
+    }
 
     #[test]
     fn saplings_grow_into_their_trees_where_there_is_room() {

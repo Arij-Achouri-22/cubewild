@@ -947,6 +947,7 @@ pub const BAG_END: usize = 36;
 pub const ARMOR: usize = 36;
 pub const SLOTS: usize = 40;
 
+#[derive(Clone)]
 pub struct Inventory {
     pub slots: [Stack; SLOTS],
     /// the stack picked up with the mouse in the inventory screen
@@ -956,6 +957,16 @@ pub struct Inventory {
 impl Inventory {
     pub fn new() -> Inventory {
         Inventory { slots: [Stack::default(); SLOTS], held: Stack::default() }
+    }
+
+    /// Cursor contents have their own record, even when every bag slot is occupied.
+    pub fn save_stacks(&self) -> String {
+        let mut text = String::from("slots");
+        for (i, st) in self.slots.iter().enumerate().filter(|(_, st)| !st.is_empty()) {
+            text += &format!(" {}:{}:{}:{}", i, st.item, st.n, st.wear);
+        }
+        text += &format!("\nheld {} {} {}\n", self.held.item, self.held.n, self.held.wear);
+        text
     }
 
     /// Item in a hotbar slot (AIR if empty).
@@ -1079,30 +1090,32 @@ impl Inventory {
         r.ins.iter().all(|&(i, n)| self.count(i) >= n)
     }
 
-    /// Crafts once into the inventory. Returns false if ingredients are missing.
+    /// Crafts once into the inventory. Nothing changes unless the entire result fits.
     pub fn craft(&mut self, r: &Recipe) -> bool {
         if !self.can_craft(r) {
             return false;
         }
+        let mut next = self.clone();
         for &(i, n) in r.ins {
-            self.take(i, n);
-        }
-        let left = self.add(r.out.0, r.out.1);
-        if left > 0 {
-            // no room: hand the rest to the mouse, or give up on it
-            if self.held.is_empty() {
-                self.held = Stack::new(r.out.0, left);
-            } else if self.held.item == r.out.0 {
-                self.held.n += left;
+            if !next.take(i, n) {
+                return false;
             }
         }
+        let left = next.add(r.out.0, r.out.1);
+        if !stash_in(std::slice::from_mut(&mut next.held), Stack::new(r.out.0, left)).is_empty() {
+            return false;
+        }
+        *self = next;
         true
     }
 
     /// Crafts once onto the mouse, like taking the result out of a crafting grid.
     pub fn craft_to_hand(&mut self, r: &Recipe) -> bool {
-        let fits = self.held.is_empty()
-            || (self.held.item == r.out.0 && self.held.n + r.out.1 <= max_stack(r.out.0));
+        let fits = if self.held.is_empty() {
+            r.out.1 <= max_stack(r.out.0)
+        } else {
+            self.held.item == r.out.0 && r.out.1 <= max_stack(r.out.0).saturating_sub(self.held.n)
+        };
         if !fits {
             return self.craft(r);
         }
@@ -1408,6 +1421,102 @@ mod tests {
         full.slots[5].n = 90;
         assert_eq!(full.pick_up(Stack::new(DIRT, 20)).n, 11);
         assert_eq!(full.pick_up(pick), pick);
+    }
+
+    #[test]
+    fn crafting_without_output_space_keeps_every_item() {
+        let r = &RECIPES[0]; // one log -> four planks
+        for to_hand in [false, true] {
+            for held in [Stack::new(STONE, 1), Stack::new(PLANKS, 99), Stack::new(PLANKS, 97)] {
+                let mut inv = Inventory::new();
+                inv.slots[..BAG_END].fill(Stack::new(DIRT, 99));
+                inv.slots[0] = Stack::new(LOG, 2);
+                inv.held = held;
+                let before = inv.clone();
+                assert!(!if to_hand { inv.craft_to_hand(r) } else { inv.craft(r) });
+                assert_eq!(inv.slots, before.slots);
+                assert_eq!(inv.held, before.held);
+            }
+        }
+        // Even partially placing the output must roll back if the rest cannot fit.
+        let mut inv = Inventory::new();
+        inv.slots[..BAG_END].fill(Stack::new(DIRT, 99));
+        inv.slots[0] = Stack::new(LOG, 2);
+        inv.slots[1] = Stack::new(PLANKS, 97);
+        inv.held = Stack::new(STONE, 1);
+        let before = inv.clone();
+        assert!(!inv.craft(r));
+        assert_eq!(inv.slots, before.slots);
+        assert_eq!(inv.held, before.held);
+    }
+
+    #[test]
+    fn crafting_uses_freed_slots_and_splits_output_within_stack_limits() {
+        let r = &RECIPES[0];
+        let mut inv = Inventory::new();
+        inv.slots[..BAG_END].fill(Stack::new(DIRT, 99));
+        inv.slots[0] = Stack::new(LOG, 1);
+        inv.held = Stack::new(STONE, 1);
+        assert!(inv.craft(r));
+        assert_eq!(inv.slots[0], Stack::new(PLANKS, 4));
+        assert_eq!(inv.held, Stack::new(STONE, 1));
+
+        inv.slots[0] = Stack::new(LOG, 3);
+        inv.slots[1] = Stack::new(PLANKS, 97);
+        inv.held = Stack::new(PLANKS, 97);
+        assert!(inv.craft_to_hand(r));
+        assert_eq!(inv.count(LOG), 2);
+        assert_eq!(inv.slots[1], Stack::new(PLANKS, 99));
+        assert_eq!(inv.held, Stack::new(PLANKS, 99));
+        assert!(!inv.craft(r));
+        assert_eq!(inv.count(LOG), 2);
+    }
+
+    #[test]
+    fn crafting_to_hand_preserves_ingredients_when_missing() {
+        let mut inv = Inventory::new();
+        inv.held = Stack::new(PLANKS, 95);
+        assert!(!inv.craft_to_hand(&RECIPES[0]));
+        assert_eq!(inv.held, Stack::new(PLANKS, 95));
+        inv.add(LOG, 2);
+        assert!(inv.craft_to_hand(&RECIPES[0]));
+        assert_eq!(inv.held, Stack::new(PLANKS, 99));
+        assert_eq!(inv.count(LOG), 1);
+    }
+
+    #[test]
+    fn bulk_crafting_stops_before_overflow_or_losing_ingredients() {
+        let mut inv = Inventory::new();
+        inv.slots[..BAG_END].fill(Stack::new(DIRT, 99));
+        inv.slots[0] = Stack::new(LOG, 99);
+        let mut crafts = 0;
+        while inv.craft(&RECIPES[0]) {
+            crafts += 1;
+            assert!(crafts < 25);
+        }
+        assert_eq!(crafts, 24);
+        assert_eq!(inv.count(LOG), 75);
+        assert_eq!(inv.held, Stack::new(PLANKS, 96));
+    }
+
+    #[test]
+    fn stowing_the_cursor_preserves_overflow_and_tool_wear() {
+        let mut inv = Inventory::new();
+        inv.slots[..BAG_END].fill(Stack::new(DIRT, 99));
+        inv.slots[0].n = 97;
+        inv.held = Stack::new(DIRT, 5);
+        inv.stow_held();
+        assert_eq!(inv.slots[0].n, 99);
+        assert_eq!(inv.held, Stack::new(DIRT, 3));
+
+        let pick = Stack { item: IRON_PICK, n: 1, wear: 20 };
+        inv.held = pick;
+        inv.stow_held();
+        assert_eq!(inv.held, pick);
+        inv.slots[1] = Stack::default();
+        inv.stow_held();
+        assert!(inv.held.is_empty());
+        assert_eq!(inv.slots[1], pick);
     }
 
     #[test]

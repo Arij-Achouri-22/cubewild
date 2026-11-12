@@ -711,19 +711,31 @@ impl Mobs {
     }
 
     /// The creatures worth keeping, one per line: kind, place, facing and their state.
-    pub fn save(&self, path: &std::path::Path) {
+    pub fn save(&self, path: &std::path::Path) -> std::io::Result<()> {
         let mut out = String::new();
         for m in self.list.iter().filter(|m| m.keep && m.dead < 0.0) {
             let k = KINDS.iter().position(|&k| k == m.kind).unwrap_or(0);
-            out += &format!("{} {} {} {} {} {} {} {} {} {} {}\n", k, m.pos.x, m.pos.y, m.pos.z, m.yaw, m.wool, m.sheared as u8, m.tame as u8, m.sitting as u8, m.baby, m.hp);
+            out += &format!("{} {} {} {} {} {} {} {} {} {} {} {} {} {}\n", k, m.pos.x, m.pos.y, m.pos.z, m.yaw, m.wool, m.sheared as u8, m.tame as u8, m.sitting as u8, m.baby, m.hp, m.breed_cd.max(0.0), m.love, m.regrow.max(0.0));
         }
-        if let Err(e) = std::fs::write(path, out) {
-            eprintln!("cubewild: failed to save animals: {e}");
+        let mut gone: Vec<_> = self.gone.iter().copied().collect();
+        gone.sort();
+        for ((x, z), home) in gone {
+            out += &format!("gone {x} {z} {home}\n");
         }
+        std::fs::write(path, out)
     }
 
-    pub fn load(&mut self, path: &std::path::Path) {
-        for line in std::fs::read_to_string(path).unwrap_or_default().lines() {
+    pub fn load(&mut self, path: &std::path::Path) -> std::io::Result<()> {
+        for line in crate::save::read_optional(path)?.lines() {
+            if let Some(record) = line.strip_prefix("gone ") {
+                let parts: Vec<_> = record.split_whitespace().collect();
+                let parsed = (|| Some(((parts.first()?.parse::<i32>().ok()?, parts.get(1)?.parse::<i32>().ok()?), parts.get(2)?.parse::<usize>().ok()?)))();
+                match parsed {
+                    Some(id) if parts.len() == 3 => { self.gone.insert(id); }
+                    _ => return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid saved villager record")),
+                }
+                continue;
+            }
             let v: Vec<f32> = line.split_whitespace().filter_map(|t| t.parse().ok()).collect();
             if v.len() < 11 || !v.iter().all(|x| x.is_finite()) {
                 continue;
@@ -739,8 +751,12 @@ impl Mobs {
             m.sitting = v[8] > 0.5;
             m.baby = v[9].clamp(0.0, 1.0);
             m.hp = (v[10] as i32).clamp(1, spec(kind).hp);
+            m.breed_cd = v.get(11).copied().unwrap_or(0.0).clamp(0.0, 240.0);
+            m.love = v.get(12).copied().unwrap_or(0.0).clamp(0.0, 25.0);
+            m.regrow = v.get(13).copied().unwrap_or(0.0).clamp(0.0, 90.0);
             m.keep = true;
         }
+        Ok(())
     }
 
     /// Advances every animal and monster. Returns the damage they dealt to the player
@@ -1255,13 +1271,21 @@ impl Mobs {
 
     /// Nearest living animal hit by a ray, within `max`.
     pub fn pick(&self, o: Vec3, d: Vec3, max: f32) -> Option<(usize, f32)> {
+        self.pick_padded(o, d, max, 0.12)
+    }
+
+    /// Projectile collisions use the body, without the crosshair's aiming allowance.
+    pub fn pick_projectile(&self, o: Vec3, d: Vec3, max: f32) -> Option<(usize, f32)> {
+        self.pick_padded(o, d, max, 0.0)
+    }
+
+    fn pick_padded(&self, o: Vec3, d: Vec3, max: f32, pad: f32) -> Option<(usize, f32)> {
         let mut best: Option<(usize, f32)> = None;
         for (i, m) in self.list.iter().enumerate() {
             if m.dead >= 0.0 {
                 continue;
             }
             let s = spec(m.kind);
-            let pad = 0.12;
             let min = m.pos - Vec3::new(s.hw + pad, 0.0, s.hw + pad);
             let max_c = m.pos + Vec3::new(s.hw + pad, s.h + pad, s.hw + pad);
             if let Some(t) = ray_aabb(o, d, min, max_c) {
@@ -1765,6 +1789,60 @@ mod tests {
         assert!(mobs.events.iter().any(|e| matches!(e, MobEvent::Born { kind: Kind::Sheep, .. })));
         // the parents cannot breed again straight away
         assert!(matches!(mobs.interact(a, WHEAT), Use::Nothing));
+        let root = crate::save::tests::TestDir::new("breeding-cooldown");
+        let path = root.0.join("animals.txt");
+        mobs.save(&path).unwrap();
+        let mut restored = Mobs::new(5);
+        restored.load(&path).unwrap();
+        assert!(restored.list[a].breed_cd > 230.0);
+        assert!(matches!(restored.interact(a, WHEAT), Use::Nothing), "reloading cannot bypass the breeding cooldown");
+        assert_eq!(restored.list.iter().filter(|m| m.baby < 1.0).count(), 1);
+    }
+
+    #[test]
+    fn killed_villagers_stay_gone_after_reloading_their_dimension() {
+        let village = village::near_world(1, 0, 0, 0, 0, 5000).into_iter().next().expect("a village near seed 1");
+        let home = village.homes[0];
+        let center = ((home.x.floor() as i32) >> 4, (home.z.floor() as i32) >> 4);
+        let mut world = field();
+        world.ver = 3;
+        world.chunks = std::mem::take(&mut world.chunks).into_iter().map(|((cx, cz), s)| ((cx + center.0, cz + center.1), s)).collect();
+        let id = (village.region, 0);
+        let mut mobs = Mobs::new(1);
+        mobs.populate(&world, home);
+        let i = (0..mobs.list.len()).find(|&i| mobs.villager_id(i) == Some(id)).expect("the living villager populates their home");
+        mobs.hit(i, home - Vec3::X, 100);
+        let root = crate::save::tests::TestDir::new("villager-consequences");
+        let path = root.0.join("animals.txt");
+        mobs.save(&path).unwrap();
+        for _ in 0..2 {
+            let mut restored = Mobs::new(1);
+            restored.load(&path).unwrap();
+            restored.populate(&world, home);
+            assert!(!(0..restored.list.len()).any(|i| restored.villager_id(i) == Some(id)));
+            assert!(restored.gone.contains(&id));
+            restored.save(&path).unwrap();
+        }
+    }
+
+    #[test]
+    fn older_animals_load_and_new_animal_timers_round_trip() {
+        let root = crate::save::tests::TestDir::new("animal-timers");
+        let path = root.0.join("animals.txt");
+        let sheep = KINDS.iter().position(|&k| k == Kind::Sheep).unwrap();
+        std::fs::write(&path, format!("{sheep} 1.5 10 1.5 0 14 1 0 0 1 4\n")).unwrap();
+        let mut mobs = Mobs::new(1);
+        mobs.load(&path).unwrap();
+        assert_eq!(mobs.list[0].breed_cd, 0.0);
+        mobs.list[0].breed_cd = 120.5;
+        mobs.list[0].love = 14.5;
+        mobs.list[0].regrow = 37.5;
+        mobs.save(&path).unwrap();
+        let mut restored = Mobs::new(1);
+        restored.load(&path).unwrap();
+        let m = &restored.list[0];
+        assert_eq!((m.breed_cd, m.love, m.regrow), (120.5, 14.5, 37.5));
+        assert!(m.sheared && m.wool == 14);
     }
 
     #[test]

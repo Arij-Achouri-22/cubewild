@@ -147,11 +147,9 @@ impl Boats {
         }
     }
 
-    pub fn save(&self, path: &Path) {
+    pub fn save(&self, path: &Path) -> std::io::Result<()> {
         let s: String = self.list.iter().map(|b| format!("{} {} {} {}\n", b.pos.x, b.pos.y, b.pos.z, b.yaw)).collect();
-        if let Err(e) = std::fs::write(path, s) {
-            eprintln!("cubewild: failed to save boats: {e}");
-        }
+        std::fs::write(path, s)
     }
 
     pub fn load(path: &Path) -> Boats {

@@ -4,6 +4,8 @@ use crate::world::{fluid_height, is_fence, is_lava, is_ladder, is_shaped, is_sol
 use glam::{IVec3, Vec3};
 
 pub fn collides(world: &World, pos: Vec3, hw: f32, h: f32) -> bool {
+    // Unknown terrain is a boundary until its chunk arrives, including in flight.
+    if !world.area_loaded(pos.x, pos.z, hw) { return true; }
     let (x0, x1) = ((pos.x - hw).floor() as i32, (pos.x + hw).floor() as i32);
     let (y0, y1) = (pos.y.floor() as i32, (pos.y + h).floor() as i32);
     let (z0, z1) = ((pos.z - hw).floor() as i32, (pos.z + hw).floor() as i32);
@@ -305,6 +307,11 @@ impl Player {
     }
 
     pub fn update(&mut self, world: &World, inp: &Input, dt: f32) {
+        if !world.area_loaded(self.pos.x, self.pos.z, PLAYER_HW) {
+            self.vel = Vec3::ZERO;
+            self.impact = 0.0;
+            return;
+        }
         let (sy, cy) = self.yaw.sin_cos();
         let fwd = Vec3::new(sy, 0.0, cy);
         let right = Vec3::new(-cy, 0.0, sy);
@@ -428,6 +435,42 @@ impl Player {
 mod tests {
     use super::*;
     use crate::world::*;
+
+    #[test]
+    fn walking_and_flying_stop_at_unloaded_chunks_and_resume_when_loaded() {
+        for (start_x, direction, missing) in [(14.5, 1.0, (1, 0)), (1.5, -1.0, (-1, 0))] {
+            for flying in [false, true] {
+                let mut world = World::flat(|_, _, _| None);
+                let chunk = world.chunks.remove(&missing).unwrap();
+                let y = if flying { 20.0 } else { 10.0 };
+                let mut p = Player::new(Vec3::new(start_x, y, 0.5));
+                p.flying = flying;
+                p.yaw = direction * std::f32::consts::FRAC_PI_2;
+                let inp = Input { forward: 1.0, sprint: true, ..Default::default() };
+                for _ in 0..240 { p.update(&world, &inp, 1.0 / 120.0); }
+                assert!(world.area_loaded(p.pos.x, p.pos.z, PLAYER_HW), "{flying}: {}", p.pos);
+                assert!((p.pos.y - y).abs() < 0.01, "no fall at an unloaded boundary: {}", p.pos);
+                assert!(p.impact < 1.0);
+                let boundary = p.pos.x;
+                world.chunks.insert(missing, chunk);
+                for _ in 0..30 { p.update(&world, &inp, 1.0 / 120.0); }
+                assert!((p.pos.x - boundary) * direction > 0.5, "movement resumes: {}", p.pos);
+            }
+        }
+    }
+
+    #[test]
+    fn a_player_whose_chunk_is_missing_waits_without_fall_damage() {
+        let mut world = World::flat(|_, _, _| None);
+        world.chunks.remove(&(0, 0));
+        let pos = Vec3::new(0.5, 30.0, 0.5);
+        let mut p = Player::new(pos);
+        p.vel = Vec3::new(12.0, -55.0, 0.0);
+        for _ in 0..60 { p.update(&world, &Input::default(), 0.05); }
+        assert_eq!(p.pos, pos);
+        assert_eq!(p.vel, Vec3::ZERO);
+        assert_eq!(p.impact, 0.0);
+    }
 
     /// Walks a player east from (1.5, 10, 0.5) for `secs` and returns where it ends up.
     fn walk(world: &World, secs: f32, jump: bool) -> Vec3 {

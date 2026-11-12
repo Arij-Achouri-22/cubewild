@@ -3,6 +3,30 @@
 
 use crate::items::*;
 use crate::world::*;
+use std::collections::HashMap;
+use std::path::Path;
+
+pub type Uses = HashMap<(((i32, i32), usize), usize), u32>;
+
+pub fn save_uses(uses: &Uses, path: &Path) -> std::io::Result<()> {
+    let mut entries: Vec<_> = uses.iter().filter(|(_, n)| **n > 0).collect();
+    entries.sort_by_key(|(key, _)| **key);
+    let text: String = entries.into_iter().map(|(&(((x, z), home), offer), &n)| format!("{x} {z} {home} {offer} {n}\n")).collect();
+    std::fs::write(path, text)
+}
+
+pub fn load_uses(path: &Path) -> std::io::Result<Uses> {
+    let mut uses = Uses::new();
+    let invalid = || std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid saved trade usage");
+    for line in crate::save::read_optional(path)?.lines() {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        let [x, z, home, offer, n] = parts.as_slice() else { return Err(invalid()) };
+        let key = (((x.parse().map_err(|_| invalid())?, z.parse().map_err(|_| invalid())?), home.parse().map_err(|_| invalid())?), offer.parse().map_err(|_| invalid())?);
+        let n = n.parse::<u32>().map_err(|_| invalid())?;
+        if n > 0 { uses.insert(key, n); }
+    }
+    Ok(uses)
+}
 
 pub struct Offer {
     /// what the player gives (the second may be nothing: `(AIR, 0)`)
@@ -86,6 +110,18 @@ pub fn offers(profession: u32) -> &'static [Offer] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn trade_usage_survives_saving_without_losing_signed_village_coordinates() {
+        let root = crate::save::tests::TestDir::new("trade-usage");
+        let path = root.0.join("trades.txt");
+        assert!(load_uses(&path).unwrap().is_empty());
+        let uses = Uses::from([((((-30_000_001, 20_000_003), 2), 6), 1), ((((2, -3), 0), 0), 12)]);
+        save_uses(&uses, &path).unwrap();
+        assert_eq!(load_uses(&path).unwrap(), uses);
+        std::fs::write(&path, "0 0 0 0\n").unwrap();
+        assert!(load_uses(&path).is_err());
+    }
 
     #[test]
     fn every_trade_deals_in_real_items() {

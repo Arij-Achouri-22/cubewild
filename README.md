@@ -165,7 +165,7 @@ unlocks the furnace, bed, iron tools, crystal pickaxe and crystal lamp, and a **
   - **Giant spiders** are fast, climb walls and pounce. They drop plant fibre.
   - **Slimes** hop after you. They drop clay.
 
-Edited chunks, position, inventory, chests, dropped items, health and time of day are saved per world seed, and
+Edited chunks, position, inventory (including the stack on the mouse), chests, dropped items, health and time of day are saved per world seed, and
 settings separately:
 
 | | Saves | Settings |
@@ -175,6 +175,20 @@ settings separately:
 | macOS | `~/Library/Application Support/cubewild/` | same folder |
 
 To move a world to another computer, copy its `world-<seed>` folder across.
+
+World checkpoints run every 30 seconds while the world is running, when opening menus,
+before changing dimensions, and when saving or quitting. Terrain, inventory and container
+contents commit together; an interrupted commit finishes before the world opens again.
+The `.checkpoint-backup` folder keeps the previous versions of files replaced by the
+latest checkpoint. Save failures stay visible and keep the world open so you can retry.
+A damaged saved chunk pauses play and reports the error instead of regenerating over
+your buildings.
+
+Water and lava resume flowing after reloading. Falling sand and gravel, pending leaf
+decay, and edits waiting for the next simulation tick are saved with their dimension;
+they wait when their terrain is unloaded. Movement stops at unloaded chunk boundaries
+until terrain arrives. Villager deaths, animal breeding cooldowns, and daily trade limits
+also survive reloading; villagers restock at the next dawn, including after sleeping.
 
 ## Frame rate
 
@@ -228,6 +242,7 @@ twelve seeds and prints where the one nearest the start is (F3 shows your positi
 - `src/gfx.rs` — renderer (one draw call per chunk, 4-byte packed vertices; buried cave
   walls of far chunks are skipped while you are above ground)
 - `src/player.rs` — movement, collision, ray casting
+- `src/projectile.rs` — nearest collision of arrows and fireballs with terrain and bodies
 - `src/mobs.rs` — animals, wolves, monsters and villagers
 - `src/village.rs` — villages: where they stand, their layout, building them into chunks
 - `src/path.rs` — path finding for hunting mobs (A* over walkable cells, one search a frame)

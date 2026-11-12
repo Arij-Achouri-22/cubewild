@@ -4,8 +4,7 @@ use crate::gfx::{ChunkMesh, Gfx};
 use glam::IVec3;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{BuildHasherDefault, Hasher};
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
@@ -1779,13 +1778,12 @@ fn lower_thread_priority() {
 fn lower_thread_priority() {}
 
 enum Job {
-    Gen(Key),
-    /// write a modified chunk to disk off the render thread (slow HDD friendly)
-    Save(PathBuf, Arc<ChunkData>),
+    Gen(Key, Option<Arc<ChunkData>>),
     Mesh(Key, u32, Box<[Arc<ChunkData>; 9]>),
 }
 enum JobResult {
-    Gen(Key, ChunkData, bool),
+    Gen(Key, Arc<ChunkData>, bool, bool),
+    LoadError(Key, String),
     Mesh(Key, u32, MeshData),
 }
 
@@ -1804,6 +1802,8 @@ pub struct World {
     /// places edited since the game last looked, and what stood there before: fluids
     /// run into them, loose blocks fall, leaves round a felled trunk wilt
     pub touched: Vec<(IVec3, Block)>,
+    /// Chunks just loaded, and whether they contain saved edits to resume.
+    pub activated: Vec<(Key, bool)>,
     pub seed: u32,
     /// the generator this world's terrain comes from (see `GEN_LATEST`)
     pub ver: u8,
@@ -1817,13 +1817,61 @@ pub struct World {
     /// chunk offsets sorted near -> far; bool = inside mesh radius
     pub spiral: Vec<(i32, i32, bool)>,
     uploads: VecDeque<(Key, u32, MeshData)>,
-    save_dir: Option<PathBuf>,
-    pending_saves: Arc<AtomicUsize>,
+    /// Edits outside the view stay here until a coordinated checkpoint commits them.
+    unloaded: HashMap<Key, Arc<ChunkData>, Fx>,
+    pub load_error: Option<String>,
     tick: u32,
 }
 
-fn chunk_path(dir: &PathBuf, k: Key) -> PathBuf {
+fn chunk_path(dir: &Path, k: Key) -> PathBuf {
     dir.join(format!("c.{}.{}.bin", k.0, k.1))
+}
+
+fn load_updates(path: &Path) -> std::io::Result<Vec<(IVec3, Block)>> {
+    let mut touched = Vec::new();
+    for line in crate::save::read_optional(path)?.lines() {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        let parsed = (|| Some((
+            IVec3::new(parts.first()?.parse().ok()?, parts.get(1)?.parse().ok()?, parts.get(2)?.parse().ok()?),
+            parts.get(3)?.parse::<u8>().ok()?,
+        )))();
+        match parsed {
+            Some((p, was)) if parts.len() == 4 && (1..CH).contains(&p.y) => touched.push((p, was)),
+            _ => return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid pending world update")),
+        }
+    }
+    Ok(touched)
+}
+
+fn load_chunk(seed: u32, ver: u8, dir: Option<&Path>, k: Key) -> std::io::Result<(Arc<ChunkData>, bool, bool)> {
+    let bytes = match dir.map(|d| std::fs::read(chunk_path(d, k))) {
+        None => None,
+        Some(Ok(bytes)) => Some(bytes),
+        Some(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Some(Err(e)) => return Err(e),
+    };
+    let saved = bytes.is_some();
+    let (data, modified) = match bytes {
+        Some(b) if b.len() == VOL => (ChunkData { blocks: b.into_boxed_slice() }, false),
+        Some(b) if b.len() == GVOL => {
+            let data = if ver == crate::deep::DEEP_VER { grow(&b, 0) } else { lift_saved(seed, k.0, k.1, &b) };
+            (data, true)
+        }
+        Some(b) => return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("damaged chunk {k:?}: {} bytes", b.len()))),
+        None => (generate_for(ver, seed, k.0, k.1), false),
+    };
+    Ok((Arc::new(data), modified, saved))
+}
+
+/// Finds light sources in a loaded chunk; above the height limit is open air.
+fn chunk_lights(k: Key, data: &ChunkData) -> Vec<(IVec3, Block)> {
+    data.blocks.iter().enumerate().filter_map(|(i, &b)| {
+        let lava = b == LAVA && i & 0x33 == 0x11 && data.blocks.get(i + 256) != Some(&LAVA);
+        (is_light(b) || lava).then(|| {
+            let i = i as i32;
+            (IVec3::new(k.0 * CW + (i & 15), i >> 8, k.1 * CW + ((i >> 4) & 15)), b)
+        })
+    }).collect()
 }
 
 impl World {
@@ -1831,7 +1879,6 @@ impl World {
         let (job_tx, job_rx) = channel::<Job>();
         let (res_tx, res_rx) = channel::<JobResult>();
         let job_rx = Arc::new(Mutex::new(job_rx));
-        let pending_saves = Arc::new(AtomicUsize::new(0));
         let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2);
         let workers = std::env::var("CUBEWILD_WORKERS")
             .ok()
@@ -1842,7 +1889,6 @@ impl World {
             let rx = job_rx.clone();
             let tx = res_tx.clone();
             let dir = save_dir.clone();
-            let saves = pending_saves.clone();
             std::thread::spawn(move || {
                 // Lowest priority: chunk work only runs on CPU time the render
                 // thread and the rest of the desktop are not using.
@@ -1853,30 +1899,13 @@ impl World {
                     Err(_) => return,
                 };
                 let res = match job {
-                    Job::Gen(k) => {
-                        let saved = dir
-                            .as_ref()
-                            .and_then(|d| std::fs::read(chunk_path(d, k)).ok())
-                            .filter(|b| b.len() == VOL || b.len() == GVOL);
-                        match saved {
-                            Some(b) if b.len() == VOL => {
-                                JobResult::Gen(k, ChunkData { blocks: b.into_boxed_slice() }, true)
-                            }
-                            // saved before the world grew: lifted onto the slate (and
-                            // marked changed, so it is saved full height)
-                            Some(b) if ver == crate::deep::DEEP_VER => JobResult::Gen(k, grow(&b, 0), true),
-                            Some(b) => JobResult::Gen(k, lift_saved(seed, k.0, k.1, &b), true),
-                            _ => JobResult::Gen(k, generate_for(ver, seed, k.0, k.1), false),
+                    Job::Gen(k, cached) => {
+                        match cached.map_or_else(|| load_chunk(seed, ver, dir.as_deref(), k), |data| Ok((data, true, true))) {
+                            Ok((data, modified, saved)) => JobResult::Gen(k, data, modified, saved),
+                            Err(e) => JobResult::LoadError(k, format!("Could not load chunk {k:?}: {e}")),
                         }
                     }
                     Job::Mesh(k, ver, n) => JobResult::Mesh(k, ver, mesh(&n)),
-                    Job::Save(path, data) => {
-                        if let Err(e) = std::fs::write(&path, &data.blocks) {
-                            eprintln!("cubewild: failed to save {}: {e}", path.display());
-                        }
-                        saves.fetch_sub(1, Ordering::SeqCst);
-                        continue;
-                    }
                 };
                 if tx.send(res).is_err() {
                     return;
@@ -1886,6 +1915,7 @@ impl World {
         }
         let mut w = World {
             touched: Vec::new(),
+            activated: Vec::new(),
             seed,
             ver,
             chunks: HashMap::default(),
@@ -1897,10 +1927,16 @@ impl World {
             radius,
             spiral: Vec::new(),
             uploads: VecDeque::new(),
-            save_dir,
-            pending_saves,
+            unloaded: HashMap::default(),
+            load_error: None,
             tick: 0,
         };
+        if let Some(dir) = &save_dir {
+            match load_updates(&dir.join("updates.txt")) {
+                Ok(touched) => w.touched = touched,
+                Err(e) => w.load_error = Some(format!("Could not load pending world updates: {e}")),
+            }
+        }
         w.set_radius(radius);
         w
     }
@@ -1945,25 +1981,15 @@ impl World {
         while let Ok(res) = self.res_rx.try_recv() {
             self.in_flight -= 1;
             match res {
-                JobResult::Gen(k, data, modified) => {
+                JobResult::Gen(k, data, modified, saved) => {
                     self.gen_pending.remove(&k);
-                    let mut lights = Vec::new();
-                    {
-                        for (i, &b) in data.blocks.iter().enumerate() {
-                            let lava = b == LAVA && i & 0x33 == 0x11 && data.blocks[i + 256] != LAVA;
-                            if (modified && is_light(b)) || lava {
-                                let i = i as i32;
-                                lights.push((
-                                    IVec3::new(k.0 * CW + (i & 15), i >> 8, k.1 * CW + ((i >> 4) & 15)),
-                                    b,
-                                ));
-                            }
-                        }
-                    }
+                    self.unloaded.remove(&k);
+                    self.activated.push((k, saved));
+                    let lights = chunk_lights(k, &data);
                     self.chunks.insert(
                         k,
                         Slot {
-                            data: Arc::new(data),
+                            data,
                             mesh: None,
                             lights,
                             dirty: true,
@@ -1972,6 +1998,13 @@ impl World {
                             modified,
                         },
                     );
+                }
+                JobResult::LoadError(k, message) => {
+                    // Keep this key pending: retrying every frame would hide the
+                    // error in repeated generation and could overwrite the save.
+                    self.gen_pending.insert(k);
+                    eprintln!("cubewild: {message}");
+                    self.load_error = Some(message);
                 }
                 JobResult::Mesh(k, ver, m) => {
                     if let Some(s) = self.chunks.get_mut(&k) {
@@ -1993,6 +2026,16 @@ impl World {
             }
         }
         // schedule nearest work first
+        // Fill the player's immediate neighbourhood before spending slots on meshes.
+        for i in 0..self.spiral.len().min(9) {
+            if self.in_flight >= self.max_in_flight { break; }
+            let (dx, dz, _) = self.spiral[i];
+            let k = (center.0 + dx, center.1 + dz);
+            if !self.chunks.contains_key(&k) && self.gen_pending.insert(k) {
+                self.job_tx.send(Job::Gen(k, self.unloaded.get(&k).cloned())).ok();
+                self.in_flight += 1;
+            }
+        }
         if self.in_flight < self.max_in_flight {
             for i in 0..self.spiral.len() {
                 if self.in_flight >= self.max_in_flight {
@@ -2003,7 +2046,7 @@ impl World {
                 match self.chunks.get(&k) {
                     None => {
                         if self.gen_pending.insert(k) {
-                            self.job_tx.send(Job::Gen(k)).ok();
+                            self.job_tx.send(Job::Gen(k, self.unloaded.get(&k).cloned())).ok();
                             self.in_flight += 1;
                         }
                     }
@@ -2032,34 +2075,49 @@ impl World {
                 .collect();
             for k in far {
                 if let Some(s) = self.chunks.remove(&k) {
-                    if let (true, Some(d)) = (s.modified, &self.save_dir) {
-                        self.pending_saves.fetch_add(1, Ordering::SeqCst);
-                        self.job_tx.send(Job::Save(chunk_path(d, k), s.data.clone())).ok();
+                    if s.modified {
+                        self.unloaded.insert(k, s.data);
                     }
                 }
             }
         }
     }
 
-    fn save_slot(&self, k: Key, s: &Slot) {
-        if !s.modified {
-            return;
+    pub fn stage_chunks(&self, dir: &Path) -> std::io::Result<()> {
+        std::fs::create_dir_all(dir)?;
+        let updates: String = self.touched.iter().map(|(p, was)| format!("{} {} {} {}\n", p.x, p.y, p.z, was)).collect();
+        std::fs::write(dir.join("updates.txt"), updates)?;
+        for (&k, data) in &self.unloaded {
+            std::fs::write(chunk_path(dir, k), &data.blocks)?;
         }
-        if let Some(d) = &self.save_dir {
-            if let Err(e) = std::fs::write(chunk_path(d, k), &s.data.blocks) {
-                eprintln!("cubewild: failed to save chunk {k:?}: {e}");
+        for (&k, s) in &self.chunks {
+            if s.modified {
+                std::fs::write(chunk_path(dir, k), &s.data.blocks)?;
             }
         }
+        Ok(())
     }
 
-    pub fn save_all(&self) {
-        for (k, s) in &self.chunks {
-            self.save_slot(*k, s);
+    /// Keep edits whose simulation neighbourhood is still unloaded for a later tick.
+    pub fn take_ready_updates(&mut self) -> Vec<(IVec3, Block)> {
+        let pending = std::mem::take(&mut self.touched);
+        let mut ready = Vec::new();
+        for (p, was) in pending {
+            let radius = if is_log(was) { 6.5 } else { 1.0 };
+            if self.area_loaded(p.x as f32 + 0.5, p.z as f32 + 0.5, radius) {
+                ready.push((p, was));
+            } else {
+                self.touched.push((p, was));
+            }
         }
-        // let queued background saves reach the disk before the process exits
-        let start = std::time::Instant::now();
-        while self.pending_saves.load(Ordering::SeqCst) > 0 && start.elapsed().as_secs() < 10 {
-            std::thread::sleep(std::time::Duration::from_millis(5));
+        ready
+    }
+
+    /// Only called after the chunks and player/container state commit together.
+    pub fn checkpoint_committed(&mut self) {
+        self.unloaded.clear();
+        for s in self.chunks.values_mut() {
+            s.modified = false;
         }
     }
 
@@ -2070,6 +2128,13 @@ impl World {
 
     pub fn is_loaded(&self, x: i32, z: i32) -> bool {
         self.chunks.contains_key(&(x >> 4, z >> 4))
+    }
+
+    /// Every chunk touched by a horizontal body or neighbourhood is available.
+    pub fn area_loaded(&self, x: f32, z: f32, radius: f32) -> bool {
+        let (x0, x1) = (((x - radius).floor() as i32) >> 4, ((x + radius).floor() as i32) >> 4);
+        let (z0, z1) = (((z - radius).floor() as i32) >> 4, ((z + radius).floor() as i32) >> 4);
+        (z0..=z1).all(|cz| (x0..=x1).all(|cx| self.chunks.contains_key(&(cx, cz))))
     }
 
     #[inline]
@@ -2298,6 +2363,90 @@ impl World {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pending_simulation_edits_survive_checkpoints_and_wait_for_neighbours() {
+        let root = crate::save::tests::TestDir::new("pending-updates");
+        let mut world = World::flat(|_, _, _| None);
+        let changes = vec![(IVec3::new(0, 10, 0), AIR), (IVec3::new(15, 12, 0), LOG)];
+        world.touched = changes.clone();
+        let checkpoint = crate::save::Checkpoint::begin(&root.0).unwrap();
+        world.stage_chunks(&checkpoint.dir()).unwrap();
+        checkpoint.commit().unwrap();
+        let reloaded = World::new(1, 1, 3, Some(root.0.clone()));
+        assert_eq!(reloaded.touched, changes);
+        assert!(reloaded.load_error.is_none());
+        let chunk = world.chunks.remove(&(1, 0)).unwrap();
+        assert_eq!(world.take_ready_updates(), vec![changes[0]]);
+        assert_eq!(world.touched, vec![changes[1]]);
+        world.chunks.insert((1, 0), chunk);
+        assert_eq!(world.take_ready_updates(), vec![changes[1]]);
+        assert!(world.touched.is_empty());
+    }
+
+    #[test]
+    fn saved_chunks_are_read_and_damaged_ones_are_never_regenerated() {
+        let root = crate::save::tests::TestDir::new("chunks");
+        let path = chunk_path(&root.0, (2, -3));
+        let mut bytes = vec![AIR; VOL];
+        bytes[bidx(1, CH - 1, 1)] = LAVA;
+        std::fs::write(&path, &bytes).unwrap();
+        let (data, modified, saved) = load_chunk(1, 3, Some(&root.0), (2, -3)).unwrap();
+        assert!(!modified);
+        assert!(saved);
+        assert_eq!(data.blocks.as_ref(), bytes.as_slice());
+        assert!(chunk_lights((2, -3), &data).contains(&(IVec3::new(33, CH - 1, -47), LAVA)));
+
+        for len in [0, 1, GVOL - 1, VOL - 1, VOL + 1] {
+            let damaged = vec![STONE; len];
+            std::fs::write(&path, &damaged).unwrap();
+            let error = load_chunk(1, 3, Some(&root.0), (2, -3)).err().expect("damaged chunks must fail loading");
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+            assert_eq!(std::fs::read(&path).unwrap(), damaged);
+        }
+        // An absent file is still new terrain, unlike a truncated saved chunk.
+        assert!(load_chunk(1, 3, Some(&root.0), (3, -3)).is_ok());
+    }
+
+    #[test]
+    fn edited_chunks_wait_for_the_player_checkpoint_even_after_unloading() {
+        let root = crate::save::tests::TestDir::new("staged-chunks");
+        let mut world = World::flat(|_, _, _| None);
+        world.set_block_bg(1, 10, 1, PLANKS);
+        world.set_block_bg(17, 10, 1, BRICK);
+        // A modified chunk leaving view is retained until the next checkpoint.
+        let unloaded = world.chunks.remove(&(1, 0)).unwrap();
+        world.unloaded.insert((1, 0), unloaded.data);
+        let checkpoint = crate::save::Checkpoint::begin(&root.0).unwrap();
+        world.stage_chunks(&checkpoint.dir()).unwrap();
+        std::fs::write(checkpoint.dir().join("player.txt"), "matching inventory\n").unwrap();
+        assert!(!chunk_path(&root.0, (0, 0)).exists());
+        assert!(!chunk_path(&root.0, (1, 0)).exists());
+        assert!(world.chunks[&(0, 0)].modified);
+        assert_eq!(world.unloaded.len(), 1);
+        checkpoint.commit().unwrap();
+        world.checkpoint_committed();
+        assert!(world.unloaded.is_empty());
+        assert!(!world.chunks[&(0, 0)].modified);
+        for (key, block) in [((0, 0), PLANKS), ((1, 0), BRICK)] {
+            let (data, _, _) = load_chunk(1, 1, Some(&root.0), key).unwrap();
+            assert_eq!(data.get(1, 10, 1), block);
+        }
+    }
+
+    #[test]
+    fn lava_lights_at_the_height_limit_load_without_panicking() {
+        let mut data = ChunkData { blocks: vec![AIR; VOL].into_boxed_slice() };
+        data.blocks[bidx(1, CH - 1, 1)] = LAVA;
+        data.blocks[bidx(1, CH - 2, 1)] = LAVA;
+        data.blocks[bidx(5, 10, 5)] = LAVA;
+        data.blocks[bidx(2, CH - 1, 2)] = TORCH;
+        let lights = chunk_lights((-2, 3), &data);
+        assert!(lights.contains(&(IVec3::new(-31, CH - 1, 49), LAVA)));
+        assert!(!lights.contains(&(IVec3::new(-31, CH - 2, 49), LAVA)));
+        assert!(lights.contains(&(IVec3::new(-27, 10, 53), LAVA)));
+        assert!(lights.contains(&(IVec3::new(-30, CH - 1, 50), TORCH)));
+    }
 
     /// An open hall in the slate near the middle of world 4242 (for screenshots).
     #[test]

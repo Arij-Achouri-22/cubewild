@@ -199,14 +199,12 @@ impl Pickups {
         }
     }
 
-    pub fn save(&self, path: &Path) {
+    pub fn save(&self, path: &Path) -> std::io::Result<()> {
         let mut s = String::new();
         for p in &self.list {
             s += &format!("{} {} {} {} {} {} {}\n", p.pos.x, p.pos.y, p.pos.z, p.stack.item, p.stack.n, p.stack.wear, p.age);
         }
-        if let Err(e) = std::fs::write(path, s) {
-            eprintln!("cubewild: failed to save dropped items: {e}");
-        }
+        std::fs::write(path, s)
     }
 
     pub fn load(path: &Path) -> Pickups {
@@ -305,7 +303,7 @@ fn fortress_chest(rng: &mut Rng) -> [Stack; CHEST_SLOTS] {
     slots
 }
 
-pub fn save_chests(chests: &Chests, path: &Path) {
+pub fn save_chests(chests: &Chests, path: &Path) -> std::io::Result<()> {
     let mut s = String::new();
     for (p, slots) in chests {
         if slots.iter().all(|st| st.is_empty()) {
@@ -317,9 +315,7 @@ pub fn save_chests(chests: &Chests, path: &Path) {
         }
         s.push('\n');
     }
-    if let Err(e) = std::fs::write(path, s) {
-        eprintln!("cubewild: failed to save chests: {e}");
-    }
+    std::fs::write(path, s)
 }
 
 pub fn load_chests(path: &Path) -> Chests {
@@ -426,7 +422,7 @@ mod tests {
         slots[26] = Stack { item: items::IRON_PICK, n: 1, wear: 12 };
         chests.insert(IVec3::new(-5, 70, 12), slots);
         chests.insert(IVec3::new(1, 2, 3), [Stack::default(); CHEST_SLOTS]);
-        save_chests(&chests, &dir.join("chests.txt"));
+        save_chests(&chests, &dir.join("chests.txt")).unwrap();
         let back = load_chests(&dir.join("chests.txt"));
         assert_eq!(back.len(), 1, "empty chests are not written");
         assert_eq!(back[&IVec3::new(-5, 70, 12)], slots);
@@ -435,7 +431,7 @@ mod tests {
         drops.spawn(Vec3::new(1.5, 64.0, -2.5), Vec3::ZERO, Stack { item: items::IRON_PICK, n: 1, wear: 3 }, 0.0);
         drops.spawn(Vec3::ZERO, Vec3::ZERO, Stack::default(), 0.0);
         assert_eq!(drops.list.len(), 1, "nothing is dropped for an empty stack");
-        drops.save(&dir.join("drops.txt"));
+        drops.save(&dir.join("drops.txt")).unwrap();
         let back = Pickups::load(&dir.join("drops.txt"));
         assert_eq!((back.list.len(), back.list[0].stack, back.list[0].pos), (1, drops.list[0].stack, drops.list[0].pos));
         std::fs::remove_dir_all(&dir).ok();
