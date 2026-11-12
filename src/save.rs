@@ -4,6 +4,10 @@
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
+use std::thread::JoinHandle;
+
+use crate::world::ChunkData;
 
 const WRITING: &str = ".checkpoint-writing";
 const PENDING: &str = ".checkpoint-pending";
@@ -15,6 +19,77 @@ pub fn read_optional(path: &Path) -> io::Result<String> {
         Ok(text) => Ok(text),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(String::new()),
         Err(e) => Err(e),
+    }
+}
+
+enum Contents {
+    Text(String),
+    Chunk(Arc<ChunkData>),
+}
+
+/// Immutable player/container data and shared chunk snapshots from one simulation
+/// tick. Only encoding happens on the game thread; all disk work can run elsewhere.
+pub struct Snapshot {
+    root: PathBuf,
+    files: Vec<(PathBuf, Contents)>,
+}
+
+impl Snapshot {
+    pub fn new(root: PathBuf) -> Self {
+        Self { root, files: Vec::new() }
+    }
+
+    pub fn text(&mut self, path: impl Into<PathBuf>, text: String) {
+        self.files.push((path.into(), Contents::Text(text)));
+    }
+
+    pub fn chunk(&mut self, path: PathBuf, data: Arc<ChunkData>) {
+        self.files.push((path, Contents::Chunk(data)));
+    }
+
+    pub fn commit(self) -> io::Result<()> {
+        let checkpoint = Checkpoint::begin(&self.root)?;
+        for (relative, contents) in self.files {
+            if relative.as_os_str().is_empty() || relative.components().any(|p| !matches!(p, Component::Normal(_))) {
+                return Err(invalid("invalid snapshot path"));
+            }
+            let path = checkpoint.dir().join(relative);
+            fs::create_dir_all(path.parent().unwrap())?;
+            let bytes = match &contents {
+                Contents::Text(text) => text.as_bytes(),
+                Contents::Chunk(data) => &data.blocks,
+            };
+            fs::write(path, bytes)?;
+        }
+        checkpoint.commit()
+    }
+}
+
+pub struct Background {
+    worker: Option<JoinHandle<io::Result<()>>>,
+}
+
+impl Background {
+    pub fn start(snapshot: Snapshot) -> io::Result<Self> {
+        let worker = std::thread::Builder::new().name("world-save".into()).spawn(move || snapshot.commit())?;
+        Ok(Self { worker: Some(worker) })
+    }
+
+    pub fn is_finished(&self) -> bool {
+        self.worker.as_ref().unwrap().is_finished()
+    }
+
+    pub fn wait(mut self) -> io::Result<()> {
+        self.worker.take().unwrap().join().unwrap_or_else(|_| Err(io::Error::other("the world save worker stopped unexpectedly")))
+    }
+}
+
+impl Drop for Background {
+    fn drop(&mut self) {
+        // A world must never remove or reuse its directory while its writer runs.
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
     }
 }
 
@@ -215,6 +290,28 @@ pub(crate) mod tests {
         fs::write(checkpoint.dir().join("c.0.0.bin"), vec![PLANKS; VOL]).unwrap();
         fs::write(checkpoint.dir().join("deep/chests.txt"), "new chest contents\n").unwrap();
         checkpoint
+    }
+
+    #[test]
+    fn dropping_the_save_handle_finishes_the_write_before_a_world_can_be_removed() {
+        let root = TestDir::new("background-drop");
+        let mut snapshot = Snapshot::new(root.0.clone());
+        snapshot.text("player.txt", "completed snapshot\n".into());
+        let writer = Background::start(snapshot).unwrap();
+        drop(writer);
+        assert_eq!(fs::read_to_string(root.0.join("player.txt")).unwrap(), "completed snapshot\n");
+        assert!(!root.0.join(PENDING).exists());
+    }
+
+    #[test]
+    fn background_save_errors_are_returned_to_the_game() {
+        let root = TestDir::new("background-error");
+        let blocked = root.0.join("not-a-directory");
+        fs::write(&blocked, "keep this file").unwrap();
+        let mut snapshot = Snapshot::new(blocked.clone());
+        snapshot.text("player.txt", "new snapshot\n".into());
+        assert!(Background::start(snapshot).unwrap().wait().is_err());
+        assert_eq!(fs::read_to_string(blocked).unwrap(), "keep this file");
     }
 
     #[test]

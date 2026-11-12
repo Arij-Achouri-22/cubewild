@@ -147,9 +147,8 @@ impl Boats {
         }
     }
 
-    pub fn save(&self, path: &Path) -> std::io::Result<()> {
-        let s: String = self.list.iter().map(|b| format!("{} {} {} {}\n", b.pos.x, b.pos.y, b.pos.z, b.yaw)).collect();
-        std::fs::write(path, s)
+    pub fn encode(&self) -> String {
+        self.list.iter().map(|b| format!("{} {} {} {}\n", b.pos.x, b.pos.y, b.pos.z, b.yaw)).collect()
     }
 
     pub fn load(path: &Path) -> Boats {

@@ -176,8 +176,9 @@ settings separately:
 
 To move a world to another computer, copy its `world-<seed>` folder across.
 
-World checkpoints run every 30 seconds while the world is running, when opening menus,
-before changing dimensions, and when saving or quitting. Terrain, inventory and container
+World checkpoints run in the background every 30 seconds while the world is running and
+when opening menus. Changing dimensions, saving to title, or quitting waits for the save
+worker and commits the latest state before leaving. Terrain, inventory and container
 contents commit together; an interrupted commit finishes before the world opens again.
 The `.checkpoint-backup` folder keeps the previous versions of files replaced by the
 latest checkpoint. Save failures stay visible and keep the world open so you can retry.
@@ -198,6 +199,31 @@ nothing on displays slower than 120 Hz with vsync on. "Render scale" draws the w
 lower resolution and stretches it; it helps where pixel fill is the limit (it was not on
 Intel HD 620, where geometry is).
 
+Block edits change collision and gameplay immediately, then workers rebuild their
+meshes. Edits to the same chunk are combined, recent edits take priority over distant
+terrain, and obsolete results are discarded. GPU uploads have a short time budget and
+reuse existing buffers. Loading saved fluids is spread over frames, and autosave disk
+writes run on a separate thread so a slow drive does not pause ordinary play.
+
+For repeatable performance checks, use the release executable:
+
+```sh
+CUBEWILD_BENCH=12 CUBEWILD_DIST=8 target/release/cubewild
+CUBEWILD_BENCH=12 CUBEWILD_DIST=8 CUBEWILD_BENCH_EDITS=1 CUBEWILD_BENCH_TURN=0 target/release/cubewild
+cargo test --release gen_speed -- --ignored --nocapture
+```
+
+The first run flies through new terrain; the second repeatedly edits a corner shared
+by four chunk meshes. Both print average FPS, 1% low, worst frame, and time to the first
+player chunk mesh. They do not save a world. To exercise a real autosave, also set
+`CUBEWILD_BENCH_AUTOSAVE=1` with a duration of at least 32 seconds; this creates a separate
+temporary save folder and prints its path. `CUBEWILD_PROF=1` logs slow frame work and
+autosave capture/completion times.
+
+On an i3-7020U with Intel HD 620, the repeated-edit test at view distance 8 improved
+from a 62.4 ms worst frame to 6.2 ms. See [PERFORMANCE.md](PERFORMANCE.md) for the test
+conditions, measurements and HDD autosave verification.
+
 ## Environment variables
 
 - `CUBEWILD_SEED=<n>` — skip the title screen and open the world of this seed (each seed
@@ -205,7 +231,8 @@ Intel HD 620, where geometry is).
   `CUBEWILD_NEW=creative|survival` starts a new world at once
 - `CUBEWILD_DIST=<chunks>` — override the saved view distance
 - `CUBEWILD_SCALE=<0.5..1>` — override the render scale
-- `CUBEWILD_WORKERS=<n>` — background chunk threads (default: physical cores - 1)
+- `CUBEWILD_WORKERS=<1..8>` — background chunk threads (default: half the available
+  hardware threads, limited to 1–4; two workers on a four-thread CPU)
 - `CUBEWILD_BENCH=<seconds>` — automated fly-through with vsync off; prints average fps,
   1% low and worst frame. `CUBEWILD_BENCH_TURN` sets the turn rate, `CUBEWILD_PROF=1`
   logs slow frames.

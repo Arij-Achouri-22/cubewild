@@ -2,11 +2,12 @@
 
 use crate::gfx::{ChunkMesh, Gfx};
 use glam::IVec3;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::hash::{BuildHasherDefault, Hasher};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{channel, Receiver, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::mpsc::{channel, Receiver};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 pub const CW: i32 = 16; // chunk width (x and z)
 pub const CH: i32 = 256; // chunk height
@@ -1387,6 +1388,17 @@ pub struct MeshData {
 
 const PW: usize = (CW + 2) as usize;
 const PH: usize = (CH + 2) as usize;
+const MESH_SKIP: u8 = 1;
+const MESH_OPAQUE: u8 = 2;
+
+fn mesh_flags() -> &'static [u8; 256] {
+    static FLAGS: std::sync::LazyLock<[u8; 256]> = std::sync::LazyLock::new(|| std::array::from_fn(|i| {
+        let b = i as Block;
+        let skip = b == AIR || is_torch(b) || is_plant(b) || is_shaped(b) || is_gate(b);
+        skip as u8 | (is_opaque(b) as u8) << 1 | fluid_kind(b) << 2
+    }));
+    &FLAGS
+}
 
 /// Greedy mesher with ambient occlusion. `n` is the 3x3 neighbourhood, index (dz+1)*3+(dx+1).
 /// A terrain vertex's corner: x and z (0..=16) share 9 bits, y (0..=256) has the next 9.
@@ -1397,6 +1409,7 @@ fn pack_xyz(x: u32, y: u32, z: u32) -> u32 {
 }
 
 pub fn mesh(n: &[Arc<ChunkData>; 9]) -> MeshData {
+    let flags = mesh_flags();
     // padded copy so neighbour lookups never branch
     let mut pad = vec![AIR; PW * PW * PH];
     for i in 0..PW * PW {
@@ -1509,24 +1522,26 @@ pub fn mesh(n: &[Arc<ChunkData>; 9]) -> MeshData {
                     p[v] = vv as i32;
                     let i = pidx(p);
                     let b = at(i);
+                    let material = flags[b as usize];
                     let m = &mut mask[vv * nu + uu];
                     *m = 0;
-                    if b == AIR || is_torch(b) || is_plant(b) || is_shaped(b) || is_gate(b) {
+                    if material & MESH_SKIP != 0 {
                         continue;
                     }
                     let q = i + sa;
                     let nb = at(q);
-                    let op = is_opaque(b);
-                    let fk = fluid_kind(b);
+                    let op = material & MESH_OPAQUE != 0;
+                    let fk = material >> 2;
+                    let neighbour = flags[nb as usize];
                     let mut visible = if op {
-                        !is_opaque(nb) && !(fk != 0 && fluid_kind(nb) == fk)
+                        neighbour & MESH_OPAQUE == 0 && !(fk != 0 && neighbour >> 2 == fk)
                     } else {
-                        nb != b && !is_opaque(nb) && !(fk != 0 && fluid_kind(nb) == fk)
+                        nb != b && neighbour & MESH_OPAQUE == 0 && !(fk != 0 && neighbour >> 2 == fk)
                     };
                     // a fluid's corners stand lower the weaker it runs: the two bits of
                     // shading each vertex has carry that instead (see `vs_chunk`)
                     let mut heights = None;
-                    if fk != 0 && (visible || (face == 2 && fluid_kind(nb) != fk)) {
+                    if fk != 0 && (visible || (face == 2 && neighbour >> 2 != fk)) {
                         let mut codes = [3u32; 4];
                         for (ci, (cu, cv)) in [(0, 0), (1, 0), (1, 1), (0, 1)].into_iter().enumerate() {
                             let mut c = p;
@@ -1548,7 +1563,7 @@ pub fn mesh(n: &[Arc<ChunkData>; 9]) -> MeshData {
                     if let Some(h) = heights {
                         ao = h;
                     } else if op {
-                        let o = |i: isize| is_opaque(at(i)) as u32;
+                        let o = |i: isize| ((flags[at(i) as usize] & MESH_OPAQUE) != 0) as u32;
                         let (um, up, vm, vp) = (o(q - su), o(q + su), o(q - sv), o(q + sv));
                         let c = |s1: u32, s2: u32, ci: isize| -> u32 {
                             if s1 + s2 == 2 {
@@ -1754,10 +1769,9 @@ pub fn mesh(n: &[Arc<ChunkData>; 9]) -> MeshData {
 #[cfg(target_os = "linux")]
 fn lower_thread_priority() {
     unsafe {
-        let param = libc::sched_param { sched_priority: 0 };
-        if libc::sched_setscheduler(0, libc::SCHED_IDLE, &param) != 0 {
-            libc::setpriority(libc::PRIO_PROCESS, 0, 15);
-        }
+        // Keep rendering ahead of chunk work without starving generation whenever
+        // the game or the graphics driver has runnable threads.
+        libc::setpriority(libc::PRIO_PROCESS, 0, 5);
     }
 }
 
@@ -1768,9 +1782,9 @@ fn lower_thread_priority() {
         fn GetCurrentThread() -> *mut std::ffi::c_void;
         fn SetThreadPriority(thread: *mut std::ffi::c_void, priority: i32) -> i32;
     }
-    const THREAD_PRIORITY_LOWEST: i32 = -2;
+    const THREAD_PRIORITY_BELOW_NORMAL: i32 = -1;
     unsafe {
-        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
     }
 }
 
@@ -1779,12 +1793,87 @@ fn lower_thread_priority() {}
 
 enum Job {
     Gen(Key, Option<Arc<ChunkData>>),
-    Mesh(Key, u32, Box<[Arc<ChunkData>; 9]>),
+    Mesh { key: Key, ticket: u64, version: u32, urgent: bool, neighbours: Box<[Arc<ChunkData>; 9]> },
 }
 enum JobResult {
-    Gen(Key, Arc<ChunkData>, bool, bool),
+    Gen(Key, Arc<ChunkData>, bool, bool, Vec<(IVec3, Block)>),
     LoadError(Key, String),
-    Mesh(Key, u32, MeshData),
+    Mesh(Key, u64, u32, MeshData),
+}
+
+fn distance(a: Key, b: Key) -> u64 {
+    let dx = (a.0 as i64 - b.0 as i64).unsigned_abs();
+    let dz = (a.1 as i64 - b.1 as i64).unsigned_abs();
+    dx.saturating_mul(dx).saturating_add(dz.saturating_mul(dz))
+}
+
+impl Job {
+    fn priority(&self, center: Key) -> (u8, u64) {
+        let (key, urgent, generation) = match self {
+            Job::Gen(key, _) => (*key, false, true),
+            Job::Mesh { key, urgent, .. } => (*key, *urgent, false),
+        };
+        let d = distance(key, center);
+        let tier = if urgent { 0 } else if generation && d <= 2 { 1 } else { 2 };
+        (tier, d.saturating_mul(2).saturating_add(generation as u64))
+    }
+}
+
+#[derive(Default)]
+struct JobState {
+    jobs: Vec<Job>,
+    center: Key,
+    closed: bool,
+}
+
+/// The render thread bounds the queue by `max_in_flight`. Workers choose the nearest
+/// useful job at pickup time, so an old travel direction cannot hide a recent edit.
+#[derive(Default)]
+struct Jobs {
+    state: Mutex<JobState>,
+    ready: Condvar,
+}
+
+impl Jobs {
+    fn push(&self, job: Job) {
+        let mut state = self.state.lock().unwrap();
+        if !state.closed {
+            state.jobs.push(job);
+            self.ready.notify_one();
+        }
+    }
+
+    fn pop(&self) -> Option<Job> {
+        let mut state = self.state.lock().unwrap();
+        loop {
+            if state.closed { return None; }
+            if let Some((i, _)) = state.jobs.iter().enumerate().min_by_key(|(_, job)| job.priority(state.center)) {
+                return Some(state.jobs.remove(i));
+            }
+            state = self.ready.wait(state).unwrap();
+        }
+    }
+
+    fn set_center(&self, center: Key) {
+        self.state.lock().unwrap().center = center;
+    }
+
+    fn cancel_mesh(&self, ticket: u64) -> bool {
+        let mut state = self.state.lock().unwrap();
+        if let Some(i) = state.jobs.iter().position(|job| matches!(job, Job::Mesh { ticket: t, .. } if *t == ticket)) {
+            state.jobs.remove(i);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn close(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.closed = true;
+        state.jobs.clear();
+        self.ready.notify_all();
+    }
 }
 
 pub struct Slot {
@@ -1793,7 +1882,7 @@ pub struct Slot {
     /// world positions of the light-emitting blocks in this chunk
     pub lights: Vec<(IVec3, Block)>,
     dirty: bool,
-    pending: bool,
+    pending: Option<(u64, u32)>,
     version: u32,
     modified: bool,
 }
@@ -1809,18 +1898,26 @@ pub struct World {
     pub ver: u8,
     pub chunks: HashMap<Key, Slot, Fx>,
     gen_pending: HashSet<Key, Fx>,
-    job_tx: Sender<Job>,
+    jobs: Arc<Jobs>,
     res_rx: Receiver<JobResult>,
     in_flight: usize,
     max_in_flight: usize,
     pub radius: i32,
     /// chunk offsets sorted near -> far; bool = inside mesh radius
     pub spiral: Vec<(i32, i32, bool)>,
-    uploads: VecDeque<(Key, u32, MeshData)>,
+    uploads: HashMap<Key, (u32, MeshData), Fx>,
+    edited: HashSet<Key, Fx>,
+    next_mesh_ticket: u64,
     /// Edits outside the view stay here until a coordinated checkpoint commits them.
     unloaded: HashMap<Key, Arc<ChunkData>, Fx>,
     pub load_error: Option<String>,
     tick: u32,
+}
+
+impl Drop for World {
+    fn drop(&mut self) {
+        self.jobs.close();
+    }
 }
 
 fn chunk_path(dir: &Path, k: Key) -> PathBuf {
@@ -1876,40 +1973,36 @@ fn chunk_lights(k: Key, data: &ChunkData) -> Vec<(IVec3, Block)> {
 
 impl World {
     pub fn new(seed: u32, ver: u8, radius: i32, save_dir: Option<PathBuf>) -> World {
-        let (job_tx, job_rx) = channel::<Job>();
         let (res_tx, res_rx) = channel::<JobResult>();
-        let job_rx = Arc::new(Mutex::new(job_rx));
+        let jobs = Arc::new(Jobs::default());
         let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2);
         let workers = std::env::var("CUBEWILD_WORKERS")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or((threads / 2).saturating_sub(1))
+            .unwrap_or((threads / 2).clamp(1, 4))
             .clamp(1, 8);
         for _ in 0..workers {
-            let rx = job_rx.clone();
+            let queue = jobs.clone();
             let tx = res_tx.clone();
             let dir = save_dir.clone();
             std::thread::spawn(move || {
-                // Lowest priority: chunk work only runs on CPU time the render
-                // thread and the rest of the desktop are not using.
                 lower_thread_priority();
-                loop {
-                let job = match rx.lock().unwrap().recv() {
-                    Ok(j) => j,
-                    Err(_) => return,
-                };
-                let res = match job {
-                    Job::Gen(k, cached) => {
-                        match cached.map_or_else(|| load_chunk(seed, ver, dir.as_deref(), k), |data| Ok((data, true, true))) {
-                            Ok((data, modified, saved)) => JobResult::Gen(k, data, modified, saved),
-                            Err(e) => JobResult::LoadError(k, format!("Could not load chunk {k:?}: {e}")),
+                while let Some(job) = queue.pop() {
+                    let res = match job {
+                        Job::Gen(k, cached) => {
+                            match cached.map_or_else(|| load_chunk(seed, ver, dir.as_deref(), k), |data| Ok((data, true, true))) {
+                                Ok((data, modified, saved)) => {
+                                    let lights = chunk_lights(k, &data);
+                                    JobResult::Gen(k, data, modified, saved, lights)
+                                }
+                                Err(e) => JobResult::LoadError(k, format!("Could not load chunk {k:?}: {e}")),
+                            }
                         }
+                        Job::Mesh { key, ticket, version, neighbours, .. } => JobResult::Mesh(key, ticket, version, mesh(&neighbours)),
+                    };
+                    if tx.send(res).is_err() {
+                        return;
                     }
-                    Job::Mesh(k, ver, n) => JobResult::Mesh(k, ver, mesh(&n)),
-                };
-                if tx.send(res).is_err() {
-                    return;
-                }
                 }
             });
         }
@@ -1920,13 +2013,15 @@ impl World {
             ver,
             chunks: HashMap::default(),
             gen_pending: HashSet::default(),
-            job_tx,
+            jobs,
             res_rx,
             in_flight: 0,
-            max_in_flight: workers * 3,
+            max_in_flight: workers * 2,
             radius,
             spiral: Vec::new(),
-            uploads: VecDeque::new(),
+            uploads: HashMap::default(),
+            edited: HashSet::default(),
+            next_mesh_ticket: 0,
             unloaded: HashMap::default(),
             load_error: None,
             tick: 0,
@@ -1965,74 +2060,118 @@ impl World {
     }
 
     fn neighbours(&self, k: Key) -> Option<Box<[Arc<ChunkData>; 9]>> {
-        let mut v: Vec<Arc<ChunkData>> = Vec::with_capacity(9);
-        for dz in -1..=1 {
-            for dx in -1..=1 {
-                v.push(self.chunks.get(&(k.0 + dx, k.1 + dz))?.data.clone());
-            }
-        }
-        let arr: [Arc<ChunkData>; 9] = v.try_into().ok()?;
-        Some(Box::new(arr))
+        let get = |dx, dz| self.chunks.get(&(k.0 + dx, k.1 + dz)).map(|s| s.data.clone());
+        Some(Box::new([
+            get(-1, -1)?, get(0, -1)?, get(1, -1)?,
+            get(-1, 0)?, get(0, 0)?, get(1, 0)?,
+            get(-1, 1)?, get(0, 1)?, get(1, 1)?,
+        ]))
     }
 
     /// Streams chunks around `center` (chunk coords). Call once per frame.
     pub fn update(&mut self, gfx: &Gfx, center: Key) {
         self.tick = self.tick.wrapping_add(1);
+        self.receive();
+        self.upload(gfx, center);
+        self.schedule(center);
+        self.unload_far(center);
+    }
+
+    fn receive(&mut self) {
         while let Ok(res) = self.res_rx.try_recv() {
             self.in_flight -= 1;
-            match res {
-                JobResult::Gen(k, data, modified, saved) => {
-                    self.gen_pending.remove(&k);
-                    self.unloaded.remove(&k);
-                    self.activated.push((k, saved));
-                    let lights = chunk_lights(k, &data);
-                    self.chunks.insert(
-                        k,
-                        Slot {
-                            data,
-                            mesh: None,
-                            lights,
-                            dirty: true,
-                            pending: false,
-                            version: 0,
-                            modified,
-                        },
-                    );
-                }
-                JobResult::LoadError(k, message) => {
-                    // Keep this key pending: retrying every frame would hide the
-                    // error in repeated generation and could overwrite the save.
-                    self.gen_pending.insert(k);
-                    eprintln!("cubewild: {message}");
-                    self.load_error = Some(message);
-                }
-                JobResult::Mesh(k, ver, m) => {
-                    if let Some(s) = self.chunks.get_mut(&k) {
-                        s.pending = false;
+            self.accept(res);
+        }
+    }
+
+    fn accept(&mut self, res: JobResult) {
+        match res {
+            JobResult::Gen(k, data, modified, saved, lights) => {
+                self.gen_pending.remove(&k);
+                self.unloaded.remove(&k);
+                self.activated.push((k, saved));
+                self.chunks.insert(
+                    k,
+                    Slot {
+                        data,
+                        mesh: None,
+                        lights,
+                        dirty: true,
+                        pending: None,
+                        version: 0,
+                        modified,
+                    },
+                );
+            }
+            JobResult::LoadError(k, message) => {
+                // Keep this key pending: retrying every frame would hide the
+                // error in repeated generation and could overwrite the save.
+                self.gen_pending.insert(k);
+                eprintln!("cubewild: {message}");
+                self.load_error = Some(message);
+            }
+            JobResult::Mesh(k, ticket, ver, m) => {
+                if let Some(s) = self.chunks.get_mut(&k) {
+                    if s.pending == Some((ticket, ver)) {
+                        s.pending = None;
                         if s.version == ver {
-                            self.uploads.push_back((k, ver, m));
+                            self.uploads.insert(k, (ver, m));
                         }
                     }
                 }
             }
         }
-        // GPU uploads, a few per frame to keep frame times flat
-        for _ in 0..2 {
-            let Some((k, ver, m)) = self.uploads.pop_front() else { break };
-            if let Some(s) = self.chunks.get_mut(&k) {
-                if s.version == ver {
-                    s.mesh = gfx.upload_mesh(&m);
-                }
-            }
+    }
+
+    fn upload(&mut self, gfx: &Gfx, center: Key) {
+        // Obsolete results do not consume an upload slot or GPU bandwidth.
+        self.uploads.retain(|k, (version, _)| self.chunks.get(k).is_some_and(|s| s.version == *version));
+        let mut keys: Vec<_> = self.uploads.keys().copied().collect();
+        keys.sort_by_key(|k| (!self.edited.contains(k), distance(*k, center)));
+        let start = Instant::now();
+        for (i, k) in keys.into_iter().take(4).enumerate() {
+            if i > 0 && start.elapsed() >= Duration::from_micros(1000) { break; }
+            let (_, mesh) = self.uploads.remove(&k).unwrap();
+            let slot = self.chunks.get_mut(&k).unwrap();
+            slot.mesh = gfx.upload_mesh(&mesh, slot.mesh.take());
+            self.edited.remove(&k);
         }
-        // schedule nearest work first
+    }
+
+    fn queue_mesh(&mut self, k: Key, urgent: bool) -> bool {
+        let Some(s) = self.chunks.get(&k) else { return false };
+        if !s.dirty { return false; }
+        if let Some((ticket, version)) = s.pending {
+            if version == s.version || !self.jobs.cancel_mesh(ticket) { return false; }
+            self.in_flight -= 1;
+            self.chunks.get_mut(&k).unwrap().pending = None;
+        }
+        if self.in_flight >= self.max_in_flight || self.uploads.len() >= 12 { return false; }
+        let Some(neighbours) = self.neighbours(k) else { return false };
+        self.next_mesh_ticket = self.next_mesh_ticket.wrapping_add(1);
+        let s = self.chunks.get_mut(&k).unwrap();
+        let ticket = self.next_mesh_ticket;
+        s.pending = Some((ticket, s.version));
+        s.dirty = false;
+        self.jobs.push(Job::Mesh { key: k, ticket, version: s.version, urgent, neighbours });
+        self.in_flight += 1;
+        true
+    }
+
+    fn schedule(&mut self, center: Key) {
+        self.jobs.set_center(center);
+        let mut edits: Vec<_> = self.edited.iter().copied().collect();
+        edits.sort_by_key(|k| distance(*k, center));
+        for k in edits {
+            self.queue_mesh(k, true);
+        }
         // Fill the player's immediate neighbourhood before spending slots on meshes.
         for i in 0..self.spiral.len().min(9) {
             if self.in_flight >= self.max_in_flight { break; }
             let (dx, dz, _) = self.spiral[i];
             let k = (center.0 + dx, center.1 + dz);
             if !self.chunks.contains_key(&k) && self.gen_pending.insert(k) {
-                self.job_tx.send(Job::Gen(k, self.unloaded.get(&k).cloned())).ok();
+                self.jobs.push(Job::Gen(k, self.unloaded.get(&k).cloned()));
                 self.in_flight += 1;
             }
         }
@@ -2046,25 +2185,21 @@ impl World {
                 match self.chunks.get(&k) {
                     None => {
                         if self.gen_pending.insert(k) {
-                            self.job_tx.send(Job::Gen(k, self.unloaded.get(&k).cloned())).ok();
+                            self.jobs.push(Job::Gen(k, self.unloaded.get(&k).cloned()));
                             self.in_flight += 1;
                         }
                     }
                     Some(s) => {
-                        if inner && s.dirty && !s.pending {
-                            if let Some(n) = self.neighbours(k) {
-                                let s = self.chunks.get_mut(&k).unwrap();
-                                s.dirty = false;
-                                s.pending = true;
-                                self.job_tx.send(Job::Mesh(k, s.version, n)).ok();
-                                self.in_flight += 1;
-                            }
+                        if inner && s.dirty {
+                            self.queue_mesh(k, false);
                         }
                     }
                 }
             }
         }
-        // unload far chunks
+    }
+
+    fn unload_far(&mut self, center: Key) {
         if self.tick % 60 == 0 {
             let lim = self.radius + 3;
             let far: Vec<Key> = self
@@ -2075,6 +2210,8 @@ impl World {
                 .collect();
             for k in far {
                 if let Some(s) = self.chunks.remove(&k) {
+                    self.edited.remove(&k);
+                    self.uploads.remove(&k);
                     if s.modified {
                         self.unloaded.insert(k, s.data);
                     }
@@ -2083,10 +2220,10 @@ impl World {
         }
     }
 
+    #[cfg(test)]
     pub fn stage_chunks(&self, dir: &Path) -> std::io::Result<()> {
         std::fs::create_dir_all(dir)?;
-        let updates: String = self.touched.iter().map(|(p, was)| format!("{} {} {} {}\n", p.x, p.y, p.z, was)).collect();
-        std::fs::write(dir.join("updates.txt"), updates)?;
+        std::fs::write(dir.join("updates.txt"), self.encode_updates())?;
         for (&k, data) in &self.unloaded {
             std::fs::write(chunk_path(dir, k), &data.blocks)?;
         }
@@ -2096,6 +2233,28 @@ impl World {
             }
         }
         Ok(())
+    }
+
+    pub fn encode_updates(&self) -> String {
+        self.touched.iter().map(|(p, was)| format!("{} {} {} {}\n", p.x, p.y, p.z, was)).collect()
+    }
+
+    pub fn snapshot_chunks(&self) -> Vec<(Key, Arc<ChunkData>)> {
+        self.unloaded.iter().map(|(&k, data)| (k, data.clone()))
+            .chain(self.chunks.iter().filter(|(_, s)| s.modified).map(|(&k, s)| (k, s.data.clone())))
+            .collect()
+    }
+
+    /// New edits made while a snapshot writes stay dirty for the next checkpoint.
+    pub fn snapshot_committed(&mut self, chunks: &[(Key, Arc<ChunkData>)]) {
+        for (key, saved) in chunks {
+            if let Some(slot) = self.chunks.get_mut(key) {
+                if Arc::ptr_eq(&slot.data, saved) { slot.modified = false; }
+            }
+            if self.unloaded.get(key).is_some_and(|current| Arc::ptr_eq(current, saved)) {
+                self.unloaded.remove(key);
+            }
+        }
     }
 
     /// Keep edits whose simulation neighbourhood is still unloaded for a later tick.
@@ -2114,6 +2273,7 @@ impl World {
     }
 
     /// Only called after the chunks and player/container state commit together.
+    #[cfg(test)]
     pub fn checkpoint_committed(&mut self) {
         self.unloaded.clear();
         for s in self.chunks.values_mut() {
@@ -2195,32 +2355,19 @@ impl World {
         })
     }
 
-    fn remesh_now(&mut self, gfx: &Gfx, k: Key) {
-        let n = self.neighbours(k);
+    fn invalidate(&mut self, k: Key, urgent: bool) {
         let Some(s) = self.chunks.get_mut(&k) else { return };
-        s.version += 1; // invalidates any in-flight mesh of the old data
-        match n {
-            Some(n) => {
-                s.mesh = gfx.upload_mesh(&mesh(&n));
-                s.dirty = false;
-            }
-            None => s.dirty = true,
-        }
+        s.version = s.version.wrapping_add(1);
+        s.dirty = true;
+        if urgent { self.edited.insert(k); }
     }
 
     /// Edits a block and lets the background workers remesh (for changes the player
     /// is not waiting on, such as crops growing).
     pub fn set_block_bg(&mut self, x: i32, y: i32, z: i32, b: Block) {
-        if y < 1 || y >= CH {
-            return;
+        if self.write_block(x, y, z, b) {
+            self.remesh_edit(x, z, false);
         }
-        let k = (x >> 4, z >> 4);
-        let (lx, lz) = (x & 15, z & 15);
-        let Some(s) = self.chunks.get_mut(&k) else { return };
-        Arc::make_mut(&mut s.data).blocks[bidx(lx, y, lz)] = b;
-        s.modified = true;
-        s.version += 1;
-        s.dirty = true;
     }
 
     /// Writes a block without remeshing. False if the spot cannot be edited.
@@ -2234,6 +2381,7 @@ impl World {
             return false;
         }
         let was = s.data.get(lx, y, lz);
+        if was == b { return false; }
         Arc::make_mut(&mut s.data).blocks[bidx(lx, y, lz)] = b;
         s.modified = true;
         let wp = IVec3::new(x, y, z);
@@ -2249,7 +2397,7 @@ impl World {
 
     /// Edits many blocks with one remesh per chunk touched (an explosion). Returns the
     /// edits that took (bedrock and unloaded places are left alone).
-    pub fn set_many(&mut self, gfx: &Gfx, edits: &[(IVec3, Block)]) -> Vec<(IVec3, Block)> {
+    pub fn set_many(&mut self, edits: &[(IVec3, Block)]) -> Vec<(IVec3, Block)> {
         let mut done = Vec::new();
         let mut keys: Vec<Key> = Vec::new();
         for &(p, b) in edits {
@@ -2270,31 +2418,34 @@ impl World {
             }
         }
         for k in keys {
-            self.remesh_now(gfx, k);
+            self.invalidate(k, true);
         }
         done
     }
 
     /// Edits a block and the one above it with a single remesh (both halves of a door).
-    pub fn set_pair(&mut self, gfx: &Gfx, x: i32, y: i32, z: i32, lower: Block, upper: Block) -> bool {
-        if y + 1 >= CH || !self.write_block(x, y, z, lower) {
+    pub fn set_pair(&mut self, x: i32, y: i32, z: i32, lower: Block, upper: Block) -> bool {
+        if y < 1 || y + 1 >= CH || !self.is_loaded(x, z)
+            || self.get_block(x, y, z) == BEDROCK || self.get_block(x, y + 1, z) == BEDROCK
+        {
             return false;
         }
-        self.write_block(x, y + 1, z, upper);
-        self.remesh_edit(gfx, x, z);
-        true
+        let lower = self.write_block(x, y, z, lower);
+        let upper = self.write_block(x, y + 1, z, upper);
+        if lower || upper { self.remesh_edit(x, z, true); }
+        lower || upper
     }
 
-    /// Edits a block and remeshes the affected chunks immediately.
-    pub fn set_block(&mut self, gfx: &Gfx, x: i32, y: i32, z: i32, b: Block) -> bool {
+    /// Edits take effect immediately; their meshes are coalesced on background workers.
+    pub fn set_block(&mut self, x: i32, y: i32, z: i32, b: Block) -> bool {
         if !self.write_block(x, y, z, b) {
             return false;
         }
-        self.remesh_edit(gfx, x, z);
+        self.remesh_edit(x, z, true);
         true
     }
 
-    fn remesh_edit(&mut self, gfx: &Gfx, x: i32, z: i32) {
+    fn remesh_edit(&mut self, x: i32, z: i32, urgent: bool) {
         let k = (x >> 4, z >> 4);
         let (lx, lz) = (x & 15, z & 15);
         // sky exposure reaches two columns across a chunk border
@@ -2302,7 +2453,7 @@ impl World {
         let zs: &[i32] = if lz <= 1 { &[0, -1] } else if lz >= 14 { &[0, 1] } else { &[0] };
         for &dz in zs {
             for &dx in xs {
-                self.remesh_now(gfx, (k.0 + dx, k.1 + dz));
+                self.invalidate((k.0 + dx, k.1 + dz), urgent);
             }
         }
     }
@@ -2321,7 +2472,7 @@ impl World {
                         }
                     }
                 }
-                let slot = Slot { data: Arc::new(ChunkData { blocks }), mesh: None, lights: Vec::new(), dirty: false, pending: false, version: 0, modified: false };
+                let slot = Slot { data: Arc::new(ChunkData { blocks }), mesh: None, lights: Vec::new(), dirty: false, pending: None, version: 0, modified: false };
                 w.chunks.insert((cx, cz), slot);
             }
         }
@@ -2363,6 +2514,158 @@ impl World {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn paused_world() -> World {
+        let mut world = World::flat(|_, _, _| None);
+        world.jobs.close();
+        world.jobs = Arc::new(Jobs::default());
+        world.max_in_flight = 4;
+        world
+    }
+
+    #[test]
+    fn edits_are_immediate_and_mesh_jobs_coalesce_without_losing_border_updates() {
+        let mut world = paused_world();
+        let before = world.chunks[&(0, 0)].data.clone();
+        assert!(world.set_block(15, 12, 15, PLANKS));
+        assert_eq!(world.get_block(15, 12, 15), PLANKS);
+        assert_eq!(before.get(15, 12, 15), AIR, "a running mesh keeps its immutable snapshot");
+        for key in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+            assert!(world.chunks[&key].dirty && world.edited.contains(&key));
+        }
+        assert_eq!(world.in_flight, 0, "editing does no synchronous mesh work");
+        let version = world.chunks[&(0, 0)].version;
+        assert!(!world.set_block(15, 12, 15, PLANKS));
+        assert_eq!(world.chunks[&(0, 0)].version, version, "identical writes do no work");
+        assert!(world.queue_mesh((0, 0), true));
+        assert!(world.set_block(15, 12, 15, GLASS));
+        assert!(world.queue_mesh((0, 0), true));
+        assert_eq!(world.in_flight, 1, "the queued stale job was replaced");
+        let Job::Mesh { key, ticket, version, neighbours, .. } = world.jobs.pop().unwrap() else { panic!("mesh job") };
+        assert_eq!(neighbours[4].get(15, 12, 15), GLASS);
+        world.accept(JobResult::Mesh(key, ticket, version, mesh(&neighbours)));
+        let (_, ready) = &world.uploads[&(0, 0)];
+        let expected = mesh(&world.neighbours((0, 0)).unwrap());
+        assert_eq!(ready.verts, expected.verts);
+        assert_eq!(ready.detail, expected.detail);
+    }
+
+    #[test]
+    fn an_edit_during_meshing_discards_the_old_result_and_builds_the_latest_state() {
+        let mut world = paused_world();
+        world.set_block(8, 12, 8, PLANKS);
+        assert!(world.queue_mesh((0, 0), true));
+        let Job::Mesh { key, ticket, version, neighbours, .. } = world.jobs.pop().unwrap() else { panic!("mesh job") };
+        world.set_block(8, 12, 8, LAMP);
+        assert!(!world.queue_mesh(key, true), "already running work completes before rescheduling");
+        world.accept(JobResult::Mesh(key, ticket, version, mesh(&neighbours)));
+        world.in_flight -= 1;
+        assert!(world.uploads.is_empty());
+        assert!(world.chunks[&key].dirty && world.chunks[&key].pending.is_none());
+        assert!(world.queue_mesh(key, true));
+        let Job::Mesh { ticket, version, neighbours, .. } = world.jobs.pop().unwrap() else { panic!("mesh job") };
+        assert_eq!(neighbours[4].get(8, 12, 8), LAMP);
+        world.accept(JobResult::Mesh(key, ticket, version, mesh(&neighbours)));
+        assert_eq!(world.uploads.len(), 1);
+        assert_eq!(world.uploads[&key].0, world.chunks[&key].version);
+    }
+
+    #[test]
+    fn old_mesh_tickets_cannot_replace_a_reloaded_chunk_or_its_pending_job() {
+        let mut world = paused_world();
+        let key = (0, 0);
+        world.chunks.get_mut(&key).unwrap().pending = Some((20, 0));
+        world.accept(JobResult::Mesh(key, 10, 0, mesh(&world.neighbours(key).unwrap())));
+        assert_eq!(world.chunks[&key].pending, Some((20, 0)));
+        assert!(world.uploads.is_empty());
+    }
+
+    #[test]
+    fn worker_pickup_prioritizes_edits_and_tracks_the_current_player_position() {
+        let world = paused_world();
+        let jobs = Jobs::default();
+        jobs.push(Job::Gen((0, 0), None));
+        jobs.push(Job::Gen((10, 10), None));
+        jobs.push(Job::Mesh { key: (5, 5), ticket: 1, version: 1, urgent: true, neighbours: world.neighbours((0, 0)).unwrap() });
+        jobs.set_center((10, 10));
+        assert!(matches!(jobs.pop(), Some(Job::Mesh { ticket: 1, .. })));
+        assert!(matches!(jobs.pop(), Some(Job::Gen((10, 10), _))));
+        assert!(matches!(jobs.pop(), Some(Job::Gen((0, 0), _))));
+        let jobs = Arc::new(jobs);
+        let worker = jobs.clone();
+        let (done_tx, done_rx) = channel();
+        let handle = std::thread::spawn(move || { done_tx.send(worker.pop().is_none()).unwrap(); });
+        jobs.close();
+        assert!(done_rx.recv_timeout(Duration::from_secs(2)).unwrap());
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn a_background_checkpoint_keeps_inventory_and_terrain_from_the_same_tick() {
+        let root = crate::save::tests::TestDir::new("background-checkpoint");
+        let mut world = World::flat(|x, y, z| (y == 10 && z == 1 && (x == 1 || x == 2)).then_some(LOG));
+        let mut inv = crate::items::Inventory::new();
+        world.set_block(1, 10, 1, AIR);
+        inv.add(LOG, 1);
+        let chunks = world.snapshot_chunks();
+        let mut snapshot = crate::save::Snapshot::new(root.0.clone());
+        snapshot.text("player.txt", inv.save_stacks());
+        for (key, data) in &chunks { snapshot.chunk(chunk_path(Path::new(""), *key), data.clone()); }
+        let writer = crate::save::Background::start(snapshot).unwrap();
+        world.set_block(2, 10, 1, AIR);
+        inv.add(LOG, 1);
+        writer.wait().unwrap();
+        world.snapshot_committed(&chunks);
+        let (saved, _, _) = load_chunk(1, 1, Some(&root.0), (0, 0)).unwrap();
+        assert_eq!((saved.get(1, 10, 1), saved.get(2, 10, 1)), (AIR, LOG));
+        assert_eq!(std::fs::read_to_string(root.0.join("player.txt")).unwrap(), "slots 0:5:1:0\nheld 0 0 0\n");
+        assert_eq!(inv.count(LOG), 2);
+        assert!(world.chunks[&(0, 0)].modified, "newer edits remain dirty after the older snapshot commits");
+        assert_eq!(world.snapshot_chunks().len(), 1);
+    }
+
+    #[test]
+    fn completing_a_snapshot_cleans_only_unchanged_loaded_and_unloaded_chunks() {
+        let mut world = paused_world();
+        world.set_block(1, 10, 1, PLANKS);
+        world.set_block(17, 10, 1, BRICK);
+        let unloaded = world.chunks.remove(&(1, 0)).unwrap();
+        world.unloaded.insert((1, 0), unloaded.data);
+        let first = world.snapshot_chunks();
+        world.set_block(1, 10, 1, GLASS);
+        world.snapshot_committed(&first);
+        assert!(world.unloaded.is_empty(), "unchanged unloaded data was saved");
+        assert!(world.chunks[&(0, 0)].modified);
+        let second = world.snapshot_chunks();
+        assert_eq!(second.len(), 1);
+        world.snapshot_committed(&second);
+        assert!(!world.chunks[&(0, 0)].modified);
+        assert!(world.snapshot_chunks().is_empty());
+    }
+
+    fn material_fixture() -> MeshData {
+        let blocks = [STONE, GLASS, WATER, LAVA, LEAVES, SLAB, SLAB_TOP + 2, STAIR_BASE + 17, FENCE, PANE, CHEST, LOOT_CHEST,
+            TORCH, WALL_TORCH, TALL_GRASS, WHEAT_2, LADDER_BASE + 1, TRAP_BASE + 4, DOOR_BASE + 37, SUNSHARD, GATE, WOOL + 8];
+        let world = World::flat(|x, y, z| {
+            if (0..CW).contains(&x) && (0..CW).contains(&z) && y == 12 {
+                Some(blocks[(x as usize + z as usize * CW as usize) % blocks.len()])
+            } else if x == 3 && y == CH - 1 && z == 3 {
+                Some(LAVA)
+            } else { None }
+        });
+        mesh(&world.neighbours((0, 0)).unwrap())
+    }
+
+    fn mesh_fingerprint(mesh: &MeshData) -> u64 {
+        mesh.verts.iter().chain(mesh.detail.iter()).copied()
+            .chain([mesh.opaque_quads, mesh.deep_quads, mesh.cut_quads, mesh.trans_quads, mesh.top.to_bits()])
+            .fold(0xcbf2_9ce4_8422_2325, |hash, word| (hash ^ word as u64).wrapping_mul(0x100_0000_01b3))
+    }
+
+    #[test]
+    fn material_geometry_lighting_and_fluid_surfaces_match_the_original_mesher() {
+        assert_eq!(mesh_fingerprint(&material_fixture()), 0x67ff_6749_e9ac_e203);
+    }
 
     #[test]
     fn pending_simulation_edits_survive_checkpoints_and_wait_for_neighbours() {
@@ -2768,22 +3071,29 @@ mod tests {
     #[test]
     #[ignore]
     fn gen_speed() {
-        let t = std::time::Instant::now();
-        let mut air = 0usize;
-        for cz in 0..8 {
-            for cx in 0..8 {
-                air += generate(2026, cx, cz).blocks.iter().filter(|b| **b == AIR).count();
+        for ver in [GEN_LATEST, crate::deep::DEEP_VER] {
+            let t = std::time::Instant::now();
+            let mut air = 0usize;
+            for cz in 0..8 {
+                for cx in 0..8 {
+                    let chunk = std::hint::black_box(generate_for(ver, 2026, cx, cz));
+                    air += chunk.blocks.iter().filter(|b| **b == AIR).count();
+                }
             }
+            println!("generator {ver}: {:.2} ms a chunk ({air} air blocks)", t.elapsed().as_secs_f64() * 1000.0 / 64.0);
+            let n: [Arc<ChunkData>; 9] = std::array::from_fn(|i| Arc::new(generate_for(ver, 2026, (i % 3) as i32, (i / 3) as i32)));
+            let mut times = Vec::new();
+            let mut vertices = 0;
+            for _ in 0..40 {
+                let t = std::time::Instant::now();
+                let m = std::hint::black_box(mesh(&n));
+                times.push(t.elapsed().as_secs_f64() * 1000.0);
+                vertices += m.verts.len() + m.detail.len();
+            }
+            times.sort_by(f64::total_cmp);
+            println!("mesh {ver}: mean {:.2} ms, p95 {:.2} ms ({vertices} vertex words)", times.iter().sum::<f64>() / times.len() as f64, times[38]);
         }
-        println!("generate: {:.2} ms a chunk ({air})", t.elapsed().as_secs_f64() * 1000.0 / 64.0);
-        let n: [Arc<ChunkData>; 9] = std::array::from_fn(|i| Arc::new(generate(2026, (i % 3) as i32, (i / 3) as i32)));
-        let t = std::time::Instant::now();
-        let mut quads = 0;
-        for _ in 0..20 {
-            let m = mesh(&n);
-            quads += m.detail.len();
-        }
-        println!("mesh: {:.2} ms a chunk ({quads})", t.elapsed().as_secs_f64() * 1000.0 / 20.0);
+        println!("material mesh fingerprint: {:016x}", mesh_fingerprint(&material_fixture()));
     }
 
     #[test]

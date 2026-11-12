@@ -199,12 +199,17 @@ impl Pickups {
         }
     }
 
+    #[cfg(test)]
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
+        std::fs::write(path, self.encode())
+    }
+
+    pub fn encode(&self) -> String {
         let mut s = String::new();
         for p in &self.list {
             s += &format!("{} {} {} {} {} {} {}\n", p.pos.x, p.pos.y, p.pos.z, p.stack.item, p.stack.n, p.stack.wear, p.age);
         }
-        std::fs::write(path, s)
+        s
     }
 
     pub fn load(path: &Path) -> Pickups {
@@ -303,7 +308,12 @@ fn fortress_chest(rng: &mut Rng) -> [Stack; CHEST_SLOTS] {
     slots
 }
 
+#[cfg(test)]
 pub fn save_chests(chests: &Chests, path: &Path) -> std::io::Result<()> {
+    std::fs::write(path, encode_chests(chests))
+}
+
+pub fn encode_chests(chests: &Chests) -> String {
     let mut s = String::new();
     for (p, slots) in chests {
         if slots.iter().all(|st| st.is_empty()) {
@@ -315,7 +325,7 @@ pub fn save_chests(chests: &Chests, path: &Path) -> std::io::Result<()> {
         }
         s.push('\n');
     }
-    std::fs::write(path, s)
+    s
 }
 
 pub fn load_chests(path: &Path) -> Chests {

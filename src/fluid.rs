@@ -6,11 +6,12 @@
 //! Water that meets lava hardens it: a source into cinderstone (as with a bucket),
 //! running lava into cobblestone; lava that runs into water turns to stone.
 
-use crate::gfx::Gfx;
 use crate::world::*;
 use glam::IVec3;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 /// how far each runs from its source
 const WATER_RUN: u8 = 7;
@@ -73,6 +74,14 @@ pub struct Fluids {
     queued: HashSet<(IVec3, bool)>,
     water_t: f32,
     lava_t: f32,
+    waking: VecDeque<Wake>,
+    waking_keys: HashSet<Key>,
+}
+
+struct Wake {
+    key: Key,
+    data: Arc<ChunkData>,
+    next: usize,
 }
 
 impl Fluids {
@@ -83,14 +92,19 @@ impl Fluids {
         }
     }
 
+    #[cfg(test)]
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
+        std::fs::write(path, self.encode())
+    }
+
+    pub fn encode(&self) -> String {
         let mut text = format!("timers {} {}\n", self.water_t, self.lava_t);
         for (name, queue) in [("water", &self.water), ("lava", &self.lava)] {
             for p in queue {
                 text += &format!("{name} {} {} {}\n", p.x, p.y, p.z);
             }
         }
-        std::fs::write(path, text)
+        text
     }
 
     pub fn load(path: &Path) -> std::io::Result<Self> {
@@ -122,19 +136,50 @@ impl Fluids {
     /// Older saves have no queue. Resume flows and exposed sources in saved chunks;
     /// untouched generated lakes do not need a simulation job for every water cell.
     pub fn chunk_loaded(&mut self, world: &World, key: Key, saved: bool) {
-        if !saved { return; }
+        if !saved || self.waking_keys.contains(&key) { return; }
         let Some(chunk) = world.chunks.get(&key) else { return };
+        self.waking_keys.insert(key);
+        self.waking.push_back(Wake { key, data: chunk.data.clone(), next: 0 });
+    }
+
+    /// Resuming a saved sea or lava pool must not scan several full chunks in one
+    /// frame. The chunk snapshot stays alive while its cells are checked in batches.
+    fn wake(&mut self, world: &World, budget: usize) {
+        let start = Instant::now();
+        let mut left = budget;
         let mut plan = Vec::new();
-        for (i, &b) in chunk.data.blocks.iter().enumerate() {
-            let kind = if is_water(b) { Kind::Water } else if is_lava(b) { Kind::Lava } else { continue };
-            let p = IVec3::new(key.0 * CW + (i as i32 & 15), i as i32 >> 8, key.1 * CW + ((i as i32 >> 4) & 15));
-            let source = b == WATER || b == LAVA;
-            plan.clear();
-            if source && world.area_loaded(p.x as f32 + 0.5, p.z as f32 + 0.5, 1.0) {
-                think(&|c| world.get_block(c.x, c.y, c.z), kind, p, &mut plan);
-                if plan.is_empty() { continue; }
+        while left > 0 {
+            let Some(mut wake) = self.waking.pop_front() else { break };
+            if !world.chunks.contains_key(&wake.key) {
+                self.waking_keys.remove(&wake.key);
+                continue;
             }
-            self.push(p, kind == Kind::Lava);
+            let key = wake.key;
+            let end = (wake.next + left).min(wake.data.blocks.len());
+            while wake.next < end {
+                if left % 128 == 0 && start.elapsed() >= Duration::from_micros(500) {
+                    self.waking.push_front(wake);
+                    return;
+                }
+                let i = wake.next;
+                let b = wake.data.blocks[i];
+                wake.next += 1;
+                left -= 1;
+                let kind = if is_water(b) { Kind::Water } else if is_lava(b) { Kind::Lava } else { continue };
+                let p = IVec3::new(key.0 * CW + (i as i32 & 15), i as i32 >> 8, key.1 * CW + ((i as i32 >> 4) & 15));
+                let source = b == WATER || b == LAVA;
+                plan.clear();
+                if source && world.area_loaded(p.x as f32 + 0.5, p.z as f32 + 0.5, 1.0) {
+                    think(&|c| world.get_block(c.x, c.y, c.z), kind, p, &mut plan);
+                    if plan.is_empty() { continue; }
+                }
+                self.push(p, kind == Kind::Lava);
+            }
+            if wake.next < wake.data.blocks.len() {
+                self.waking.push_front(wake);
+            } else {
+                self.waking_keys.remove(&key);
+            }
         }
     }
 
@@ -164,7 +209,8 @@ impl Fluids {
 
     /// Runs the fluids on. `touched` are the places edited since the last call. Returns
     /// what running water washed away (torches, plants, crops), to be dropped as items.
-    pub fn update(&mut self, world: &mut World, gfx: &Gfx, dt: f32, touched: &[(IVec3, Block)]) -> Vec<(IVec3, Block)> {
+    pub fn update(&mut self, world: &mut World, dt: f32, touched: &[(IVec3, Block)]) -> Vec<(IVec3, Block)> {
+        self.wake(world, 4096);
         self.gather(world, touched);
         self.water_t += dt;
         self.lava_t += dt;
@@ -189,7 +235,7 @@ impl Fluids {
                     washed.push((p, was));
                 }
             }
-            world.set_many(gfx, &edits);
+            world.set_many(&edits);
         }
         washed
     }
@@ -405,11 +451,30 @@ mod tests {
         fluids.chunk_loaded(&world, (0, 0), false);
         assert!(fluids.queued.is_empty(), "generated lakes need no full scan");
         fluids.chunk_loaded(&world, (0, 0), true);
+        while !fluids.waking.is_empty() { fluids.wake(&world, VOL); }
         let mut edits = HashMap::new();
         fluids.step(&world, Kind::Water, &mut edits);
         fluids.step(&world, Kind::Lava, &mut edits);
         assert!(is_water(edits[&IVec3::new(4, 10, 0)]));
         assert!(is_lava(edits[&IVec3::new(7, 10, 0)]));
+    }
+
+    #[test]
+    fn saved_chunks_wake_in_bounded_batches_and_can_be_requeued_after_unloading() {
+        let mut world = World::flat(|_, y, _| (y == 10).then_some(WATER));
+        let mut fluids = Fluids::default();
+        fluids.chunk_loaded(&world, (0, 0), true);
+        fluids.chunk_loaded(&world, (0, 0), true);
+        assert_eq!(fluids.waking.len(), 1);
+        assert_eq!(fluids.waking[0].next, 0, "loading only enqueues a snapshot");
+        fluids.wake(&world, 128);
+        assert!(fluids.waking[0].next <= 128);
+        let chunk = world.chunks.remove(&(0, 0)).unwrap();
+        fluids.wake(&world, 128);
+        assert!(fluids.waking.is_empty() && fluids.waking_keys.is_empty());
+        world.chunks.insert((0, 0), chunk);
+        fluids.chunk_loaded(&world, (0, 0), true);
+        assert_eq!(fluids.waking.len(), 1);
     }
 
     #[test]

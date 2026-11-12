@@ -140,7 +140,7 @@ impl Furnace {
     }
 }
 
-pub fn save(furnaces: &Furnaces, path: &Path) -> std::io::Result<()> {
+pub fn encode(furnaces: &Furnaces) -> String {
     let mut s = String::new();
     for (p, f) in furnaces {
         if f.slots.iter().all(|st| st.is_empty()) && f.burn <= 0.0 {
@@ -152,7 +152,7 @@ pub fn save(furnaces: &Furnaces, path: &Path) -> std::io::Result<()> {
         }
         s.push('\n');
     }
-    std::fs::write(path, s)
+    s
 }
 
 pub fn load(path: &Path) -> Furnaces {

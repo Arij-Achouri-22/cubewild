@@ -2,7 +2,7 @@
 //! fall, leaves cut off from every trunk wilt away, and saplings grow into trees.
 //! Like the fluids, this only looks at places that were edited (`World::touched`).
 
-use crate::gfx::{Gfx, ItemVert};
+use crate::gfx::ItemVert;
 use crate::mobs::Rng;
 use crate::world::*;
 use glam::{IVec3, Vec3};
@@ -50,7 +50,12 @@ pub struct Settle {
 const REACH: i32 = 6;
 
 impl Settle {
+    #[cfg(test)]
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
+        std::fs::write(path, self.encode())
+    }
+
+    pub fn encode(&self) -> String {
         let mut text = String::new();
         for f in &self.falling {
             text += &format!("fall {} {} {} {} {}\n", f.pos.x, f.pos.y, f.pos.z, f.vy, f.block);
@@ -58,7 +63,7 @@ impl Settle {
         for (p, timer) in &self.wilt {
             text += &format!("leaf {} {} {} {}\n", p.x, p.y, p.z, timer);
         }
-        std::fs::write(path, text)
+        text
     }
 
     pub fn load(path: &Path) -> std::io::Result<Self> {
@@ -94,10 +99,10 @@ impl Settle {
     /// Runs the settling on: `touched` are the places edited since the last call, with
     /// what stood there before. `body` is where the player stands and how tall they are:
     /// a block coming down on them breaks rather than burying them.
-    pub fn update(&mut self, world: &mut World, gfx: &Gfx, rng: &mut Rng, dt: f32, touched: &[(IVec3, Block)], body: (Vec3, f32)) -> Settled {
+    pub fn update(&mut self, world: &mut World, rng: &mut Rng, dt: f32, touched: &[(IVec3, Block)], body: (Vec3, f32)) -> Settled {
         let (out, edits) = self.advance(world, rng, dt, touched, body);
         if !edits.is_empty() {
-            world.set_many(gfx, &edits);
+            world.set_many(&edits);
         }
         out
     }

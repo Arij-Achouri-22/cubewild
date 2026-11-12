@@ -8,11 +8,15 @@ use std::path::Path;
 
 pub type Uses = HashMap<(((i32, i32), usize), usize), u32>;
 
+#[cfg(test)]
 pub fn save_uses(uses: &Uses, path: &Path) -> std::io::Result<()> {
+    std::fs::write(path, encode_uses(uses))
+}
+
+pub fn encode_uses(uses: &Uses) -> String {
     let mut entries: Vec<_> = uses.iter().filter(|(_, n)| **n > 0).collect();
     entries.sort_by_key(|(key, _)| **key);
-    let text: String = entries.into_iter().map(|(&(((x, z), home), offer), &n)| format!("{x} {z} {home} {offer} {n}\n")).collect();
-    std::fs::write(path, text)
+    entries.into_iter().map(|(&(((x, z), home), offer), &n)| format!("{x} {z} {home} {offer} {n}\n")).collect()
 }
 
 pub fn load_uses(path: &Path) -> std::io::Result<Uses> {

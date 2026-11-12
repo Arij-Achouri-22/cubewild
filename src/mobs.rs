@@ -711,7 +711,12 @@ impl Mobs {
     }
 
     /// The creatures worth keeping, one per line: kind, place, facing and their state.
+    #[cfg(test)]
     pub fn save(&self, path: &std::path::Path) -> std::io::Result<()> {
+        std::fs::write(path, self.encode())
+    }
+
+    pub fn encode(&self) -> String {
         let mut out = String::new();
         for m in self.list.iter().filter(|m| m.keep && m.dead < 0.0) {
             let k = KINDS.iter().position(|&k| k == m.kind).unwrap_or(0);
@@ -722,7 +727,7 @@ impl Mobs {
         for ((x, z), home) in gone {
             out += &format!("gone {x} {z} {home}\n");
         }
-        std::fs::write(path, out)
+        out
     }
 
     pub fn load(&mut self, path: &std::path::Path) -> std::io::Result<()> {

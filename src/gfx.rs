@@ -837,17 +837,20 @@ impl Gfx {
         );
     }
 
-    pub fn upload_mesh(&self, m: &MeshData) -> Option<ChunkMesh> {
+    pub fn upload_mesh(&self, m: &MeshData, previous: Option<ChunkMesh>) -> Option<ChunkMesh> {
         if m.verts.is_empty() && m.detail.is_empty() {
             return None;
         }
-        let vbuf = vbuf(&self.device, (m.verts.len().max(1) * 4) as u64);
-        self.queue.write_buffer(&vbuf, 0, bytemuck::cast_slice(&m.verts));
-        let detail = (!m.detail.is_empty()).then(|| {
-            let buf = self::vbuf(&self.device, (m.detail.len() * 4) as u64);
-            self.queue.write_buffer(&buf, 0, bytemuck::cast_slice(&m.detail));
-            (buf, ((m.detail.len() / 8) as u32).min(MAX_QUADS))
-        });
+        let (mut vbuf, old_detail) = match previous {
+            Some(previous) => (previous.vbuf, previous.detail),
+            None => (self::vbuf(&self.device, ((m.verts.len().max(1) * 4) as u64).next_power_of_two()), None),
+        };
+        self.fill(&mut vbuf, bytemuck::cast_slice(&m.verts));
+        let detail = if m.detail.is_empty() { None } else {
+            let mut buf = old_detail.map(|(buf, _)| buf).unwrap_or_else(|| self::vbuf(&self.device, ((m.detail.len() * 4) as u64).next_power_of_two()));
+            self.fill(&mut buf, bytemuck::cast_slice(&m.detail));
+            Some((buf, ((m.detail.len() / 8) as u32).min(MAX_QUADS)))
+        };
         Some(ChunkMesh {
             vbuf,
             detail,

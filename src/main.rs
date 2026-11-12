@@ -407,6 +407,19 @@ struct Bench {
     duration: f32,
     t: f32,
     frames: Vec<f32>,
+    edit_tick: u32,
+    terrain_ready: Option<f32>,
+}
+
+struct SaveSnapshot {
+    files: save::Snapshot,
+    chunks: Vec<(Key, Arc<ChunkData>)>,
+}
+
+struct PendingSave {
+    writer: save::Background,
+    chunks: Vec<(Key, Arc<ChunkData>)>,
+    started: Instant,
 }
 
 struct Game {
@@ -457,6 +470,7 @@ struct Game {
     drawn: (usize, u32),
     save_dir: Option<PathBuf>,
     last_checkpoint: Instant,
+    pending_save: Option<PendingSave>,
     save_error: Option<String>,
     load_notice: Option<String>,
     bench: Option<Bench>,
@@ -1128,6 +1142,8 @@ impl Game {
             duration: d,
             t: 0.0,
             frames: Vec::new(),
+            edit_tick: 0,
+            terrain_ready: None,
         });
         let mut settings = Settings::load();
         if let Some(d) = env("CUBEWILD_DIST").and_then(|v| v.parse().ok()) {
@@ -1157,7 +1173,13 @@ impl Game {
         gfx.upload_font(&atlas);
 
         let mut startup_error = None;
-        let loaded = load_world(seed, settings.view_dist, save, Mode::Survival).unwrap_or_else(|e| {
+        let loaded = if bench.is_some() && env("CUBEWILD_BENCH_AUTOSAVE").is_some() {
+            let dir = std::env::temp_dir().join(format!("cubewild-bench-save-{}", std::process::id()));
+            println!("benchmark save folder: {}", dir.display());
+            std::fs::create_dir_all(&dir).and_then(|_| load_world_at(seed, settings.view_dist, Some(dir), Mode::Survival))
+        } else {
+            load_world(seed, settings.view_dist, save, Mode::Survival)
+        }.unwrap_or_else(|e| {
             startup_error = Some(format!("Could not open world {seed}: {e}"));
             load_world(seed, settings.view_dist, false, Mode::Survival).expect("an unsaved world needs no disk access")
         });
@@ -1248,6 +1270,7 @@ impl Game {
             drawn: (0, 0),
             save_dir,
             last_checkpoint: Instant::now(),
+            pending_save: None,
             save_error: None,
             load_notice: startup_error,
             bench,
@@ -1356,6 +1379,9 @@ impl Game {
 
     /// Puts a loaded world in place of the current one.
     fn install(&mut self, l: Loaded) {
+        // Entering another world already saved; deleting the current one must also
+        // wait for any writer before its directory can be removed.
+        let _ = self.finish_autosave();
         self.world = l.world;
         self.player = l.player;
         self.inv = l.inv;
@@ -1415,7 +1441,7 @@ impl Game {
             }
         };
         self.install(loaded);
-        self.checkpoint();
+        self.start_autosave();
         self.goto(Screen::Play);
     }
 
@@ -1433,10 +1459,9 @@ impl Game {
         self.worlds = list_worlds();
     }
 
-    fn write_checkpoint(&mut self) -> std::io::Result<()> {
-        let Some(d) = &self.save_dir else { return Ok(()) };
-        let checkpoint = save::Checkpoint::begin(d)?;
-        let d = checkpoint.dir();
+    fn capture_checkpoint(&self) -> Option<SaveSnapshot> {
+        let root = self.save_dir.as_ref()?;
+        let mut files = save::Snapshot::new(root.clone());
         let p = &self.player;
         let mut s = format!("{} {} {} {} {}\n{}", p.pos.x, p.pos.y, p.pos.z, p.yaw, p.pitch, self.inv.save_stacks());
         s += &format!("\nsel {}\n", self.sel);
@@ -1449,23 +1474,85 @@ impl Game {
         }
         s += &format!("xp {} {}\n", self.level, self.xp);
         s += &format!("weather {} {} {}\n", self.weather.want, self.weather.timer, self.weather.storm as u8);
-        std::fs::write(d.join("player.txt"), s)?;
+        files.text("player.txt", s);
         let gates: String = self.gates.iter().map(|g| format!("{} {} {} {} {}\n", g.deep as u8, g.at.x, g.at.y, g.at.z, g.axis)).collect();
-        std::fs::write(d.join("gates.txt"), gates)?;
-        trade::save_uses(&self.trade_uses, &d.join("trades.txt"))?;
+        files.text("gates.txt", gates);
+        files.text("trades.txt", trade::encode_uses(&self.trade_uses));
         // the rest belongs to the world the player is in
-        let d = if self.world.is_deep() { d.join("deep") } else { d };
-        self.world.stage_chunks(&d)?;
-        self.pickups.save(&d.join("drops.txt"))?;
-        loot::save_chests(&self.chests, &d.join("chests.txt"))?;
-        furnace::save(&self.furnaces, &d.join("furnaces.txt"))?;
-        self.boats.save(&d.join("boats.txt"))?;
-        self.mobs.save(&d.join("animals.txt"))?;
-        self.fluids.save(&d.join("fluids.txt"))?;
-        self.settle.save(&d.join("settle.txt"))?;
-        checkpoint.commit()?;
-        self.world.checkpoint_committed();
+        let d = PathBuf::from(if self.world.is_deep() { "deep" } else { "" });
+        let chunks = self.world.snapshot_chunks();
+        for (key, data) in &chunks {
+            files.chunk(d.join(format!("c.{}.{}.bin", key.0, key.1)), data.clone());
+        }
+        files.text(d.join("updates.txt"), self.world.encode_updates());
+        files.text(d.join("drops.txt"), self.pickups.encode());
+        files.text(d.join("chests.txt"), loot::encode_chests(&self.chests));
+        files.text(d.join("furnaces.txt"), furnace::encode(&self.furnaces));
+        files.text(d.join("boats.txt"), self.boats.encode());
+        files.text(d.join("animals.txt"), self.mobs.encode());
+        files.text(d.join("fluids.txt"), self.fluids.encode());
+        files.text(d.join("settle.txt"), self.settle.encode());
+        Some(SaveSnapshot { files, chunks })
+    }
+
+    fn finish_autosave(&mut self) -> std::io::Result<()> {
+        if let Some(pending) = self.pending_save.take() {
+            pending.writer.wait()?;
+            self.world.snapshot_committed(&pending.chunks);
+            if std::env::var_os("CUBEWILD_PROF").is_some() {
+                println!("autosave completed in {:.1}ms on the save worker", pending.started.elapsed().as_secs_f64() * 1000.0);
+            }
+        }
         Ok(())
+    }
+
+    fn start_autosave(&mut self) -> bool {
+        if self.pending_save.is_some() { return true; }
+        let started = Instant::now();
+        let Some(snapshot) = self.capture_checkpoint() else { return true };
+        self.last_checkpoint = Instant::now();
+        match save::Background::start(snapshot.files) {
+            Ok(writer) => {
+                self.pending_save = Some(PendingSave { writer, chunks: snapshot.chunks, started });
+                if std::env::var_os("CUBEWILD_PROF").is_some() {
+                    println!("autosave capture {:.2}ms", started.elapsed().as_secs_f64() * 1000.0);
+                }
+                true
+            }
+            Err(e) => {
+                self.report_save_error(e);
+                false
+            }
+        }
+    }
+
+    fn poll_autosave(&mut self) -> bool {
+        if self.pending_save.as_ref().is_some_and(|p| p.writer.is_finished()) {
+            self.last_checkpoint = Instant::now();
+            if let Err(e) = self.finish_autosave() {
+                self.report_save_error(e);
+                return false;
+            }
+            self.save_error = None;
+        }
+        true
+    }
+
+    fn write_checkpoint(&mut self) -> std::io::Result<()> {
+        // A manual retry also recovers a failed older journal before writing the
+        // current state. There is never more than one writer for this world.
+        let _ = self.finish_autosave();
+        if let Some(snapshot) = self.capture_checkpoint() {
+            snapshot.files.commit()?;
+            self.world.snapshot_committed(&snapshot.chunks);
+        }
+        Ok(())
+    }
+
+    fn report_save_error(&mut self, error: std::io::Error) {
+        let message = format!("Save failed: {error}. Your world is still open; retry saving before leaving.");
+        eprintln!("cubewild: {message}");
+        self.save_error = Some(message);
     }
 
     fn checkpoint(&mut self) -> bool {
@@ -1477,9 +1564,7 @@ impl Game {
                 true
             }
             Err(e) => {
-                let message = format!("Save failed: {e}. Your world is still open; retry saving before leaving.");
-                eprintln!("cubewild: {message}");
-                self.save_error = Some(message);
+                self.report_save_error(e);
                 false
             }
         }
@@ -1527,7 +1612,7 @@ impl Game {
             self.throw(left);
         }
         if screen != Screen::Play && matches!(self.screen, Screen::Play | Screen::Inventory | Screen::Chest | Screen::Furnace | Screen::Trade) {
-            self.checkpoint();
+            self.start_autosave();
         }
         if self.screen == Screen::Settings && screen != Screen::Settings {
             self.settings.save();
@@ -1834,7 +1919,7 @@ impl Game {
                 }
             }
         }
-        self.world.set_many(&self.gfx, &edits);
+        self.world.set_many(&edits);
         self.gates.push(Gate { deep: self.world.is_deep(), at: lo, axis });
         let mid = (lo.as_vec3() + hi.as_vec3()) * 0.5 + 0.5;
         self.audio.play_at(Snd::GateOpen, mid, 1.2, 1.0);
@@ -1874,7 +1959,7 @@ impl Game {
         let deep = self.world.is_deep();
         self.gates.retain(|g| g.deep != deep || !out.contains(&g.at));
         let edits: Vec<(IVec3, Block)> = out.iter().map(|&c| (c, AIR)).collect();
-        self.world.set_many(&self.gfx, &edits);
+        self.world.set_many(&edits);
         let mid = out[0].as_vec3() + 0.5;
         self.audio.play_at(Snd::Fizz, mid, 1.0, 0.6);
     }
@@ -2006,7 +2091,7 @@ impl Game {
                 }
             }
         }
-        self.world.set_many(&self.gfx, &edits);
+        self.world.set_many(&edits);
         let at = IVec3::new(fx, fy + 1, fz);
         self.gates.push(Gate { deep: self.world.is_deep(), at, axis });
         self.player.pos = at.as_vec3() + Vec3::new(1.0, 0.0, 0.5);
@@ -2131,7 +2216,7 @@ impl Game {
                 }
             }
         }
-        let broken = self.world.set_many(&self.gfx, &edits);
+        let broken = self.world.set_many(&edits);
         let cells: Vec<IVec3> = broken.iter().map(|b| b.0).collect();
         self.check_gates(&cells);
         self.weather.dirty();
@@ -2483,7 +2568,7 @@ impl Game {
         if creative || progress >= items::break_time(b, tool) {
             self.mining = None;
             self.primary_cd = if creative { 0.22 } else { 0.0 };
-            if self.world.set_block(&self.gfx, p.x, p.y, p.z, AIR) {
+            if self.world.set_block(p.x, p.y, p.z, AIR) {
                 self.check_gates(&[p]);
                 self.quiet = creative;
                 self.dig_acc = 0.0;
@@ -2554,21 +2639,21 @@ impl Game {
                     // the other half goes with it
                     let y = if door_upper(b) { p.y - 1 } else { p.y + 1 };
                     if is_door(self.world.get_block(p.x, y, p.z)) {
-                        self.world.set_block(&self.gfx, p.x, y, p.z, AIR);
+                        self.world.set_block(p.x, y, p.z, AIR);
                     }
                 }
                 // doors, torches and plants standing on the block come loose
                 let above = self.world.get_block(p.x, p.y + 1, p.z);
                 let up = at + Vec3::Y;
                 if is_door(above) && !door_upper(above) {
-                    if self.world.set_pair(&self.gfx, p.x, p.y + 1, p.z, AIR, AIR) {
+                    if self.world.set_pair(p.x, p.y + 1, p.z, AIR, AIR) {
                         self.spill(up, items::door_item(above), 1);
                     }
-                } else if (above == TORCH || is_plant(above)) && self.world.set_block(&self.gfx, p.x, p.y + 1, p.z, AIR) {
+                } else if (above == TORCH || is_plant(above)) && self.world.set_block(p.x, p.y + 1, p.z, AIR) {
                     self.spill(up, items::drop_for(above, tool), 1);
                     // (a stand of reeds falls whole)
                     let mut y = p.y + 2;
-                    while above == REEDS && self.world.get_block(p.x, y, p.z) == REEDS && self.world.set_block(&self.gfx, p.x, y, p.z, AIR) {
+                    while above == REEDS && self.world.get_block(p.x, y, p.z) == REEDS && self.world.set_block(p.x, y, p.z, AIR) {
                         self.spill(up, items::FIBER, 1);
                         y += 1;
                     }
@@ -2584,7 +2669,7 @@ impl Game {
                     } else {
                         continue;
                     };
-                    if self.world.set_block(&self.gfx, c.x, c.y, c.z, AIR) {
+                    if self.world.set_block(c.x, c.y, c.z, AIR) {
                         self.spill(c.as_vec3() + 0.5, item, 1);
                     }
                 }
@@ -2656,7 +2741,7 @@ impl Game {
                         // found in a cave and opened for the first time: from now on an
                         // ordinary chest holding what was left in it
                         self.chests.insert(p, loot::roll_chest(self.world.seed, p, self.world.is_deep()));
-                        self.world.set_block(&self.gfx, p.x, p.y, p.z, CHEST);
+                        self.world.set_block(p.x, p.y, p.z, CHEST);
                         self.say("You found a chest".into());
                     }
                     self.chests.entry(p).or_insert([Stack::default(); items::CHEST_SLOTS]);
@@ -2669,7 +2754,7 @@ impl Game {
                     let turned = TRAP_BASE + ((b - TRAP_BASE) ^ TRAP_OPEN);
                     if !self.fits(p, turned) {
                         self.say("Something is in the way of the trapdoor".into());
-                    } else if self.world.set_block(&self.gfx, p.x, p.y, p.z, turned) {
+                    } else if self.world.set_block(p.x, p.y, p.z, turned) {
                         self.audio.play_var(Snd::Door, p.as_vec3() + 0.5, 0.7);
                     }
                     return;
@@ -2677,7 +2762,7 @@ impl Game {
                 BED if self.world.is_deep() => {
                     // no sleeping down here
                     self.place_cd = 0.6;
-                    self.world.set_block(&self.gfx, p.x, p.y, p.z, AIR);
+                    self.world.set_block(p.x, p.y, p.z, AIR);
                     self.explode(p.as_vec3() + 0.5, 3.0);
                     self.say("Beds don't work in the Emberdeep".into());
                     return;
@@ -2731,9 +2816,9 @@ impl Game {
                     let soil = { let b = self.world.get_block(p.x, p.y, p.z); b == DIRT || is_grassy(b) };
                     if soil && (above == AIR || is_tuft(above)) {
                         if above != AIR {
-                            self.world.set_block(&self.gfx, p.x, p.y + 1, p.z, AIR);
+                            self.world.set_block(p.x, p.y + 1, p.z, AIR);
                         }
-                        if self.world.set_block(&self.gfx, p.x, p.y, p.z, FARMLAND) {
+                        if self.world.set_block(p.x, p.y, p.z, FARMLAND) {
                             self.wear_held();
                         }
                     }
@@ -2746,7 +2831,7 @@ impl Game {
             items::SEEDS => {
                 if let Some((p, n, _)) = target {
                     if n.y == 1 && self.world.get_block(p.x, p.y, p.z) == FARMLAND && self.world.get_block(p.x, p.y + 1, p.z) == AIR {
-                        if self.world.set_block(&self.gfx, p.x, p.y + 1, p.z, WHEAT_0) {
+                        if self.world.set_block(p.x, p.y + 1, p.z, WHEAT_0) {
                             self.spend();
                         }
                     } else {
@@ -2761,7 +2846,7 @@ impl Game {
                 if let Some((w, _, _)) = hit {
                     let b = self.world.get_block(w.x, w.y, w.z);
                     let full = if b == WATER { items::WATER_BUCKET } else if b == LAVA { items::LAVA_BUCKET } else { return };
-                    if self.world.set_block(&self.gfx, w.x, w.y, w.z, AIR) {
+                    if self.world.set_block(w.x, w.y, w.z, AIR) {
                         self.audio.play_var(if b == WATER { Snd::Swim } else { Snd::Fizz }, w.as_vec3() + 0.5, 0.9);
                         self.inv.slots[self.sel] = Stack::new(full, 1);
                     }
@@ -2775,11 +2860,11 @@ impl Game {
                     let was = self.world.get_block(q.x, q.y, q.z);
                     if is_water(was) {
                         // poured into water it hardens at once
-                        if self.world.set_block(&self.gfx, q.x, q.y, q.z, if was == WATER { CINDERSTONE } else { COBBLE }) {
+                        if self.world.set_block(q.x, q.y, q.z, if was == WATER { CINDERSTONE } else { COBBLE }) {
                             self.inv.slots[self.sel] = Stack::new(items::BUCKET, 1);
                             self.hiss(here);
                         }
-                    } else if is_replaceable(was) && self.world.set_block(&self.gfx, q.x, q.y, q.z, LAVA) {
+                    } else if is_replaceable(was) && self.world.set_block(q.x, q.y, q.z, LAVA) {
                         self.audio.play_var(Snd::Fizz, here, 0.6);
                         self.inv.slots[self.sel] = Stack::new(items::BUCKET, 1);
                     }
@@ -2803,11 +2888,11 @@ impl Game {
                     let was = self.world.get_block(q.x, q.y, q.z);
                     if was == LAVA {
                         // water poured on lava: it hardens into cinderstone
-                        if self.world.set_block(&self.gfx, q.x, q.y, q.z, CINDERSTONE) {
+                        if self.world.set_block(q.x, q.y, q.z, CINDERSTONE) {
                             self.inv.slots[self.sel] = Stack::new(items::BUCKET, 1);
                             self.hiss(here);
                         }
-                    } else if is_replaceable(was) && self.world.set_block(&self.gfx, q.x, q.y, q.z, WATER) {
+                    } else if is_replaceable(was) && self.world.set_block(q.x, q.y, q.z, WATER) {
                         self.audio.play_var(Snd::Splash, here, 0.5);
                         self.inv.slots[self.sel] = Stack::new(items::BUCKET, 1);
                         // and the lava it touches hardens
@@ -2819,7 +2904,7 @@ impl Game {
                             }
                         }
                         if !hard.is_empty() {
-                            self.world.set_many(&self.gfx, &hard);
+                            self.world.set_many(&hard);
                             self.hiss(here);
                         }
                     }
@@ -2911,7 +2996,7 @@ impl Game {
         if !self.fits(at, block) {
             return;
         }
-        if self.world.set_block(&self.gfx, at.x, at.y, at.z, block) {
+        if self.world.set_block(at.x, at.y, at.z, block) {
             self.spend();
             self.weather.dirty();
             self.audio.play_var(Snd::Place(audio::surface(block)), at.as_vec3() + 0.5, 0.8);
@@ -2944,7 +3029,7 @@ impl Game {
         }
         edits.push((at(-1, 0, 4), GRASS));
         edits.push((at(-1, 1, 4), SAPLING));
-        self.world.set_many(&self.gfx, &edits);
+        self.world.set_many(&edits);
         self.player.pos.y = (g + 1) as f32;
         self.test_fluid_at = Some((IVec3::new(c.x, g, c.z), 0.0));
         true
@@ -3061,10 +3146,10 @@ impl Game {
         for (i, st) in [Stack::new(COBBLE, 5), Stack::new(PLANKS, 1), Stack::new(items::IRON_PICK, 1), Stack::new(items::STICK, 3), Stack::new(items::STAIRS, 2)].into_iter().enumerate() {
             self.pickups.spawn(Vec3::new(ox as f32 - 0.6, y0 as f32 + 0.5, oz as f32 + 2.6 + i as f32 * 0.45), Vec3::ZERO, st, 0.0);
         }
-        self.world.set_block(&self.gfx, ox + 3, y0 + 2, oz + 3, LAMP);
+        self.world.set_block(ox + 3, y0 + 2, oz + 3, LAMP);
         // torches on the west and north walls
-        self.world.set_block(&self.gfx, ox + 1, y0 + 2, oz + 2, WALL_TORCH);
-        self.world.set_block(&self.gfx, ox + 3, y0 + 2, oz + 1, WALL_TORCH + 2);
+        self.world.set_block(ox + 1, y0 + 2, oz + 2, WALL_TORCH);
+        self.world.set_block(ox + 3, y0 + 2, oz + 1, WALL_TORCH + 2);
         let p = &mut self.player;
         if inside {
             (p.pos, p.yaw, p.pitch) = (Vec3::new(ox as f32 + 2.5, y0 as f32 + 0.01, oz as f32 + 3.5), 1.2, 0.0);
@@ -3104,7 +3189,7 @@ impl Game {
             self.say("Something is in the way of the door".into());
             return;
         }
-        if self.world.set_pair(&self.gfx, p.x, y, p.z, lower, upper) {
+        if self.world.set_pair(p.x, y, p.z, lower, upper) {
             self.audio.play_var(Snd::Door, p.as_vec3() + 0.5, 0.75);
         }
     }
@@ -3131,7 +3216,7 @@ impl Game {
         if self.door_blocked(q, lower) {
             return;
         }
-        if self.world.set_pair(&self.gfx, q.x, q.y, q.z, lower, lower + DOOR_UPPER) {
+        if self.world.set_pair(q.x, q.y, q.z, lower, lower + DOOR_UPPER) {
             self.spend();
         }
     }
@@ -3424,6 +3509,9 @@ impl Game {
         }
 
         // ---- simulate
+        if !self.poll_autosave() {
+            self.goto(Screen::Pause);
+        }
         let pc = ((self.player.pos.x.floor() as i32) >> 4, (self.player.pos.z.floor() as i32) >> 4);
         let t0 = Instant::now();
         if self.screen != Screen::Title {
@@ -3479,7 +3567,11 @@ impl Game {
         };
         if let Some(b) = &mut self.bench {
             b.t += real_dt;
-            input = Input { forward: 1.0, ..Default::default() };
+            if b.terrain_ready.is_none() && self.world.chunks.get(&pc).is_some_and(|s| s.mesh.is_some()) {
+                b.terrain_ready = Some(b.t);
+            }
+            let edit_bench = std::env::var_os("CUBEWILD_BENCH_EDITS").is_some();
+            input = Input { forward: if edit_bench { 0.0 } else { 1.0 }, ..Default::default() };
             self.player.flying = true;
             self.player.yaw +=
                 std::env::var("CUBEWILD_BENCH_TURN").ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(0.12) * dt;
@@ -3497,7 +3589,7 @@ impl Game {
                 let over = f.iter().filter(|t| **t > 1.0 / 120.0).count();
                 let (w, h) = self.gfx.size();
                 println!(
-                    "BENCH {w}x{h} dist={} frames={} avg_fps={:.1} low1pct_fps={:.1} worst_ms={:.2} frames_over_8.3ms={} chunks_drawn={} quads={}",
+                    "BENCH {w}x{h} dist={} frames={} avg_fps={:.1} low1pct_fps={:.1} worst_ms={:.2} frames_over_8.3ms={} chunks_drawn={} quads={} terrain_ready_ms={:.1} chunks_loaded={} chunks_meshed={}",
                     self.world.radius,
                     f.len(),
                     1.0 / avg,
@@ -3505,8 +3597,12 @@ impl Game {
                     f[0] * 1000.0,
                     over,
                     self.drawn.0,
-                    self.drawn.1
+                    self.drawn.1,
+                    b.terrain_ready.unwrap_or(-0.001) * 1000.0,
+                    self.world.chunks.len(),
+                    self.world.chunks.values().filter(|s| s.mesh.is_some()).count(),
                 );
+                if self.save_dir.is_some() { self.checkpoint(); }
                 el.exit();
                 return;
             }
@@ -3524,7 +3620,7 @@ impl Game {
             // falling sand and gravel, wilting leaves
             let touched = self.world.take_ready_updates();
             let creative = self.mode == Mode::Creative;
-            for (p, b) in self.fluids.update(&mut self.world, &self.gfx, dt, &touched) {
+            for (p, b) in self.fluids.update(&mut self.world, dt, &touched) {
                 // (running water carries off torches and plants, which drop)
                 let drop = items::drop_for(b, AIR);
                 if drop != AIR && !creative {
@@ -3532,7 +3628,7 @@ impl Game {
                 }
             }
             let body = (self.player.pos, self.player.height());
-            let settled = self.settle.update(&mut self.world, &self.gfx, &mut self.rng, dt, &touched, body);
+            let settled = self.settle.update(&mut self.world, &mut self.rng, dt, &touched, body);
             for (at, b) in settled.landed {
                 self.audio.play_var(Snd::Place(audio::surface(b)), at, 0.9);
             }
@@ -3790,7 +3886,7 @@ impl Game {
                 } else if is_sapling(b) && self.rng.f() < 0.35 {
                     // a sapling grows into its tree, if there is room
                     if let Some(tree) = settle::grow(&self.world, c, b, &mut self.rng) {
-                        self.world.set_many(&self.gfx, &tree);
+                        self.world.set_many(&tree);
                     }
                 }
             }
@@ -3832,11 +3928,27 @@ impl Game {
             }
         }
 
-        if simulate && self.arrival.is_none() && self.save_dir.is_some()
-            && self.last_checkpoint.elapsed().as_secs() >= 30 && !self.checkpoint()
+        if simulate && self.arrival.is_none() && self.save_dir.is_some() && self.pending_save.is_none()
+            && self.last_checkpoint.elapsed().as_secs() >= 30 && !self.start_autosave()
         {
             self.goto(Screen::Pause);
         }
+
+        // Repeatable stress test for editing a corner shared by four chunk meshes.
+        if let Some(bench) = &mut self.bench {
+            if std::env::var_os("CUBEWILD_BENCH_EDITS").is_some() && bench.t > 6.0 && self.ready {
+                let tick = ((bench.t - 6.0) * 6.0) as u32;
+                if tick != bench.edit_tick {
+                    bench.edit_tick = tick;
+                    let p = self.player.pos.floor().as_ivec3();
+                    let (x, z) = ((p.x >> 4) * CW, (p.z >> 4) * CW);
+                    let y = (p.y + 3).clamp(1, CH - 2);
+                    self.world.set_block(x, y, z, if tick % 2 == 0 { AIR } else { PLANKS });
+                }
+            }
+        }
+
+        let t_sim = t0.elapsed().as_secs_f32() * 1000.0 - t_world;
 
         // ---- build the frame
         let (w, h) = self.gfx.size();
@@ -5119,7 +5231,7 @@ impl Game {
             let near = 1.0 - 0.35 * overcast;
             (mix3(base, srgb([232, 142, 92]), dusk), view_dist * 0.62 * near, (view_dist - 6.0) * (1.0 - 0.2 * overcast))
         };
-        let t_build = t0.elapsed().as_secs_f32() * 1000.0 - t_world;
+        let t_build = t0.elapsed().as_secs_f32() * 1000.0 - t_world - t_sim;
         let t1 = Instant::now();
         self.gfx.render(&Frame {
             view_proj: vp,
@@ -5145,11 +5257,12 @@ impl Game {
         self.item_verts = item_verts;
         self.sky = sky;
         let t_render = t1.elapsed().as_secs_f32() * 1000.0;
+        let work_ms = t0.elapsed().as_secs_f32() * 1000.0;
         if std::env::var_os("CUBEWILD_PROF").is_some()
-            && real_dt > 0.009
-            && self.bench.as_ref().map_or(false, |b| b.t > 6.0)
+            && work_ms > if self.bench.is_some() { 9.0 } else { 22.0 }
+            && self.bench.as_ref().is_none_or(|b| b.t > 6.0)
         {
-            println!("slow frame {:.1}ms: world {:.2} build {:.2} render {:.2}", real_dt * 1000.0, t_world, t_build, t_render);
+            println!("slow frame work {work_ms:.1}ms: world {t_world:.2} simulation {t_sim:.2} build {t_build:.2} render {t_render:.2}");
         }
 
         // a click that did something clicks
