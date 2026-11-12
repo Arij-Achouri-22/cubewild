@@ -326,7 +326,7 @@ pub fn near(seed: u32, x0: i32, z0: i32, x1: i32, z1: i32, pad: i32) -> Vec<Arc<
 
 /// Builds into a chunk the part of any village that falls inside it. `h` gives the height
 /// of the ground of the chunk's own columns.
-pub fn stamp(seed: u32, cx: i32, cz: i32, blocks: &mut [u8], h: &dyn Fn(i32, i32) -> i32) {
+pub fn stamp(seed: u32, cx: i32, cz: i32, blocks: &mut [Block], h: &dyn Fn(i32, i32) -> i32) {
     let (ox, oz) = (cx * CW, cz * CW);
     for v in near(seed, ox, oz, ox + CW - 1, oz + CW - 1, REACH) {
         v.build(&mut Edit { blocks, ox, oz }, h);
@@ -335,7 +335,7 @@ pub fn stamp(seed: u32, cx: i32, cz: i32, blocks: &mut [u8], h: &dyn Fn(i32, i32
 
 /// Writes blocks by world position into one chunk; whatever lies outside it is dropped.
 struct Edit<'a> {
-    blocks: &'a mut [u8],
+    blocks: &'a mut [Block],
     ox: i32,
     oz: i32,
 }
@@ -455,8 +455,9 @@ impl Village {
                 } else if if l.along_x() { z == (l.z0 + l.z1) / 2 } else { x == (l.x0 + l.x1) / 2 } {
                     e.level(x, z, l.g, DIRT, WATER);
                 } else {
-                    e.level(x, z, l.g, DIRT, FARMLAND);
-                    e.set(x, l.g + 1, z, WHEAT_0 + (hash2(l.r, x, z) % 4) as Block);
+                    e.level(x, z, l.g, DIRT, crate::farming::WET_FARMLAND + 6);
+                    let base = match (x + z).rem_euclid(3) { 0 => crate::farming::CARROTS, 1 => crate::farming::POTATOES, _ => WHEAT_0 };
+                    e.set(x, l.g + 1, z, base + (hash2(l.r, x, z) % 4) as Block);
                 }
             }
         }
@@ -509,7 +510,7 @@ impl Village {
             }
         }
         // the door stands open, so that the people of the house can come and go
-        let door = DOOR_BASE + l.side + DOOR_OPEN + p.door;
+        let door = DOOR_BASE + l.side as Block + DOOR_OPEN + p.door;
         e.set(doorx, y0, doorz, door);
         e.set(doorx, y0 + 1, doorz, door + DOOR_UPPER);
 
@@ -533,8 +534,8 @@ impl Village {
                 // (the block of the lower row, of the upper row, and of a ridge between them)
                 let (low, high, ridge) = match p.roof {
                     Roof::Stairs(mat) => {
-                        let s = STAIR_BASE + (mat << 3);
-                        if along_x { (s + 3, s + 2, SLAB + mat) } else { (s + 1, s, SLAB + mat) }
+                        let s = STAIR_BASE + ((mat as Block) << 3);
+                        if along_x { (s + 3, s + 2, SLAB + mat as Block) } else { (s + 1, s, SLAB + mat as Block) }
                     }
                     Roof::Blocks(b) => (b, b, b),
                     Roof::Flat(..) => unreachable!(),

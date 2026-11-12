@@ -108,6 +108,9 @@ pub struct Pointer {
     pub down: bool,
     /// right button pressed this frame
     pub rclicked: bool,
+    pub rdown: bool,
+    pub released: bool,
+    pub rreleased: bool,
 }
 
 pub struct Ui<'a> {

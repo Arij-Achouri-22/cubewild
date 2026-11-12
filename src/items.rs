@@ -3,7 +3,7 @@
 use crate::world::*;
 
 /// Block items share their id with the block. Other items start at 64.
-pub type Item = u8;
+pub type Item = u16;
 pub const STICK: Item = 64;
 pub const MEAT: Item = 65;
 pub const HIDE: Item = 66;
@@ -106,7 +106,18 @@ pub const PYRE_BOOTS: Item = 198;
 /// oak, birch, pine, jungle, acacia saplings (+ n of `world::SAPLING` + n)
 pub const SAPLING_ITEM: Item = 199;
 pub const LAVA_BUCKET: Item = 204;
-pub const ITEM_END: Item = 205;
+pub const ANVIL_ITEM: Item = 205;
+pub const ENCHANTING_ITEM: Item = 206;
+pub const SHIELD: Item = 207;
+pub const CARROT: Item = 208;
+pub const POTATO: Item = 209;
+pub const BAKED_POTATO: Item = 210;
+pub const OAK_GATE: Item = 211;
+pub const BIRCH_GATE: Item = 212;
+pub const SIGN_ITEM: Item = 213;
+pub const EXTRA_SLAB: Item = 214;
+pub const EXTRA_STAIRS: Item = 218;
+pub const ITEM_END: Item = 222;
 /// slots in a chest
 pub const CHEST_SLOTS: usize = 27;
 /// first texture layer holding item icons
@@ -116,7 +127,7 @@ pub const ICON_FOOD: u32 = ICON_BASE + 101;
 pub const ICON_AIR: u32 = ICON_BASE + 102;
 
 pub fn is_block(i: Item) -> bool {
-    (i != AIR && i < 64) || is_wool_item(i) || (DEEP_ITEM..DEEP_ITEM + DEEP_BLOCKS).contains(&i) || is_extra_item(i) || is_sapling_item(i)
+    (OAK_GATE..ITEM_END).contains(&i) || (ANVIL_ITEM..=ENCHANTING_ITEM).contains(&i) || (i != AIR && i < 64) || is_wool_item(i) || (DEEP_ITEM..DEEP_ITEM + DEEP_BLOCKS).contains(&i) || is_extra_item(i) || is_sapling_item(i)
 }
 
 pub fn is_sapling_item(i: Item) -> bool {
@@ -132,8 +143,14 @@ pub fn is_wool_item(i: Item) -> bool {
 }
 
 /// The block an item puts down (most block items are their own block).
+pub fn slab_material(i:Item)->Option<Block> {if (SLAB..SLAB_END).contains(&i) {Some(i-SLAB)} else if (EXTRA_SLAB..EXTRA_SLAB+4).contains(&i) {Some(4+i-EXTRA_SLAB)} else {None}}
+pub fn stair_material(i:Item)->Option<Block> {if (STAIRS..STAIRS+4).contains(&i) {Some(i-STAIRS)} else if (EXTRA_STAIRS..EXTRA_STAIRS+4).contains(&i) {Some(4+i-EXTRA_STAIRS)} else {None}}
 pub fn block_of(i: Item) -> Block {
-    if is_wool_item(i) {
+    if let Some(mat)=slab_material(i) {return crate::building::slab(mat,false);}
+    if let Some(mat)=stair_material(i) {return crate::building::stairs(mat,0,false);}
+    if i==OAK_GATE || i==BIRCH_GATE {return crate::building::FENCE_GATE+(i-OAK_GATE)*4;}
+    if i==SIGN_ITEM {return crate::building::SIGN;}
+    if i == ANVIL_ITEM { ANVIL } else if i == ENCHANTING_ITEM { ENCHANTING_TABLE } else if is_wool_item(i) {
         WOOL + (i - WOOL_ITEM)
     } else if (DEEP_ITEM..DEEP_ITEM + DEEP_BLOCKS).contains(&i) {
         CINDERSTONE + (i - DEEP_ITEM)
@@ -148,7 +165,7 @@ pub fn block_of(i: Item) -> Block {
 
 /// The colour of a dye item.
 pub fn dye_colour(i: Item) -> Option<u8> {
-    (DYE..DYE + 16).contains(&i).then(|| i - DYE)
+    (DYE..DYE + 16).contains(&i).then(|| (i - DYE) as u8)
 }
 
 pub fn valid(i: Item) -> bool {
@@ -159,6 +176,15 @@ pub fn valid(i: Item) -> bool {
 
 pub fn name(i: Item) -> &'static str {
     match i {
+        OAK_GATE => "Oak Fence Gate", BIRCH_GATE => "Birch Fence Gate", SIGN_ITEM => "Sign",
+        EXTRA_SLAB => "Brick Slab", i if i==EXTRA_SLAB+1 => "Sandstone Slab", i if i==EXTRA_SLAB+2 => "Slate Slab", i if i==EXTRA_SLAB+3 => "Cinderwood Slab",
+        EXTRA_STAIRS => "Brick Stairs", i if i==EXTRA_STAIRS+1 => "Sandstone Stairs", i if i==EXTRA_STAIRS+2 => "Slate Stairs", i if i==EXTRA_STAIRS+3 => "Cinderwood Stairs",
+        CARROT => "Carrot",
+        POTATO => "Potato",
+        BAKED_POTATO => "Baked Potato",
+        ANVIL_ITEM => "Anvil",
+        ENCHANTING_ITEM => "Enchanting Table",
+        SHIELD => "Shield",
         GRASS => "Grass",
         ICE => "Ice",
         RED_SAND => "Red Sand",
@@ -362,6 +388,8 @@ pub fn name(i: Item) -> &'static str {
 
 /// Texture-array layer used as the item's icon.
 pub fn icon(i: Item) -> u32 {
+    if (CARROT..=BAKED_POTATO).contains(&i) { return crate::textures::NEW_TEX as u32 + 12 + (i - CARROT) as u32; }
+    if i == SHIELD { return crate::textures::NEW_TEX as u32 + 2; }
     if (SLAB..=BIRCH_FENCE).contains(&i) {
         // a picture of the shape rather than a face of it
         crate::textures::SHAPE_ICONS as u32 + (i - SLAB) as u32
@@ -380,7 +408,7 @@ pub fn icon(i: Item) -> u32 {
     } else if is_wool_item(i) || is_extra_item(i) || is_sapling_item(i) || (DEEP_ITEM..DEEP_ITEM + DEEP_BLOCKS).contains(&i) {
         tex_for(block_of(i), if block_of(i) == EMBER_MOSS { 2 } else { 0 })
     } else if is_block(i) {
-        tex_for(i, if i == FURNACE { 4 } else { 0 })
+        tex_for(block_of(i), if i == FURNACE { 4 } else { 0 })
     } else {
         ICON_BASE + (i - 64) as u32
     }
@@ -494,6 +522,7 @@ fn pick_tier(i: Item) -> u8 {
 
 /// How many uses an item survives (0 = never wears out).
 pub fn max_wear(i: Item) -> u16 {
+    if i == SHIELD { return 336; }
     if i == STRIKER {
         return 64;
     }
@@ -506,7 +535,10 @@ pub fn max_wear(i: Item) -> u16 {
             Mat::Crystal => 900,
             Mat::Pyre => 2000,
         },
-        Some(_) => 0,
+        Some((kind, m)) => {
+            let base = match kind { Kind::Helmet => 11, Kind::Chest => 16, Kind::Legs => 15, _ => 13 };
+            base * match m { Mat::Leather | Mat::Wood => 5, Mat::Gold => 7, Mat::Iron | Mat::Stone => 15, Mat::Crystal => 33, Mat::Pyre => 37 }
+        },
         None => match i {
             SPEAR => 80,
             FLINT_KNIFE => 50,
@@ -521,6 +553,9 @@ pub fn max_wear(i: Item) -> u16 {
 /// Hunger restored by eating an item (0 = not food).
 pub fn food(i: Item) -> f32 {
     match i {
+        CARROT => 3.0,
+        POTATO => 1.0,
+        BAKED_POTATO => 5.0,
         MEAT | RAW_FISH => 2.5,
         BERRIES => 1.5,
         BREAD => 5.0,
@@ -566,10 +601,11 @@ pub fn kind(i: Item) -> &'static str {
         Some((Kind::Helmet | Kind::Chest | Kind::Legs | Kind::Boots, _)) => "Armour",
         Some(_) => "Tool",
         None => match i {
+            SHIELD => "Shield",
             SPEAR | FLINT_KNIFE | BOW | ARROW => "Weapon",
             SHEARS | BUCKET | WATER_BUCKET | LAVA_BUCKET | FISHING_ROD | COMPASS | CLOCK | BOAT => "Tool",
             i if is_sapling_item(i) => "Plant",
-            WORKBENCH | FURNACE | BED | TORCH | LAMP | OAK_DOOR | BIRCH_DOOR | CHEST | LADDER | TRAPDOOR => "Utility block",
+            ANVIL_ITEM | ENCHANTING_ITEM | OAK_GATE | BIRCH_GATE | SIGN_ITEM | WORKBENCH | FURNACE | BED | TORCH | LAMP | OAK_DOOR | BIRCH_DOOR | CHEST | LADDER | TRAPDOOR => "Utility block",
             STAIRS..=137 => "Block",
             i if food(i) > 0.0 => "Food",
             i if is_plant(i) => "Plant",
@@ -612,7 +648,7 @@ pub fn desc(i: Item) -> &'static str {
         CACTUS => "A prickly desert plant.",
         WORKBENCH => "Stand near it to craft advanced recipes.",
         FURNACE => "Smelts ore and cooks food. Needs fuel: coal, wood or sticks.",
-        TORCH => "Lights the dark. Glows in your hand too.",
+        TORCH => "Place it on a block or wall to light the dark.",
         LAMP => "A bright, steady light.",
         BED => "Right click to set your spawn and sleep through the night.",
         GRAVEL => "Loose stones from the sea bed. May hide flint.",
@@ -668,7 +704,13 @@ pub fn desc(i: Item) -> &'static str {
         i if dye_colour(i).is_some() => "Dyes wool and sheep. Mix two to get a new colour.",
         i if is_wool_item(i) => "Soft, coloured building block. Shear sheep or dye white wool.",
         FISHING_ROD => "Hold right click on water and wait for a bite.",
-        BOW => "Right click to shoot an arrow.",
+        SHIELD => "Hold right click to raise it and block attacks from the front.",
+        BOW => "Hold right click to draw, then release to shoot. A full draw takes one second.",
+        ANVIL_ITEM => "Right click to repair gear with experience and matching material.",
+        ENCHANTING_ITEM => "Right click to enchant equipment with levels and crystal.",
+        CARROT | POTATO => "Eat it, or plant it on farmland near water and light.",
+        OAK_GATE | BIRCH_GATE => "Right click to open or close. Keeps animals inside a fence.",
+        SIGN_ITEM => "Place to write; look to read; right click to edit.",
         ARROW => "Ammunition for the bow.",
         COMPASS => "Carry it to see your heading and the way to your spawn.",
         CLOCK => "Carry it to see the time of day.",
@@ -849,6 +891,21 @@ pub const RECIPES: &[Recipe] = &[
     r(Cat::Building, (BIRCH_FENCE, 3), &[(BIRCH_PLANKS, 4), (STICK, 2)], WORKBENCH),
     r(Cat::Building, (IRON_BLOCK, 1), &[(IRON_INGOT, 4)], WORKBENCH),
     r(Cat::Building, (GOLD_BLOCK, 1), &[(GOLD_INGOT, 4)], WORKBENCH),
+    r(Cat::Utility, (ANVIL_ITEM, 1), &[(IRON_BLOCK, 3), (IRON_INGOT, 4)], WORKBENCH),
+    r(Cat::Utility, (ENCHANTING_ITEM, 1), &[(EXTRA_ITEM, 4), (CRYSTAL, 2), (FIBER, 3)], WORKBENCH),
+    r(Cat::Combat, (SHIELD, 1), &[(PLANKS, 6), (IRON_INGOT, 1)], WORKBENCH),
+
+    r(Cat::Building,(OAK_GATE,1),&[(STICK,4),(PLANKS,2)],WORKBENCH),
+    r(Cat::Building,(BIRCH_GATE,1),&[(STICK,4),(BIRCH_PLANKS,2)],WORKBENCH),
+    r(Cat::Building,(SIGN_ITEM,3),&[(PLANKS,6),(STICK,1)],WORKBENCH),
+    r(Cat::Building,(EXTRA_SLAB+0,6),&[(BRICK,3)],WORKBENCH),
+    r(Cat::Building,(EXTRA_STAIRS+0,4),&[(BRICK,6)],WORKBENCH),
+    r(Cat::Building,(EXTRA_SLAB+1,6),&[(SANDSTONE,3)],WORKBENCH),
+    r(Cat::Building,(EXTRA_STAIRS+1,4),&[(SANDSTONE,6)],WORKBENCH),
+    r(Cat::Building,(EXTRA_SLAB+2,6),&[(EXTRA_ITEM,3)],WORKBENCH),
+    r(Cat::Building,(EXTRA_STAIRS+2,4),&[(EXTRA_ITEM,6)],WORKBENCH),
+    r(Cat::Building,(EXTRA_SLAB+3,6),&[(DEEP_ITEM+8,3)],WORKBENCH),
+    r(Cat::Building,(EXTRA_STAIRS+3,4),&[(DEEP_ITEM+8,6)],WORKBENCH),
 ];
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -857,12 +914,15 @@ pub struct Stack {
     pub n: u32,
     /// uses spent, for tools
     pub wear: u16,
+    pub enchants: u8,
 }
 
 impl Stack {
     pub fn new(item: Item, n: u32) -> Stack {
-        Stack { item, n, wear: 0 }
+        Stack { item, n, wear: 0, enchants: 0 }
     }
+
+    pub fn persist_wear(self) -> u32 { self.wear as u32 | (self.enchants as u32) << 16 }
 
     pub fn is_empty(&self) -> bool {
         self.n == 0
@@ -907,7 +967,7 @@ pub fn right_click_stack(held: &mut Stack, slot: &mut Stack, accepts: bool) {
             click_stack(held, slot, accepts);
         }
     } else if accepts && (s.is_empty() || (s.item == held.item && s.n < max_stack(s.item))) {
-        *slot = Stack { item: held.item, n: s.n + 1, wear: s.wear };
+        *slot = Stack { n: s.n + 1, ..*held };
         held.n -= 1;
         if held.n == 0 {
             *held = Stack::default();
@@ -935,7 +995,7 @@ pub fn stash_in(slots: &mut [Stack], st: Stack) -> Stack {
             break;
         }
         let k = n.min(max);
-        *s = Stack { item: st.item, n: k, wear: st.wear };
+        *s = Stack { n: k, ..st };
         n -= k;
     }
     if n > 0 { Stack { n, ..st } } else { Stack::default() }
@@ -952,20 +1012,26 @@ pub struct Inventory {
     pub slots: [Stack; SLOTS],
     /// the stack picked up with the mouse in the inventory screen
     pub held: Stack,
+    pub grid: [Stack; 9],
 }
 
 impl Inventory {
     pub fn new() -> Inventory {
-        Inventory { slots: [Stack::default(); SLOTS], held: Stack::default() }
+        Inventory { slots: [Stack::default(); SLOTS], held: Stack::default(), grid: [Stack::default(); 9] }
     }
 
     /// Cursor contents have their own record, even when every bag slot is occupied.
     pub fn save_stacks(&self) -> String {
         let mut text = String::from("slots");
         for (i, st) in self.slots.iter().enumerate().filter(|(_, st)| !st.is_empty()) {
-            text += &format!(" {}:{}:{}:{}", i, st.item, st.n, st.wear);
+            text += &format!(" {}:{}:{}:{}", i, st.item, st.n, st.persist_wear());
         }
-        text += &format!("\nheld {} {} {}\n", self.held.item, self.held.n, self.held.wear);
+        text += &format!("\nheld {} {} {}\n", self.held.item, self.held.n, self.held.persist_wear());
+        if self.grid.iter().any(|s| !s.is_empty()) {
+        text.push_str("grid");
+        for (i, st) in self.grid.iter().enumerate().filter(|(_, s)| !s.is_empty()) { text += &format!(" {}:{}:{}:{}", i, st.item, st.n, st.persist_wear()); }
+        text.push('\n');
+        }
         text
     }
 
@@ -976,7 +1042,9 @@ impl Inventory {
 
     /// Share of damage that gets through the armour worn.
     pub fn armor_factor(&self) -> f32 {
-        1.0 - self.slots[ARMOR..].iter().filter_map(|s| armor(s.item)).map(|a| a.1).sum::<f32>()
+        let base = 1.0 - self.slots[ARMOR..].iter().filter_map(|s| armor(s.item)).map(|a| a.1).sum::<f32>();
+        let protection: u32 = self.slots[ARMOR..].iter().filter(|s| !s.is_empty()).map(|&s| crate::equipment::Enchant::Protection.level(s) as u32).sum();
+        base * (1.0 - 0.04 * protection.min(20) as f32)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -998,7 +1066,7 @@ impl Inventory {
         if s.is_empty() || s.item == i {
             let k = n.min(max_stack(i).saturating_sub(s.n));
             if k > 0 {
-                *s = Stack { item: i, n: s.n + k, wear: s.wear };
+                *s = Stack { item: i, n: s.n + k, wear: s.wear, enchants: s.enchants };
             }
             n - k
         } else {
@@ -1072,6 +1140,7 @@ impl Inventory {
     }
 
     /// Spends one use of the tool in `slot`. Returns true if it just broke.
+    #[cfg(test)]
     pub fn wear_tool(&mut self, slot: usize) -> bool {
         let s = &mut self.slots[slot];
         let max = max_wear(s.item);
@@ -1101,8 +1170,8 @@ impl Inventory {
                 return false;
             }
         }
-        let left = next.add(r.out.0, r.out.1);
-        if !stash_in(std::slice::from_mut(&mut next.held), Stack::new(r.out.0, left)).is_empty() {
+        let left = next.pick_up(crate::equipment::craft_output(r,&self.slots));
+        if !stash_in(std::slice::from_mut(&mut next.held), left).is_empty() {
             return false;
         }
         *self = next;
@@ -1122,10 +1191,11 @@ impl Inventory {
         if !self.can_craft(r) {
             return false;
         }
+        let output=crate::equipment::craft_output(r,&self.slots);
         for &(i, n) in r.ins {
             self.take(i, n);
         }
-        self.held = Stack::new(r.out.0, self.held.n + r.out.1);
+        self.held = Stack { n:self.held.n+r.out.1,..output };
         true
     }
 
@@ -1170,6 +1240,7 @@ impl Inventory {
 
     /// Puts the mouse stack back when the inventory closes.
     pub fn stow_held(&mut self) {
+        for i in 0..9 { self.grid[i] = self.stash(0..BAG_END, self.grid[i]); }
         self.held = self.stash(0..BAG_END, self.held);
     }
 
@@ -1193,7 +1264,15 @@ pub fn door_item(b: Block) -> Item {
 
 /// The item a block in the world stands for (middle click, and what it drops).
 pub fn item_of(b: Block) -> Item {
+    if crate::building::is_fence_gate(b) {return OAK_GATE+((b-crate::building::FENCE_GATE)>>2);}
+    if crate::building::is_sign(b) {return SIGN_ITEM;}
+    if is_slab(b) && slab_mat(b)>=4 {return EXTRA_SLAB+slab_mat(b)-4;}
+    if is_stairs(b) && stair_mat(b)>=4 {return EXTRA_STAIRS+stair_mat(b)-4;}
+    if let Some((item, _)) = crate::farming::harvest(b) { return item; }
+    if crate::farming::moisture(b).is_some() { return DIRT; }
     match b {
+        ANVIL => ANVIL_ITEM,
+        ENCHANTING_TABLE => ENCHANTING_ITEM,
         b if is_door(b) => door_item(b),
         b if is_slab(b) => SLAB + slab_mat(b),
         b if is_stairs(b) => STAIRS + stair_mat(b),
@@ -1228,6 +1307,8 @@ pub fn tier_needed(b: Block) -> u8 {
 
 /// What a block gives when broken with `tool` (AIR = nothing).
 pub fn drop_for(b: Block, tool: Item) -> Item {
+    if let Some((item, _)) = crate::farming::harvest(b) { return item; }
+    if crate::farming::moisture(b).is_some() { return DIRT; }
     if pick_tier(tool) < tier_needed(b) {
         return AIR;
     }
@@ -1258,6 +1339,8 @@ pub fn drop_for(b: Block, tool: Item) -> Item {
 
 /// Seconds of holding the button needed to break `b` with `tool` in hand.
 pub fn break_time(b: Block, tool: Item) -> f32 {
+    if is_plant(b) {return 0.05;}
+    if crate::farming::moisture(b).is_some() {return 0.5;}
     let with = |kind: Kind, base: f32, gain: f32| match self::tool(tool, kind) {
         Some(m) => (base * speed(m) * gain).max(0.06),
         None => base,
@@ -1408,7 +1491,7 @@ mod tests {
         assert_eq!((inv.held.n, chest[4].n), (34, 1));
         inv.stow_held();
         // shift-click style moves keep a tool's wear
-        let pick = Stack { item: IRON_PICK, n: 1, wear: 9 };
+        let pick = Stack { item: IRON_PICK, n: 1, wear: 9, enchants: 0 };
         assert!(stash_in(&mut chest, pick).is_empty());
         assert!(chest.contains(&pick));
         assert_eq!(stash_in(&mut chest, Stack::new(COBBLE, 100)).n, 0);
@@ -1509,7 +1592,7 @@ mod tests {
         assert_eq!(inv.slots[0].n, 99);
         assert_eq!(inv.held, Stack::new(DIRT, 3));
 
-        let pick = Stack { item: IRON_PICK, n: 1, wear: 20 };
+        let pick = Stack { item: IRON_PICK, n: 1, wear: 20, enchants: 0 };
         inv.held = pick;
         inv.stow_held();
         assert_eq!(inv.held, pick);

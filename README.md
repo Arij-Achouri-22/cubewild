@@ -76,12 +76,16 @@ to see the rest.
 | Hold left click | break block, or hit an animal in reach |
 | Right click | place the selected block, eat the held food, open or close a door or trapdoor, open a chest, sleep in a bed, open a workbench or furnace |
 | Q | drop one of the held item (Ctrl+Q drops the whole stack) |
-| Middle click | select the block you look at |
+| Middle click / P | select the block you look at; acquire it in creative |
 | 1-9, mouse wheel | choose hotbar slot |
 | E or Tab | inventory and crafting |
 | F, or Space twice | fly, in creative worlds (Space up, Shift down) |
 | F3 / F11 | debug overlay / fullscreen |
 | Esc | pause menu (settings, controls, save and quit) |
+
+Movement, jump, sprint, sneak, inventory, drop, flight and the keyboard pick-block shortcut
+can be rebound in **Pause → Controls**. Click a binding and press its replacement; Escape
+cancels. Mouse controls and menu shortcuts stay available.
 
 ## Gathering and crafting
 
@@ -92,16 +96,22 @@ The inventory window has a 9-slot hotbar, a 27-slot backpack, four armour slots 
 chest, legs, feet) beside a picture of your character, and a crafting area. Left click
 picks a stack up and puts it down, right click takes half or drops one, Shift+click sends
 a stack between hotbar and backpack (or puts armour on), and Sort tidies the backpack.
+Drag a carried stack with the left button to divide it evenly over slots, or with the
+right button to put one in each slot. Items that do not fit stay on the cursor.
 The recipe book on the left has tabs (Tools, Weapons, Armour, Utility, Building,
 Materials, Food) and a "Can craft" filter; pick a recipe, then click the result slot to
 take it (Shift+click crafts as many as you can). Hover anything for its details.
+The **Grid** button switches to manual shaped crafting: 2×2 in the inventory, or 3×3
+near a workbench. Recipes can be offset or mirrored. The recipe book remains available.
+Closing the window returns grid ingredients to the bag, with excess dropped beside you;
+an interrupted session also preserves the grid itself.
 
 Recipes are in `src/items.rs`. Basic tools and torches can be made anywhere; a **workbench**
 unlocks the furnace, bed, iron tools, crystal pickaxe and crystal lamp, and a **furnace**
 (stand within a few steps of either) smelts iron ore, cooks meat, and burns logs into coal.
 
-- **Ores** sit in underground stone: coal anywhere, iron below y 60 (needs a stone
-  pickaxe), gold below y 34, crystal below y 22 (needs an iron pickaxe). The pockets
+- **Ores** sit in underground stone: coal anywhere, iron below y 124 (needs a stone
+  pickaxe), gold below y 98, crystal below y 86 (needs an iron pickaxe). The pockets
   grow towards the bottom of the world.
 - **Caves**: two networks of tunnels wind through the rock and open onto hillsides, and
   below them lie caverns, wider and more frequent the further down. The deepest are
@@ -112,17 +122,22 @@ unlocks the furnace, bed, iron tools, crystal pickaxe and crystal lamp, and a **
   better loot the deeper they stand: torches and bread near the surface; iron, gold,
   crystal and finished tools and armour near the lava.
 - **Light**: enclosed spaces are dark, and so is the night. Torches and crystal lamps
-  light their surroundings, and a torch in your hand lights the way.
+  illuminate through open cells, with levels from 0 to 15. Solid walls stop their light.
+  Terrain, crop growth and Overworld monster spawning share these block-light values.
 - **Tools** come in wood, stone, iron, gold (fast but brittle) and crystal: pickaxes,
   axes, shovels, hoes and swords. They wear out; a bar on the icon shows what is left.
   Also: shears, bucket (scoops and pours water), fishing rod (hold right click on water),
   bow and arrows, compass and clock (shown at the top of the screen while carried).
-- **Farming**: till grass or dirt with a hoe, plant seeds (from grass tufts), wait for the
-  wheat to turn gold, and bake bread.
+- **Farming**: till grass or dirt with a hoe, then plant wheat seeds, carrots or potatoes.
+  Water within four blocks, including diagonals, hydrates soil; exposed rain does too.
+  Crops need light level 9 or higher and grow faster on moist soil. Dry empty farmland
+  eventually becomes dirt. Jumping on a field can trample it. Village fields supply the
+  new crops. Harvested carrots and potatoes can be planted again; potatoes can also be baked.
 - **The land**: oak, birch and pine trees, grass tufts (plant fibre), flowers, mushrooms and
   berry bushes (stew), gravel (flint) and clay (bricks) on the sea bed, gold deep down.
 - **Armour**: leather, gold, iron and crystal pieces each absorb a share of the damage from
-  bites and falls; a full crystal set absorbs 64%.
+  attacks; a full crystal set absorbs 64%. Armour wears when it absorbs attacks. Falling,
+  drowning, hunger and lava follow their own damage rules.
 - **Doors and windows**: at a workbench, six planks make three doors (oak or birch) and
   six glass make sixteen window panes. A door stands two blocks tall on the edge of its
   block nearest to you; right click opens and closes it (sneak to place a block against
@@ -141,7 +156,9 @@ unlocks the furnace, bed, iron tools, crystal pickaxe and crystal lamp, and a **
   let go to slide down. Monsters that walk into a ladder climb it too, though they do
   not look for one. A trapdoor opens and closes with a right click.
 - **Chests**: eight planks make a chest holding 27 stacks. Right click to open it;
-  Shift+click sends a stack across. A broken chest spills what it held.
+  Shift+click sends a stack across. Two adjacent chests join into a 54-slot large chest;
+  either half opens it. A third chest cannot join the pair. Leave room above the lid.
+  Breaking a half spills only that half's contents.
 - **Survival**: you have health and hunger. Eat meat (cooked is far better) to stay fed;
   a full stomach heals you. Long falls, drowning, starving and wolf bites hurt. When you
   die, everything you carry and wear drops where you fell and you wake at your spawn
@@ -152,7 +169,7 @@ unlocks the furnace, bed, iron tools, crystal pickaxe and crystal lamp, and a **
 - **Day and night** take 12 minutes. Wolves spawn at night and hunt you; they are a
   little slower than your walk, and a bite costs one heart. Right click a bed
   to set your spawn point and, at night, sleep until morning.
-- **Monsters** come out at night, never within 9 blocks of a torch or lamp, and are gone
+- **Monsters** come out at night in places with no block light, and are gone
   by morning: sunlight burns zombies and skeletons, and the rest slip away once out of
   sight. Sneaking shortens the distance at which they notice you. Hunters find their way
   to you: round walls, through doorways and open doors, up steps and down into pits and
@@ -165,7 +182,31 @@ unlocks the furnace, bed, iron tools, crystal pickaxe and crystal lamp, and a **
   - **Giant spiders** are fast, climb walls and pounce. They drop plant fibre.
   - **Slimes** hop after you. They drop clay.
 
-Edited chunks, position, inventory (including the stack on the mouse), chests, dropped items, health and time of day are saved per world seed, and
+- **More building pieces**: brick, sandstone, slate and cinderwood have matching stairs
+  and slabs. Oak and birch fence gates open with right click and keep animals enclosed
+  when shut. Signs hold four short lines: place one to write it, look at it to read,
+  and right click to edit. Enter saves the text; Escape cancels.
+- **Combat**: hold right click with a shield to raise it and block attacks from the front;
+  it takes a quarter second to raise and wears when hit. Hold right click with a bow,
+  then release to shoot; a full draw takes one second. Changing slots cancels the draw.
+  The bar below the crosshair shows attack readiness. Enemies signal an approaching
+  strike, giving you time to block or move out of reach.
+
+## Repairing and enchanting
+
+Craft an **anvil** from three iron blocks and four ingots at a workbench. Stand nearby,
+open the inventory and choose **Equipment**, then pick damaged gear onto the cursor.
+Each repair costs one level and one matching material and restores a quarter of maximum
+durability. Right clicking the anvil opens this panel directly.
+
+An **enchanting table** costs four slate, two crystals and three plant fibre. Its Equipment
+panel offers **Efficiency** for mining tools, **Unbreaking** for durable equipment and
+**Protection** for armour. Each goes up to level III and costs a crystal plus 3, 6 or 9
+experience levels. Repairs and pyre upgrades preserve enchantments. These are deliberately
+small versions of Minecraft's equipment systems, using Cubewild's existing materials.
+
+Edited chunks, position, inventory (including the cursor and crafting grid), equipment,
+signs, chests, dropped items, health and time of day are saved per world seed, and
 settings separately:
 
 | | Saves | Settings |
@@ -266,7 +307,7 @@ twelve seeds and prints where the one nearest the start is (F3 shows your positi
 ## Layout
 
 - `src/world.rs` — blocks, terrain, caves and ores, where a new world's player starts, greedy mesher with AO and sky exposure, chunk streaming
-- `src/gfx.rs` — renderer (one draw call per chunk, 4-byte packed vertices; buried cave
+- `src/gfx.rs` — renderer (one draw call per chunk, 8-byte packed terrain vertices; buried cave
   walls of far chunks are skipped while you are above ground)
 - `src/player.rs` — movement, collision, ray casting
 - `src/projectile.rs` — nearest collision of arrows and fireballs with terrain and bodies
@@ -274,5 +315,10 @@ twelve seeds and prints where the one nearest the start is (F3 shows your positi
 - `src/village.rs` — villages: where they stand, their layout, building them into chunks
 - `src/path.rs` — path finding for hunting mobs (A* over walkable cells, one search a frame)
 - `src/items.rs` — items, inventory, recipes, mining times
+- `src/lighting.rs` — cached block light, propagated on mesh workers
+- `src/equipment.rs`, `src/farming.rs`, `src/crafting.rs` — equipment progression, random farm ticks and shaped crafting
+- `src/building.rs`, `src/combat.rs`, `src/controls.rs` — building interactions, combat and configurable input
+- `src/persistence.rs`, `src/registry.rs` — coordinated game snapshots and versioned 16-bit block storage
+- `src/inventory_ui.rs` — inventory, crafting and equipment screens
 - `src/loot.rs` — items lying in the world, and what chests hold
 - `src/ui.rs`, `src/textures.rs` — UI widgets and Noto Sans text, procedural block/item textures

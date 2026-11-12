@@ -44,8 +44,8 @@ impl Kind {
     /// The flowing block of a level (1 ..= run).
     fn flow(self, level: u8) -> Block {
         match self {
-            Kind::Water => WATER_FLOW + (WATER_RUN - level),
-            Kind::Lava => LAVA_FLOW + (LAVA_RUN - level),
+            Kind::Water => WATER_FLOW + (WATER_RUN - level) as Block,
+            Kind::Lava => LAVA_FLOW + (LAVA_RUN - level) as Block,
         }
     }
 }
@@ -55,9 +55,9 @@ impl Kind {
 pub fn level(kind: Kind, b: Block) -> u8 {
     match kind {
         Kind::Water if b == WATER => WATER_RUN + 1,
-        Kind::Water if (WATER_FLOW..WATER_FLOW_END).contains(&b) => WATER_RUN - (b - WATER_FLOW),
+        Kind::Water if (WATER_FLOW..WATER_FLOW_END).contains(&b) => WATER_RUN - (b - WATER_FLOW) as u8,
         Kind::Lava if b == LAVA => LAVA_RUN + 1,
-        Kind::Lava if (LAVA_FLOW..LAVA_FLOW_END).contains(&b) => LAVA_RUN - (b - LAVA_FLOW),
+        Kind::Lava if (LAVA_FLOW..LAVA_FLOW_END).contains(&b) => LAVA_RUN - (b - LAVA_FLOW) as u8,
         _ => 0,
     }
 }

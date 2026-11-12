@@ -31,6 +31,7 @@ pub type Furnaces = HashMap<IVec3, Furnace>;
 /// What an item cooks into, and how many.
 pub fn smelt(i: Item) -> Option<(Item, u32)> {
     Some(match i {
+        items::POTATO => (items::BAKED_POTATO, 1),
         IRON_ORE => (items::IRON_INGOT, 1),
         GOLD_ORE => (items::GOLD_INGOT, 1),
         i if i == items::EXTRA_ITEM + 3 => (items::PYRE_INGOT, 1),
@@ -148,7 +149,7 @@ pub fn encode(furnaces: &Furnaces) -> String {
         }
         s += &format!("{} {} {} {} {} {} {}", p.x, p.y, p.z, f.burn, f.burn_max, f.cook, f.xp);
         for (i, st) in f.slots.iter().enumerate().filter(|(_, st)| !st.is_empty()) {
-            s += &format!(" {}:{}:{}:{}", i, st.item, st.n, st.wear);
+            s += &format!(" {}:{}:{}:{}", i, st.item, st.n, st.persist_wear());
         }
         s.push('\n');
     }

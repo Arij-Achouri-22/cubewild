@@ -128,7 +128,7 @@ fn spec(k: Kind) -> Spec {
 
 /// The wool item of a colour.
 pub fn wool_item(c: u8) -> Item {
-    if c == 0 { CLOTH as Item } else { items::WOOL_ITEM + c - 1 }
+    if c == 0 { CLOTH as Item } else { items::WOOL_ITEM + c as Item - 1 }
 }
 
 fn drops(m: &Mob, rng: &mut Rng) -> Drops {
@@ -185,6 +185,7 @@ pub struct Mob {
     age: f32,
     /// seconds until it can bite (or shoot) again
     bite: f32,
+    windup: f32,
     /// seconds until a slime's next hop, or a spider's next leap
     hop: f32,
     /// seconds until the sun next scorches the undead
@@ -301,6 +302,7 @@ pub struct Mobs {
     pub list: Vec<Mob>,
     /// arrows loosed by skeletons this frame: (position, velocity)
     pub shots: Vec<(Vec3, Vec3)>,
+    pub attacks: Vec<(Vec3,f32)>,
     /// fireballs thrown by emberwisps this frame: (position, velocity)
     pub fireballs: Vec<(Vec3, Vec3)>,
     rng: Rng,
@@ -341,11 +343,12 @@ const MAX_ANIMALS: usize = 12;
 const MAX_WOLVES: usize = 4;
 const MAX_MONSTERS: usize = 10;
 /// monsters never appear this close to a torch or lamp
-const SAFE_LIGHT: f32 = 9.0;
+
+fn dark_spawn(world:&World,p:IVec3)->bool {world.block_light(p.x,p.y,p.z)==Some(0) && world.block_light(p.x,p.y+1,p.z)==Some(0)}
 
 impl Mobs {
     pub fn new(seed: u64) -> Mobs {
-        Mobs { list: Vec::new(), shots: Vec::new(), fireballs: Vec::new(), rng: Rng(seed | 1), spawn_timer: 0.0, finder: Finder::default(), ignore: false, gone: HashSet::new(), guards: HashMap::new(), events: Vec::new() }
+        Mobs { list: Vec::new(), shots: Vec::new(), attacks: Vec::new(), fireballs: Vec::new(), rng: Rng(seed | 1), spawn_timer: 0.0, finder: Finder::default(), ignore: false, gone: HashSet::new(), guards: HashMap::new(), events: Vec::new() }
     }
 
     /// The Emberdeep's creatures: hound packs on the floors, wisps in the air (more in
@@ -478,7 +481,7 @@ impl Mobs {
                     });
                     let Some(y) = floor else { continue };
                     let pos = Vec3::new(x as f32 + 0.5, y as f32 + 0.01, z as f32 + 0.5);
-                    if world.sky_level(x, y, z) != 0 || !world.lights_near(pos, SAFE_LIGHT).is_empty() {
+                    if world.sky_level(x, y, z) != 0 || !dark_spawn(world,IVec3::new(x,y,z)) {
                         continue;
                     }
                     let kind = match roll {
@@ -529,7 +532,7 @@ impl Mobs {
             let pos = Vec3::new(x as f32 + 0.5, y as f32 + 1.01, z as f32 + 0.5);
             if kind.is_monster() {
                 // any firm ground will do, as long as no light keeps them away
-                if !is_solid(top) || is_leaves(top) || !world.lights_near(pos, SAFE_LIGHT).is_empty() {
+                if !is_solid(top) || is_leaves(top) || !dark_spawn(world,IVec3::new(x,y+1,z)) {
                     continue;
                 }
             } else if !is_grassy(top) && !(top == SNOW && kind == Kind::Hare) {
@@ -599,6 +602,7 @@ impl Mobs {
                 hspeed: 0.0,
                 age: 0.0,
                 bite: 1.0,
+                windup: 0.0,
                 hop: 0.0,
                 burn: self.rng.range(0.5, 1.5),
                 path: Vec::new(),
@@ -769,6 +773,7 @@ impl Mobs {
     /// `lure` is the item in the player's hand: animals follow their food.
     pub fn update(&mut self, world: &World, player: Vec3, sneaking: bool, night: bool, lure: Item, dt: f32) -> f32 {
         let mut damage = 0.0;
+        self.attacks.clear();
         // (in the Emberdeep it is always night: its creatures never slink off)
         let night = night || world.is_deep();
         self.spawn_timer -= dt;
@@ -822,6 +827,7 @@ impl Mobs {
         let events = &mut self.events;
         let ignore = self.ignore;
         let rng = &mut self.rng;
+        let attacks=&mut self.attacks;
         let shots = &mut self.shots;
         let fireballs = &mut self.fireballs;
         let finder = &mut self.finder;
@@ -895,6 +901,7 @@ impl Mobs {
                     s.sight
                 };
                 hunting = m.flee <= 0.0 && dist < sight && !m.tame;
+                if !hunting {m.windup=0.0;}
                 let lured = !m.kind.is_monster() && !(m.kind == Kind::Wolf && !m.tame) && m.kind.food().contains(&lure) && dist < 10.0 && m.flee <= 0.0;
                 if m.tame && m.sitting {
                     // sits where it was told, watching the player
@@ -1106,9 +1113,16 @@ impl Mobs {
                     }
                     // (a brute's club reaches further, and higher)
                     let (reach, up) = if m.kind == Kind::Brute { (2.3, 2.6) } else { (1.5, 1.9) };
-                    if s.dmg > 0.0 && flat < reach && to_player.y.abs() < up && m.bite <= 0.0 {
-                        m.bite = if m.kind == Kind::Brute { 1.8 } else { 1.2 };
-                        damage += s.dmg;
+                    if m.windup>0.0 {
+                        m.windup-=dt;
+                        if m.windup<=0.0 {
+                            m.bite=if m.kind==Kind::Brute {1.8} else {1.2};
+                            if flat<reach && to_player.y.abs()<up && clear_path(world,m.pos+Vec3::Y,player+Vec3::Y) {
+                                damage+=s.dmg;attacks.push((m.pos,s.dmg));
+                            }
+                        }
+                    } else if s.dmg>0.0 && flat<reach && to_player.y.abs()<up && m.bite<=0.0 {
+                        m.windup=if m.kind==Kind::Brute {0.55} else {0.3};
                     }
                 } else if m.flee > 0.0 {
                     m.flee -= dt;
@@ -1365,6 +1379,11 @@ impl Mobs {
             let grown = 0.5 + 0.5 * m.baby;
             let sit = if m.sitting { -0.14 } else { 0.0 };
             let mut base = Mat4::from_translation(rel + Vec3::new(0.0, hop + sit, 0.0)) * Mat4::from_rotation_y(m.yaw) * Mat4::from_scale(Vec3::splat(grown));
+            if alive && (m.windup>0.0 || (m.kind==Kind::Skeleton && m.bite<0.45 && m.los)) {
+                let warn=Mat4::from_translation(rel+Vec3::Y*(spec(m.kind).h*grown+0.25));
+                push_box(out,&warn,Vec3::new(-0.04,0.08,-0.04),Vec3::new(0.04,0.28,0.04),[255,190,45],EMISSIVE);
+                push_box(out,&warn,Vec3::new(-0.04,-0.03,-0.04),Vec3::new(0.04,0.04,0.04),[255,190,45],EMISSIVE);
+            }
             if m.love > 0.0 && alive {
                 // a pair of little hearts over its head
                 let h = spec(m.kind).h * grown + 0.3 + (m.age * 2.0).sin() * 0.06;
@@ -1692,7 +1711,7 @@ fn draw_monster(out: &mut Vec<EntVert>, m: &Mob, base: &Mat4, swing: f32, tint: 
                 part(&limb([sx * 0.22, 0.95, 0.0], sx * swing * 0.6), [-0.15, -0.95, -0.16], [0.15, 0.0, 0.16], rock, O);
             }
             // arms: the right drags a club; both swing up when it strikes
-            let strike = if alive && m.bite > 1.3 { (m.bite - 1.3) * 3.0 } else { 0.0 };
+            let strike = if alive && m.windup>0.0 { (0.55-m.windup)*3.0 } else { 0.0 };
             part(&limb([-0.58, 1.9, 0.0], -swing * 0.4 - strike), [-0.13, -1.25, -0.13], [0.13, 0.0, 0.13], plate, O);
             let arm = limb([0.58, 1.9, 0.0], swing * 0.4 - strike * 1.2);
             part(&arm, [-0.13, -1.25, -0.13], [0.13, 0.0, 0.13], plate, O);
@@ -1860,6 +1879,25 @@ mod tests {
             _ => panic!("shears shear"),
         }
         assert!(matches!(mobs.interact(i, SHEARS), Use::Nothing));
+    }
+
+    #[test]
+    fn spawning_checks_light_in_the_body_space_and_respects_walls() {
+        let mut world=World::flat(|x,y,z| if (x,y,z)==(0,11,0) {Some(crate::world::TORCH)} else if x==2 && y>=10 {Some(crate::world::STONE)} else {None});
+        world.bake_test_light();
+        assert_eq!(world.block_light(1,9,0),Some(0),"the supporting stone itself is dark");
+        assert!(!dark_spawn(&world,IVec3::new(1,10,0)),"the body space is lit");
+        assert!(dark_spawn(&world,IVec3::new(3,10,0)),"a solid wall shields the other side");
+    }
+
+    #[test]
+    fn melee_has_a_warning_and_a_dodged_strike_misses() {
+        let w=field();let mut mobs=Mobs::new(8);mobs.spawn_timer=1000.0;
+        let i=mobs.spawn(Kind::Zombie,Vec3::new(2.5,10.0,2.5));mobs.list[i].bite=0.0;
+        assert_eq!(mobs.update(&w,Vec3::new(3.5,10.0,2.5),false,true,0,0.01),0.0);
+        assert!(mobs.list[i].windup>0.0);
+        assert_eq!(mobs.update(&w,Vec3::new(10.5,10.0,2.5),false,true,0,0.35),0.0);
+        assert!(mobs.attacks.is_empty());
     }
 
     #[test]

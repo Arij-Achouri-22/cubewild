@@ -38,8 +38,8 @@ pub struct Pickups {
 }
 
 pub fn parse_stack(item: u32, n: u32, wear: u32) -> Option<Stack> {
-    let item = u8::try_from(item).ok().filter(|&i| items::valid(i))?;
-    (n > 0).then(|| Stack { item, n: n.min(items::max_stack(item)), wear: wear.min(items::max_wear(item).saturating_sub(1) as u32) as u16 })
+    let item = items::Item::try_from(item).ok().filter(|&i| items::valid(i))?;
+    (n > 0).then(|| Stack { item, n: n.min(items::max_stack(item)), wear: (wear & 65535).min(items::max_wear(item).saturating_sub(1) as u32) as u16, enchants: ((wear >> 16) as u8) & 63 })
 }
 
 impl Pickups {
@@ -207,7 +207,7 @@ impl Pickups {
     pub fn encode(&self) -> String {
         let mut s = String::new();
         for p in &self.list {
-            s += &format!("{} {} {} {} {} {} {}\n", p.pos.x, p.pos.y, p.pos.z, p.stack.item, p.stack.n, p.stack.wear, p.age);
+            s += &format!("{} {} {} {} {} {} {}\n", p.pos.x, p.pos.y, p.pos.z, p.stack.item, p.stack.n, p.stack.persist_wear(), p.age);
         }
         s
     }
@@ -321,7 +321,7 @@ pub fn encode_chests(chests: &Chests) -> String {
         }
         s += &format!("{} {} {}", p.x, p.y, p.z);
         for (i, st) in slots.iter().enumerate().filter(|(_, st)| !st.is_empty()) {
-            s += &format!(" {}:{}:{}:{}", i, st.item, st.n, st.wear);
+            s += &format!(" {}:{}:{}:{}", i, st.item, st.n, st.persist_wear());
         }
         s.push('\n');
     }
@@ -392,7 +392,7 @@ mod tests {
         for _ in 0..3 {
             drops.pop(&mut rng, Vec3::new(0.5, 12.5, 0.5), Stack::new(COBBLE, 2));
         }
-        drops.pop(&mut rng, Vec3::new(0.5, 12.5, 0.5), Stack { item: items::IRON_PICK, n: 1, wear: 5 });
+        drops.pop(&mut rng, Vec3::new(0.5, 12.5, 0.5), Stack { item: items::IRON_PICK, n: 1, wear: 5, enchants: 0 });
         for _ in 0..600 {
             drops.update(&w, None, &mut inv, &mut got, 1.0 / 120.0);
         }
@@ -406,7 +406,7 @@ mod tests {
         drops.update(&w, Some(Vec3::new(0.5, 10.0, 0.5)), &mut inv, &mut got, 1.0 / 120.0);
         assert!(drops.list.is_empty());
         assert_eq!(inv.count(COBBLE), 6);
-        assert!(inv.slots.contains(&Stack { item: items::IRON_PICK, n: 1, wear: 5 }));
+        assert!(inv.slots.contains(&Stack { item: items::IRON_PICK, n: 1, wear: 5, enchants: 0 }));
         assert_eq!(got.iter().map(|s| s.n).sum::<u32>(), 7);
         // after five minutes untouched an item is gone
         drops.spawn(Vec3::new(0.5, 10.0, 0.5), Vec3::ZERO, Stack::new(DIRT, 1), 0.0);
@@ -429,7 +429,7 @@ mod tests {
         let mut chests = Chests::default();
         let mut slots = [Stack::default(); CHEST_SLOTS];
         slots[0] = Stack::new(COBBLE, 64);
-        slots[26] = Stack { item: items::IRON_PICK, n: 1, wear: 12 };
+        slots[26] = Stack { item: items::IRON_PICK, n: 1, wear: 12, enchants: 0 };
         chests.insert(IVec3::new(-5, 70, 12), slots);
         chests.insert(IVec3::new(1, 2, 3), [Stack::default(); CHEST_SLOTS]);
         save_chests(&chests, &dir.join("chests.txt")).unwrap();
@@ -438,7 +438,7 @@ mod tests {
         assert_eq!(back[&IVec3::new(-5, 70, 12)], slots);
 
         let mut drops = Pickups::default();
-        drops.spawn(Vec3::new(1.5, 64.0, -2.5), Vec3::ZERO, Stack { item: items::IRON_PICK, n: 1, wear: 3 }, 0.0);
+        drops.spawn(Vec3::new(1.5, 64.0, -2.5), Vec3::ZERO, Stack { item: items::IRON_PICK, n: 1, wear: 3, enchants: 0 }, 0.0);
         drops.spawn(Vec3::ZERO, Vec3::ZERO, Stack::default(), 0.0);
         assert_eq!(drops.list.len(), 1, "nothing is dropped for an empty stack");
         drops.save(&dir.join("drops.txt")).unwrap();

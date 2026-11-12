@@ -32,7 +32,7 @@ pub fn collides(world: &World, pos: Vec3, hw: f32, h: f32) -> bool {
 
 /// True if a body of half-width `hw` and height `h` standing at `pos` reaches into a
 /// shaped block (door, pane, slab, stairs, fence...).
-fn shape_overlaps(world: &World, b: u8, x: i32, y: i32, z: i32, pos: Vec3, hw: f32, h: f32) -> bool {
+fn shape_overlaps(world: &World, b: crate::world::Block, x: i32, y: i32, z: i32, pos: Vec3, hw: f32, h: f32) -> bool {
     let (boxes, n) = world.shape_at(b, x, y, z);
     boxes[..n].iter().any(|q| {
         pos.x + hw > q[0] && pos.x - hw < q[3] && pos.y + h > q[1] && pos.y < q[4] && pos.z + hw > q[2] && pos.z - hw < q[5]
@@ -138,7 +138,7 @@ pub fn raycast(world: &World, o: Vec3, d: Vec3, max: f32) -> Option<(IVec3, IVec
 }
 
 /// Like `raycast`, stopping at the first block for which `hit` is true.
-pub fn raycast_with(world: &World, o: Vec3, d: Vec3, max: f32, hit: impl Fn(u8) -> bool) -> Option<(IVec3, IVec3, f32)> {
+pub fn raycast_with(world: &World, o: Vec3, d: Vec3, max: f32, hit: impl Fn(crate::world::Block) -> bool) -> Option<(IVec3, IVec3, f32)> {
     let mut p = o.floor().as_ivec3();
     let step = IVec3::new(sgn(d.x), sgn(d.y), sgn(d.z));
     let inv = Vec3::new(1.0 / d.x.abs(), 1.0 / d.y.abs(), 1.0 / d.z.abs());

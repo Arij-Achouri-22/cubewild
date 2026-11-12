@@ -1,8 +1,8 @@
 //! Procedurally generated 16x16 block textures (no asset files).
 
 pub const TEX: usize = 16;
-/// The terrain mesh can only name the first 128 layers (it packs a layer in 7 bits),
-/// so blocks live below 128 and the icons and other textures above.
+/// Legacy terrain keeps its layers below 128. Material attributes now carry a
+/// separate 16-bit layer index, so new terrain textures can follow the icons.
 /// The blocks of the Emberdeep (see `world::tex_for`).
 pub const DEEP_TEX: usize = 96;
 /// slate, fortress bricks (whole, cracked), pyre ore: `world::SLATE` + n
@@ -13,14 +13,14 @@ pub const ICON_BASE: usize = 128;
 pub const EXTRA_BASE: usize = ICON_BASE + 103;
 /// icons of the four slabs and two fences
 pub const SHAPE_ICONS: usize = EXTRA_BASE + 4;
-/// the eight door textures (they are drawn with the detailed shapes, which can name any
-/// layer; the first 128 layers are kept for the blocks of the terrain mesh)
+/// The eight door textures. Keep their existing layer numbers for old materials.
 pub const DOOR_TEX: usize = SHAPE_ICONS + 6;
 /// the player's arm in first person: skin, then sleeve
 pub const ARM_TEX: usize = DOOR_TEX + 8;
-pub const LAYERS: usize = ARM_TEX + 2;
+pub const NEW_TEX: usize = ARM_TEX + 2;
+pub const LAYERS: usize = NEW_TEX + 15;
 /// icons of the pyre ingot and the eight pieces of pyre gear (`items::PYRE_INGOT` + n),
-/// in spare layers under the item icons (the array holds no more than 256)
+/// in the original spare layers below the item icons
 pub const PYRE_ICONS: usize = EXTRA_TEX + 4;
 /// the lava bucket's icon, after the pyre icons
 pub const LAVA_BUCKET_ICON: usize = PYRE_ICONS + 10;
@@ -94,7 +94,7 @@ fn pixel(layer: usize, x: i32, y: i32) -> [u8; 4] {
         // (drawn as made-up item numbers past the others: see `item_pixel`)
         return item_pixel(200 + layer - PYRE_ICONS, x, y);
     }
-    if layer >= ARM_TEX {
+    if (ARM_TEX..ARM_TEX + 2).contains(&layer) {
         let n = h(layer as u32, x, y);
         let c = if layer == ARM_TEX { [226.0, 176.0, 134.0] } else { [176.0, 92.0, 52.0] };
         return shade(c, 0.93 + n * 0.07);
@@ -116,7 +116,7 @@ fn pixel(layer: usize, x: i32, y: i32) -> [u8; 4] {
         return biome_pixel(layer, x, y);
     }
     // (doors keep the numbering their drawing code was written for)
-    let layer = if layer >= DOOR_TEX { layer - DOOR_TEX + 56 } else { layer };
+    let layer = if (DOOR_TEX..DOOR_TEX+8).contains(&layer) { layer - DOOR_TEX + 56 } else { layer };
     let l = layer as u32;
     let n = h(l, x, y);
     match layer {
@@ -514,6 +514,17 @@ fn pixel(layer: usize, x: i32, y: i32) -> [u8; 4] {
                 }
             }
         }
+        l if l >= NEW_TEX => {
+            let k = l - NEW_TEX;
+            match k {
+                0 => { let v = 68 + ((x * 13 + y * 7) % 18) as u8; [v, v, v + 5, 255] },
+                1 => if y < 3 { [125, 35, 54, 255] } else if x % 7 < 2 { [60, 215, 210, 255] } else { [28, 30, 48, 255] },
+                3 => { let c = pixel(50, x, y); [(c[0] as f32 * 0.63) as u8, (c[1] as f32 * 0.63) as u8, (c[2] as f32 * 0.63) as u8, 255] },
+                4..=11 => { let stage = (k - 4) % 4; let mut c = pixel(51 + stage, x, y); if stage == 3 && y > 10 && c[3] > 0 { c = if k < 8 { [222, 119, 35, 255] } else { [169, 124, 64, 255] }; } c },
+                12..=14 => { if (x - 8).abs() + (y - 8).abs() > 7 { [0, 0, 0, 0] } else if k == 12 && y < 5 { [66, 153, 40, 255] } else if k == 12 { [234, 128, 30, 255] } else { [if k == 13 { 180 } else { 205 }, 140, 72, 255] } },
+                _ => if x < 2 || x > 13 || y < 1 || y > 14 { [0, 0, 0, 0] } else if x == 2 || x == 13 || y == 1 || y == 14 { [140, 145, 150, 255] } else { [115, 78, 42, 255] },
+            }
+        },
         l if l >= EXTRA_BASE => extra_pixel(l - EXTRA_BASE, x, y),
         l if l >= ICON_BASE => item_pixel(l - ICON_BASE, x, y),
         _ => [0, 0, 0, 0],
@@ -1442,5 +1453,19 @@ fn sapling_pixel(k: usize, x: i32, y: i32) -> [u8; 4] {
         shade(bark, 0.85 + n * 0.15)
     } else {
         [0, 0, 0, 0]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn new_equipment_crops_and_station_icons_have_visible_pixels() {
+        for item in crate::items::ANVIL_ITEM..crate::items::ITEM_END {
+            let layer=crate::items::icon(item) as usize;
+            assert!(layer<LAYERS,"item {item} has an out-of-range icon");
+            assert!((0..16).any(|y|(0..16).any(|x|pixel(layer,x,y)[3]>0)),"item {item} has an empty icon");
+        }
+        assert_ne!(pixel(NEW_TEX,8,8),pixel(56,8,8));
     }
 }

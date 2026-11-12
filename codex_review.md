@@ -2,6 +2,8 @@
 
 Reviewed commit: `0089b73`
 
+**Survival systems update — 2026-11-12:** The requested follow-up items **1–7** are implemented: occluded block lighting; armour durability, XP repairs and enchantments; hydrated farms with carrots and potatoes; crafting grids, stack dragging and configurable controls; fence gates, large chests, signs and matching building shapes; shields, charged bows and attack feedback; and separate gameplay modules with versioned 16-bit block storage. Last night's performance work was committed first as `28e222f`. Minecraft reference links, implementation details and validation are in [DEVELOPMENT.md](DEVELOPMENT.md); performance measurements are in [PERFORMANCE.md](PERFORMANCE.md). The original roadmap's automation, distinctive fortress encounter, visual polish and onboarding work remain pending. The review below is retained as the historical baseline.
+
 **Implementation update — 2026-11-12:** Reliability findings **1–8** below are now addressed. The first pass fixed crafting, height-limit lava, coordinated recoverable checkpoints, and cursor-stack loss. The second pass persists fluid queues, falling blocks, leaf decay and pending edits; resolves the nearest projectile collision; blocks movement into unloaded chunks and prioritizes nearby terrain; and persists villager deaths, breeding cooldowns and daily trade limits. Added **31 regression tests** across both passes; `cargo test --offline --release` passes with **76 passed, 9 ignored**. The feature roadmap remains pending. The original review follows unchanged.
 
 **Cubewild already has enough features to become a small Minecraft-style game. The biggest improvements now are reliability, consistent world rules, and stronger progression.**

@@ -76,7 +76,7 @@ impl Settle {
                 ["fall", x, y, z, vy, block] => {
                     let pos = Vec3::new(x.parse().map_err(|_| invalid())?, y.parse().map_err(|_| invalid())?, z.parse().map_err(|_| invalid())?);
                     let vy: f32 = vy.parse().map_err(|_| invalid())?;
-                    let block = block.parse::<u8>().map_err(|_| invalid())?;
+                    let block = block.parse::<Block>().map_err(|_| invalid())?;
                     if !pos.is_finite() || !(1.0..=CH as f32).contains(&pos.y) || !vy.is_finite() || !(-40.0..=0.0).contains(&vy) || !loose(block) {
                         return Err(invalid());
                     }

@@ -55,11 +55,10 @@ impl Snapshot {
             }
             let path = checkpoint.dir().join(relative);
             fs::create_dir_all(path.parent().unwrap())?;
-            let bytes = match &contents {
-                Contents::Text(text) => text.as_bytes(),
-                Contents::Chunk(data) => &data.blocks,
-            };
-            fs::write(path, bytes)?;
+            match &contents {
+                Contents::Text(text) => fs::write(path, text.as_bytes())?,
+                Contents::Chunk(data) => fs::write(path, crate::registry::encode(data))?,
+            }
         }
         checkpoint.commit()
     }
@@ -120,7 +119,7 @@ impl Checkpoint {
         for relative in files_in(&self.dir())? {
             let source = self.dir().join(&relative);
             let bytes = fs::read(&source)?;
-            validate_chunk(&relative, bytes.len())?;
+            validate_chunk(&relative, &bytes)?;
             File::options().write(true).open(&source)?.sync_all()?;
             let name = relative.to_str().ok_or_else(|| invalid("invalid checkpoint filename"))?;
             manifest += &format!("{:016x} {} {}\n", checksum(&bytes), bytes.len(), name);
@@ -176,7 +175,7 @@ pub fn recover(root: &Path) -> io::Result<()> {
         if bytes.len() != len || checksum(&bytes) != hash {
             return Err(invalid(&format!("damaged checkpoint file: {}", relative.display())));
         }
-        validate_chunk(&relative, len)?;
+        validate_chunk(&relative, &bytes)?;
         entries.push(relative);
     }
     if entries.is_empty() {
@@ -217,10 +216,13 @@ fn invalid(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
-fn validate_chunk(path: &Path, len: usize) -> io::Result<()> {
+fn validate_chunk(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-    if name.starts_with("c.") && name.ends_with(".bin") && len != crate::world::VOL && len != crate::world::GVOL {
-        return Err(invalid(&format!("damaged saved chunk: {} ({len} bytes)", path.display())));
+    if name.starts_with("c.") && name.ends_with(".bin") {
+        if bytes.starts_with(crate::registry::MAGIC) {crate::registry::decode(bytes)?;}
+        else if bytes.len()!=crate::world::VOL && bytes.len()!=crate::world::GVOL {
+            return Err(invalid(&format!("damaged saved chunk: {} ({} bytes)",path.display(),bytes.len())));
+        }
     }
     Ok(())
 }
@@ -287,7 +289,7 @@ pub(crate) mod tests {
         let checkpoint = Checkpoint::begin(root).unwrap();
         fs::create_dir_all(checkpoint.dir().join("deep")).unwrap();
         fs::write(checkpoint.dir().join("player.txt"), "new inventory\n").unwrap();
-        fs::write(checkpoint.dir().join("c.0.0.bin"), vec![PLANKS; VOL]).unwrap();
+        fs::write(checkpoint.dir().join("c.0.0.bin"), vec![PLANKS as u8; VOL]).unwrap();
         fs::write(checkpoint.dir().join("deep/chests.txt"), "new chest contents\n").unwrap();
         checkpoint
     }
@@ -318,13 +320,13 @@ pub(crate) mod tests {
     fn checkpoint_keeps_the_previous_files_and_commits_both_dimensions() {
         let root = TestDir::new("checkpoint");
         fs::write(root.0.join("player.txt"), "old inventory\n").unwrap();
-        fs::write(root.0.join("c.0.0.bin"), vec![STONE; VOL]).unwrap();
+        fs::write(root.0.join("c.0.0.bin"), vec![STONE as u8; VOL]).unwrap();
         stage(&root.0).commit().unwrap();
         assert_eq!(fs::read_to_string(root.0.join("player.txt")).unwrap(), "new inventory\n");
-        assert_eq!(fs::read(root.0.join("c.0.0.bin")).unwrap(), vec![PLANKS; VOL]);
+        assert_eq!(fs::read(root.0.join("c.0.0.bin")).unwrap(), vec![PLANKS as u8; VOL]);
         assert_eq!(fs::read_to_string(root.0.join("deep/chests.txt")).unwrap(), "new chest contents\n");
         assert_eq!(fs::read_to_string(root.0.join(BACKUP).join("old/player.txt")).unwrap(), "old inventory\n");
-        assert_eq!(fs::read(root.0.join(BACKUP).join("old/c.0.0.bin")).unwrap(), vec![STONE; VOL]);
+        assert_eq!(fs::read(root.0.join(BACKUP).join("old/c.0.0.bin")).unwrap(), vec![STONE as u8; VOL]);
         assert!(fs::read_to_string(root.0.join(BACKUP).join("created.txt")).unwrap().contains("deep/chests.txt"));
         assert!(!root.0.join(PENDING).exists());
     }
@@ -333,15 +335,15 @@ pub(crate) mod tests {
     fn interrupted_commit_finishes_before_any_world_state_is_loaded() {
         let root = TestDir::new("recover");
         fs::write(root.0.join("player.txt"), "old inventory\n").unwrap();
-        fs::write(root.0.join("c.0.0.bin"), vec![STONE; VOL]).unwrap();
+        fs::write(root.0.join("c.0.0.bin"), vec![STONE as u8; VOL]).unwrap();
         let checkpoint = stage(&root.0);
         checkpoint.prepare().unwrap();
         fs::rename(&checkpoint.staging, root.0.join(PENDING)).unwrap();
         // The process stopped after the terrain was replaced, before the player.
-        atomic_write(&root.0.join("c.0.0.bin"), &vec![PLANKS; VOL]).unwrap();
+        atomic_write(&root.0.join("c.0.0.bin"), &vec![PLANKS as u8; VOL]).unwrap();
         recover(&root.0).unwrap();
         assert_eq!(fs::read_to_string(root.0.join("player.txt")).unwrap(), "new inventory\n");
-        assert_eq!(fs::read(root.0.join("c.0.0.bin")).unwrap(), vec![PLANKS; VOL]);
+        assert_eq!(fs::read(root.0.join("c.0.0.bin")).unwrap(), vec![PLANKS as u8; VOL]);
         recover(&root.0).unwrap();
     }
 
@@ -354,7 +356,7 @@ pub(crate) mod tests {
         assert_eq!(fs::read_to_string(root.0.join("player.txt")).unwrap(), "old inventory\n");
         checkpoint.prepare().unwrap();
         fs::rename(&checkpoint.staging, root.0.join(PENDING)).unwrap();
-        fs::write(root.0.join(PENDING).join("new/c.0.0.bin"), [STONE]).unwrap();
+        fs::write(root.0.join(PENDING).join("new/c.0.0.bin"), [STONE as u8]).unwrap();
         assert!(recover(&root.0).is_err());
         assert_eq!(fs::read_to_string(root.0.join("player.txt")).unwrap(), "old inventory\n");
         assert!(!root.0.join("deep/chests.txt").exists());

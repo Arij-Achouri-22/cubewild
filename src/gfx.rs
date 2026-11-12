@@ -121,16 +121,19 @@ struct COut {
   @location(2) light: f32,
   @location(3) p: vec3<f32>,
   @location(4) sky: f32,
+  @location(5) block_light: f32,
 };
 
-@vertex fn vs_chunk(@location(0) v: u32, @location(1) off: vec4<f32>) -> COut {
+@vertex fn vs_chunk(@location(0) words: vec2<u32>, @location(1) off: vec4<f32>) -> COut {
+  let v = words.x;
   let xz = v & 511u;
   let x = f32(xz % 17u); let y = f32((v >> 9u) & 511u); let z = f32(xz / 17u);
   let face = (v >> 18u) & 7u;
   var ao = f32((v >> 28u) & 3u);
   var p = vec3<f32>(x, y, z) + off.xyz;
   var o: COut;
-  o.layer = (v >> 21u) & 127u;
+  o.layer = words.y >> 8u;
+  o.block_light = f32(words.y & 255u) / 255.0;
   if (o.layer == 12u || o.layer == 56u) {
     // water and lava: the shading bits say how far this corner of the surface sinks
     p.y -= (3.0 - ao) * 0.25;
@@ -163,7 +166,8 @@ struct COut {
   let face = v.y & 7u;
   let p = q + off.xyz;
   var o: COut;
-  o.layer = (v.y >> 3u) & 255u;
+  o.layer = (v.y >> 3u) & 65535u;
+  o.block_light = f32((v.y >> 21u) & 255u) / 255.0;
   o.pos = g.view_proj * vec4<f32>(p, 1.0);
   if (face < 2u) { o.uv = vec2<f32>(q.z, -q.y); }
   else if (face < 4u) { o.uv = vec2<f32>(q.x, q.z); }
@@ -172,7 +176,7 @@ struct COut {
   o.light = shade[face];
   o.p = p;
   var skyl = array<f32, 4>(0.2, 0.52, 1.0, 1.0);
-  o.sky = skyl[(v.y >> 11u) & 3u];
+  o.sky = skyl[(v.y >> 19u) & 3u];
   return o;
 }
 @vertex fn vs_item(@location(0) p: vec3<f32>, @location(1) uv: vec2<f32>, @location(2) layer: u32, @location(3) light: f32, @location(4) sky: f32) -> COut {
@@ -180,6 +184,7 @@ struct COut {
   o.pos = g.view_proj * vec4<f32>(p, 1.0);
   o.uv = uv;
   o.layer = layer;
+  o.block_light = 0.0;
   o.light = light;
   o.p = p;
   o.sky = sky;
@@ -193,6 +198,7 @@ struct COut {
   o.pos.z = o.pos.z * 0.05;
   o.uv = uv;
   o.layer = layer;
+  o.block_light = 0.0;
   o.light = light;
   o.p = p;
   o.sky = sky;
@@ -200,13 +206,8 @@ struct COut {
 }
 
 fn chunk_color(i: COut, c: vec4<f32>) -> vec4<f32> {
-  var glow = 0.0;
-  let n = i32(g.misc.y);
-  for (var k = 0; k < n; k++) {
-    let l = g.lights[k];
-    glow = max(glow, 1.0 - distance(i.p, l.xyz) / l.w);
-  }
-  glow = glow * glow * 1.15;
+  // Cached flood light respects walls and costs no per-pixel source loop.
+  let glow = i.block_light;
   // what daylight seeps into enclosed places fades out on the way down
   // (world heights: the old y 12..44, lifted onto the deep slate by 64)
   let dim = mix(0.1, 1.0, smoothstep(76.0, 108.0, i.p.y + g.misc.w));
@@ -374,7 +375,7 @@ impl Gfx {
             .expect("no GPU adapter");
         let adapter_name = format!("{} ({:?})", adapter.get_info().name, adapter.get_info().backend);
         let (device, queue) = adapter
-            .request_device(&wgpu::DeviceDescriptor::default())
+            .request_device(&wgpu::DeviceDescriptor { required_limits: wgpu::Limits { max_texture_array_layers: textures::LAYERS as u32, ..wgpu::Limits::default() }, ..Default::default() })
             .await
             .expect("request device");
 
@@ -545,14 +546,14 @@ impl Gfx {
             immediate_size: 0,
         });
 
-        let chunk_attrs = wgpu::vertex_attr_array![0 => Uint32];
+        let chunk_attrs = wgpu::vertex_attr_array![0 => Uint32x2];
         let inst_attrs = wgpu::vertex_attr_array![1 => Float32x4];
         let ent_attrs = wgpu::vertex_attr_array![0 => Float32x3, 1 => Unorm8x4];
         let ui_attrs =
             wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2, 2 => Unorm8x4, 3 => Float32];
         let chunk_bufs = [
             Some(wgpu::VertexBufferLayout {
-                array_stride: 4,
+                array_stride: 8,
                 step_mode: wgpu::VertexStepMode::Vertex,
                 attributes: &chunk_attrs,
             }),
@@ -843,7 +844,7 @@ impl Gfx {
         }
         let (mut vbuf, old_detail) = match previous {
             Some(previous) => (previous.vbuf, previous.detail),
-            None => (self::vbuf(&self.device, ((m.verts.len().max(1) * 4) as u64).next_power_of_two()), None),
+            None => (self::vbuf(&self.device, ((m.verts.len().max(1) * 8) as u64).next_power_of_two()), None),
         };
         self.fill(&mut vbuf, bytemuck::cast_slice(&m.verts));
         let detail = if m.detail.is_empty() { None } else {

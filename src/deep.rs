@@ -618,14 +618,14 @@ mod layer_tests {
         assert_eq!(tex_for(SMOULDER, 0), 101);
         assert_eq!(tex_for(PYRE_ORE, 0), 114);
         // every block's layer fits the terrain mesh's 7 bits
-        for b in 0..=255u8 {
+        for b in 0..=255u16 {
             for f in 0..6 {
                 if !is_shaped(b) {
                     assert!(tex_for(b, f) < 128, "block {b} face {f}");
                 }
             }
         }
-        assert!(crate::textures::LAYERS <= 256);
+        assert!(crate::textures::LAYERS <= 512);
     }
 }
 
